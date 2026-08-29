@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from omegaconf import OmegaConf
 
@@ -163,3 +163,35 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
         10,
     )
+
+
+def test_streamopd_skips_unused_ppo_computations_without_changing_sync_baseline():
+    def run(streamopd_enabled: bool) -> _StubTrainer:
+        trainer = _StubTrainer.__new__(_StubTrainer)
+        trainer.streamopd_kv_enabled = streamopd_enabled
+        trainer.global_steps = 1
+        trainer.use_reference_policy = False
+        trainer.use_critic = False
+        trainer.config = OmegaConf.create(
+            {"trainer": {"critic_warmup": 0}, "actor_rollout_ref": {"rollout": {"temperature": 1.0}}}
+        )
+        trainer.reward_loop_manager = MagicMock(reward_loop_worker_handles=[object()])
+        batch = MagicMock()
+        batch.extra_info = {}
+        trainer.replay_buffer = MagicMock()
+        trainer.replay_buffer.sample.return_value = (batch, {})
+        trainer._balance_batch = MagicMock(return_value=batch)
+        trainer._compute_old_log_prob = MagicMock(return_value=batch)
+        trainer._compute_advantage = MagicMock(return_value=batch)
+        trainer._update_actor = MagicMock(return_value=batch)
+
+        trainer._step_once({}, {}, sample_batch_size=1)
+        return trainer
+
+    streamopd_trainer = run(streamopd_enabled=True)
+    streamopd_trainer._compute_old_log_prob.assert_not_called()
+    streamopd_trainer._compute_advantage.assert_not_called()
+
+    baseline_trainer = run(streamopd_enabled=False)
+    baseline_trainer._compute_old_log_prob.assert_called_once()
+    baseline_trainer._compute_advantage.assert_called_once()

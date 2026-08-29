@@ -173,6 +173,10 @@ def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
 
+    from verl.experimental.streamopd_kv import prepare_streamopd_kv_config
+
+    prepare_streamopd_kv_config(config)
+
     # validate config
     validate_config(
         config=config,

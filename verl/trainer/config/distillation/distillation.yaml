@@ -13,6 +13,25 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Two-pool strict OPD with committed-token teacher streaming and rollout KV reuse.
+# The MVP is opt-in and supports text-only, single-teacher Qwen3 jobs on vLLM.
+streamopd_kv:
+  _target_: verl.workers.config.StreamOPDKVConfig
+  enabled: false
+  token_chunk_size: 256
+  reverse_chunk_size: 256
+  reverse_batch_size: 16
+  reverse_batch_max_tokens: 8192
+  max_pending_teacher_chunks: 128
+  kv_handoff_dir: /tmp/verl-streamopd-kv
+  rollout_backend: vllm
+  exact_dense_attention: true
+  require_same_tokenizer: true
+  cleanup_after_step: true
+  validate_teacher_artifacts: false
+  validate_full_forward_loss: false
+  validation_atol: 1.0e-4
+
 # distillation loss config
 distillation_loss:
 

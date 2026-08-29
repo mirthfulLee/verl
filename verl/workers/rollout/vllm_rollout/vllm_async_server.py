@@ -29,12 +29,10 @@ from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
-from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
@@ -70,8 +68,25 @@ from verl.workers.rollout.vllm_rollout.utils import (
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
+_RESET_PREFIX_CACHE_KWARGS = {}
+if _VLLM_VERSION >= version.parse("0.13.0"):
+    _RESET_PREFIX_CACHE_KWARGS["reset_connector"] = True
 
-if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
+if _VLLM_VERSION > version.parse("0.11.0"):
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    if _VLLM_VERSION == version.parse("0.12.0"):
+        from vllm.entrypoints.harmony_utils import get_encoding
+    elif _VLLM_VERSION >= version.parse("0.13.0"):
+        from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+    else:
+        get_encoding = None
+else:
+    from vllm.utils import FlexibleArgumentParser
+
+    get_encoding = None
+
+if get_encoding is not None and os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
 
 
@@ -543,6 +558,8 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        streamopd_callback: Optional[ray.actor.ActorHandle] = None,
+        streamopd_chunk_size: Optional[int] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
@@ -562,6 +579,33 @@ class vLLMHttpServer:
             )
 
         prompt_ids = normalize_token_ids(prompt_ids)
+        streamopd_publisher = None
+        if streamopd_callback is not None:
+            if streamopd_chunk_size is None or streamopd_chunk_size < 1:
+                raise ValueError("streamopd_chunk_size must be positive when a callback is provided")
+            if self._disaggregation_role != "null":
+                raise NotImplementedError("StreamOPD-KV cannot be combined with vLLM P/D disaggregation")
+            from verl.experimental.streamopd_kv import CommittedChunkPublisher, TrajectoryKey
+
+            policy_version = int(self.global_steps or 0)
+
+            async def submit_streamopd_chunk(chunk) -> None:
+                await streamopd_callback.submit_streamopd_chunk.remote(chunk.as_dict())
+
+            streamopd_publisher = CommittedChunkPublisher(
+                key=TrajectoryKey(policy_version, request_id),
+                prompt_ids=prompt_ids,
+                chunk_size=streamopd_chunk_size,
+                submit=submit_streamopd_chunk,
+            )
+            kv_transfer_params = dict(kv_transfer_params or {})
+            kv_transfer_params.update(
+                {
+                    "streamopd_kv": True,
+                    "policy_version": policy_version,
+                    "prompt_length": len(prompt_ids),
+                }
+            )
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -649,9 +693,18 @@ class vLLMHttpServer:
             final_res: Optional[RequestOutput] = None
             async for output in generator:
                 final_res = output
+                if streamopd_publisher is not None and output.outputs:
+                    candidate = output.outputs[0]
+                    await streamopd_publisher.observe(
+                        candidate.token_ids,
+                        terminal=candidate.finish_reason is not None,
+                    )
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
+        if streamopd_publisher is not None:
+            extra_fields["streamopd_trajectory_id"] = request_id
+            extra_fields["streamopd_policy_version"] = streamopd_publisher.key.policy_version
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -803,7 +856,7 @@ class vLLMHttpServer:
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
@@ -811,7 +864,7 @@ class vLLMHttpServer:
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
             # is configured (vLLM scheduler treats it as such).
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -832,10 +885,12 @@ class vLLMHttpServer:
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous model weights. With no connector it
             # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
 
-            await self.engine.reset_mm_cache()
-            await self.engine.reset_encoder_cache()
+            if _VLLM_VERSION >= version.parse("0.9.0"):
+                await self.engine.reset_mm_cache()
+            if _VLLM_VERSION >= version.parse("0.16.0"):
+                await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""
@@ -854,7 +909,7 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
         await self.engine.wake_up(tags=["kv_cache"])
-        await self.engine.reset_prefix_cache(reset_connector=True)
+        await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
 
     def _should_profile(self) -> bool:
         """Whether this replica drives the engine profiler."""
@@ -909,23 +964,29 @@ class vLLMHttpServer:
                 - request_ids: List of aborted request IDs
         """
         try:
-            # Snapshot request IDs before pausing for reporting
-            request_ids = list(self.engine.output_processor.request_states.keys())
+            if _VLLM_VERSION >= version.parse("0.12.0"):
+                request_ids = list(self.engine.output_processor.request_states.keys())
+                await self.engine.pause_generation(
+                    wait_for_inflight_requests=False,
+                    clear_cache=reset_prefix_cache,
+                )
+            else:
+                request_states_snapshot = list(self.engine.output_processor.request_states.items())
+                request_ids = [req_id for req_id, _ in request_states_snapshot]
+                if not request_ids:
+                    return {"aborted_count": 0, "request_ids": []}
 
-            # pause_generation with wait_for_inflight_requests=False will:
-            # 1. Set engine to paused state (blocks new generate calls)
-            # 2. Abort all in-flight requests
-            # 3. Wait for requests to drain
-            # 4. Clear prefix and mm caches if clear_cache=True.
-            #    EngineCore._reset_caches defaults reset_connector=True
-            #    on this path, so any attached external KV store (e.g.
-            #    MooncakeStoreConnector) is invalidated along with the
-            #    local prefix cache — RL-correct hard-reset at every
-            #    weight update boundary, no extra kwargs needed.
-            await self.engine.pause_generation(
-                wait_for_inflight_requests=False,
-                clear_cache=reset_prefix_cache,
-            )
+                from vllm.v1.engine import FinishReason
+
+                for _, req_state in request_states_snapshot:
+                    request_output = req_state.make_request_output(
+                        [], pooling_output=None, finish_reason=FinishReason.ABORT, stop_reason=None
+                    )
+                    req_state.queue.put(request_output)
+                self.engine.output_processor.abort_requests(request_ids)
+                await self.engine.engine_core.abort_requests_async(request_ids)
+                if reset_prefix_cache:
+                    await self.clear_kv_cache()
 
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
@@ -938,7 +999,8 @@ class vLLMHttpServer:
         """Resume generation after abort_all_requests (pause_generation)."""
         if self.node_rank != 0:
             return
-        await self.engine.resume_generation()
+        if _VLLM_VERSION >= version.parse("0.12.0"):
+            await self.engine.resume_generation()
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.
@@ -1144,7 +1206,8 @@ class vLLMHttpServer:
         FSDP training backward when DP > 1.
         """
         await self.engine.sleep(level=self._resolve_sleep_level())
-        await self.engine.reset_encoder_cache()
+        if _VLLM_VERSION >= version.parse("0.16.0"):
+            await self.engine.reset_encoder_cache()
 
 
 class vLLMReplica(RolloutReplica):

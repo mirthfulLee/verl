@@ -261,6 +261,14 @@ class LLMServerClient:
         """
         server_id, server = await self._acquire_server(request_id)
         try:
+            streamopd_enabled = bool(kwargs.pop("streamopd_enabled", False))
+            if streamopd_enabled:
+                callback = getattr(self, "streamopd_callback", None)
+                chunk_size = getattr(self, "streamopd_chunk_size", None)
+                if callback is None or chunk_size is None:
+                    raise RuntimeError("StreamOPD-KV client callback was not configured")
+                kwargs["streamopd_callback"] = callback
+                kwargs["streamopd_chunk_size"] = chunk_size
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data

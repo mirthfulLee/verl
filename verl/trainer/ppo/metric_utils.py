@@ -431,8 +431,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Computes various metrics from a batch of data for PPO training.
 
     This function calculates metrics related to scores, rewards, advantages, returns, values,
-    and sequence lengths from a batch of data. It provides statistical information (mean, max, min)
-    for each metric category.
+    and sequence lengths from a batch of data. Advantages and returns are optional for direct
+    distillation batches that do not optimize a policy-gradient objective.
 
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
@@ -453,8 +453,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
-    advantages = batch.batch["advantages"]
-    returns = batch.batch["returns"]
+    advantages = batch.batch.get("advantages")
+    returns = batch.batch.get("returns")
+    if (advantages is None) != (returns is None):
+        raise KeyError("advantages and returns must either both be present or both be absent")
+    if use_critic and returns is None:
+        raise KeyError("critic metrics require advantages and returns")
 
     max_prompt_length = batch.batch["prompts"].shape[-1]
     max_response_length = batch.batch["responses"].shape[-1]
@@ -487,24 +491,36 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         logger.warning("All samples are aborted, returning default reward metrics")
         reward_mean = reward_max = reward_min = float("nan")
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    valid_returns = None
+    policy_gradient_metrics = {}
+    if advantages is not None and returns is not None:
+        valid_adv = torch.masked_select(advantages, response_mask)
+        valid_returns = torch.masked_select(returns, response_mask)
 
-    if valid_adv.numel() > 0:
-        adv_mean = torch.mean(valid_adv).detach().item()
-        adv_max = torch.max(valid_adv).detach().item()
-        adv_min = torch.min(valid_adv).detach().item()
-    else:
-        logger.warning("Response mask is all False, returning default advantage metrics")
-        adv_mean = adv_max = adv_min = float("nan")
+        if valid_adv.numel() > 0:
+            adv_mean = torch.mean(valid_adv).detach().item()
+            adv_max = torch.max(valid_adv).detach().item()
+            adv_min = torch.min(valid_adv).detach().item()
+        else:
+            logger.warning("Response mask is all False, returning default advantage metrics")
+            adv_mean = adv_max = adv_min = float("nan")
 
-    if valid_returns.numel() > 0:
-        returns_mean = torch.mean(valid_returns).detach().item()
-        returns_max = torch.max(valid_returns).detach().item()
-        returns_min = torch.min(valid_returns).detach().item()
-    else:
-        logger.warning("Response mask is all False, returning default return metrics")
-        returns_mean = returns_max = returns_min = float("nan")
+        if valid_returns.numel() > 0:
+            returns_mean = torch.mean(valid_returns).detach().item()
+            returns_max = torch.max(valid_returns).detach().item()
+            returns_min = torch.min(valid_returns).detach().item()
+        else:
+            logger.warning("Response mask is all False, returning default return metrics")
+            returns_mean = returns_max = returns_min = float("nan")
+
+        policy_gradient_metrics = {
+            "critic/advantages/mean": adv_mean,
+            "critic/advantages/max": adv_max,
+            "critic/advantages/min": adv_min,
+            "critic/returns/mean": returns_mean,
+            "critic/returns/max": returns_max,
+            "critic/returns/min": returns_min,
+        }
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -560,14 +576,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
-        # adv
-        "critic/advantages/mean": adv_mean,
-        "critic/advantages/max": adv_max,
-        "critic/advantages/min": adv_min,
-        # returns
-        "critic/returns/mean": returns_mean,
-        "critic/returns/max": returns_max,
-        "critic/returns/min": returns_min,
+        **policy_gradient_metrics,
         **critic_value_metrics,
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),

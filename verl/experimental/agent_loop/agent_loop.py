@@ -491,6 +491,37 @@ class AgentLoopWorker:
                 config=config,
                 teacher_client=teacher_client,
             )
+            streamopd_config = config.distillation.get("streamopd_kv", {})
+            self.streamopd_config = streamopd_config
+            self.streamopd_kv_enabled = bool(streamopd_config.get("enabled", False))
+            if self.streamopd_kv_enabled:
+                from verl.experimental.streamopd_kv import StreamingTeacherCoordinator
+
+                if self.rollout_config.agent.default_agent_loop != "single_turn_agent":
+                    raise NotImplementedError("StreamOPD-KV MVP supports the single_turn_agent loop only")
+                if self.hf_model_type != "qwen3":
+                    raise NotImplementedError(
+                        f"StreamOPD-KV reverse training supports Qwen3 students only, got {self.hf_model_type!r}"
+                    )
+                if streamopd_config.get("require_same_tokenizer", True):
+                    from transformers import AutoTokenizer
+
+                    teacher_model = next(iter(config.distillation.teacher_models.values()))
+                    teacher_tokenizer = AutoTokenizer.from_pretrained(
+                        teacher_model.model_path,
+                        trust_remote_code=bool(config.data.get("trust_remote_code", False)),
+                    )
+                    if self.tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
+                        raise ValueError("StreamOPD-KV requires identical student and teacher token-id vocabularies")
+                self._streamopd_teacher = StreamingTeacherCoordinator(
+                    self._score_streamopd_teacher_prefix,
+                    max_pending_chunks=int(streamopd_config.get("max_pending_teacher_chunks", 128)),
+                )
+                self.llm_client.streamopd_callback = ray.get_runtime_context().current_actor
+                self.llm_client.streamopd_chunk_size = int(streamopd_config.get("token_chunk_size", 256))
+        else:
+            self.streamopd_config = {}
+            self.streamopd_kv_enabled = False
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -661,8 +692,27 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            run_kwargs = dict(kwargs)
+            run_kwargs["_streamopd_validate"] = trajectory["validate"]
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    async def _score_streamopd_teacher_prefix(
+        self, sequence_ids: list[int], request_id: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return await self.teacher_server_manager.compute_teacher_logprobs_single(
+            sequence_ids=sequence_ids,
+            request_id=request_id,
+        )
+
+    async def submit_streamopd_chunk(self, value: dict[str, Any]) -> None:
+        """Ray callback used by rollout servers to enqueue committed tokens."""
+
+        if not self.streamopd_kv_enabled:
+            raise RuntimeError("received a StreamOPD token chunk while StreamOPD-KV is disabled")
+        from verl.experimental.streamopd_kv import CommittedTokenChunk
+
+        await self._streamopd_teacher.submit(CommittedTokenChunk.from_dict(value))
 
     def _pad_token_ids(
         self,
@@ -1014,12 +1064,44 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
-                multi_modal_data=output.multi_modal_data,
-                mm_processor_kwargs=output.mm_processor_kwargs,
-                routing_key=routing_key,
-            )
+            if self.streamopd_kv_enabled:
+                if output.multi_modal_data:
+                    raise NotImplementedError("StreamOPD-KV MVP does not support multimodal teacher streaming")
+                from verl.experimental.streamopd_kv import TrajectoryKey
+
+                trajectory_id = output.extra_fields.get("streamopd_trajectory_id")
+                policy_version = output.extra_fields.get("streamopd_policy_version")
+                if trajectory_id is None or policy_version is None:
+                    raise RuntimeError("rollout output is missing StreamOPD trajectory identity")
+                teacher_ids, teacher_logprobs = await self._streamopd_teacher.result(
+                    TrajectoryKey(int(policy_version), str(trajectory_id)),
+                    required_completion_tokens=len(response_ids),
+                )
+                if self.streamopd_config.get("validate_teacher_artifacts", False):
+                    expected_ids, expected_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                        sequence_ids=prompt_ids + response_ids,
+                        routing_key=routing_key,
+                    )
+                    if not torch.equal(teacher_ids, expected_ids):
+                        mismatched = int((teacher_ids != expected_ids).sum().item())
+                        raise RuntimeError(
+                            f"streamed teacher top-k token ids differ from post-hoc scoring at {mismatched} entries"
+                        )
+                    max_abs_error = float((teacher_logprobs - expected_logprobs).abs().max().item())
+                    tolerance = float(self.streamopd_config.get("validation_atol", 1e-4))
+                    if max_abs_error > tolerance:
+                        raise RuntimeError(
+                            "streamed teacher logprobs differ from post-hoc scoring: "
+                            f"max_abs_error={max_abs_error}, tolerance={tolerance}"
+                        )
+                    logger.info("StreamOPD teacher validation max_abs_error=%g", max_abs_error)
+            else:
+                teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    sequence_ids=prompt_ids + response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

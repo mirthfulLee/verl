@@ -31,21 +31,23 @@ package_name = "vllm"
 package_version = get_version(package_name)
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
+_MIN_VLLM_VERSION = "0.11.0"
 
 if package_version is None:
     if not is_sglang_available():
         raise ValueError(
             f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
-            f"vllm versions are 0.18.0+"
+            f"vllm versions are {_MIN_VLLM_VERSION}+"
         )
 elif is_npu_available:
     # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
     VLLM_SLEEP_LEVEL = 1
     from vllm import LLM
     from vllm.distributed import parallel_state
-elif vs.parse(package_version) >= vs.parse("0.18.0"):
+elif vs.parse(package_version) >= vs.parse(_MIN_VLLM_VERSION):
     vllm_version = package_version
-    VLLM_SLEEP_LEVEL = 2
+    if vs.parse(package_version) >= vs.parse("0.8.5"):
+        VLLM_SLEEP_LEVEL = 2
     from vllm import LLM
     from vllm.distributed import parallel_state
 else:
@@ -54,7 +56,7 @@ else:
     if not is_sglang_available():
         raise ValueError(
             f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
-            f"vllm versions are 0.18.0+"
+            f"vllm versions are {_MIN_VLLM_VERSION}+"
         )
 
 __all__ = ["LLM", "parallel_state"]

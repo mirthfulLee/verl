@@ -349,6 +349,19 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
 
+    def test_compute_data_metrics_for_direct_distillation(self):
+        """Direct distillation reports sequence metrics without PPO-only tensors."""
+        del self.batch.batch["advantages"]
+        del self.batch.batch["returns"]
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertNotIn("critic/advantages/mean", metrics)
+        self.assertNotIn("critic/returns/mean", metrics)
+        self.assertIn("critic/score/mean", metrics)
+        self.assertIn("critic/rewards/mean", metrics)
+        self.assertIn("response_length/mean", metrics)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""

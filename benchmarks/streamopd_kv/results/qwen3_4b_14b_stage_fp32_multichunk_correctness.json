@@ -1,0 +1,33 @@
+{
+  "dataset": "open-r1/DAPO-Math-17k-Processed",
+  "dataset_index": 601,
+  "student": "/models/store/Qwen/Qwen3-4B",
+  "teacher": "/models/store/Qwen/Qwen3-14B",
+  "student_dtype": "float32",
+  "teacher_dtype": "float32",
+  "prompt_tokens": 317,
+  "response_tokens": 64,
+  "topk": 32,
+  "token_chunk_size": 32,
+  "reverse_chunk_size": 256,
+  "verl_sync_opd_stage": {
+    "rollout_seconds": 2.0100319560151547,
+    "teacher_seconds": 0.7086241331417114,
+    "training_seconds": 0.7514401709195226,
+    "total_seconds": 3.4700962600763887,
+    "training_peak_gb": 33.307616233825684,
+    "loss_sum": 6.10928201675415
+  },
+  "streamopd_kv": {
+    "overlapped_rollout_teacher_seconds": 2.1367350260261446,
+    "reverse_training_seconds": 0.8624840138945729,
+    "total_seconds": 2.9992190399207175,
+    "training_peak_gb": 34.82391405105591,
+    "loss_sum": 6.1091718673706055
+  },
+  "speedup": 1.1569999436146947,
+  "loss_abs_error": 0.00011014938354492188,
+  "teacher_streaming_objective_abs_error": 4.76837158203125e-07,
+  "reverse_abs_error_same_teacher": 0.00010967254638671875,
+  "notes": "The baseline is the stage-equivalent of verl V1 Native OPD with trainer_mode=sync, not an external implementation. Teacher scoring runs in a separate CUDA process; rollout KV remains in the student process and therefore has zero serialization handoff cost in this stage benchmark. Correctness-only full forward with streamed teacher artifacts is excluded from timing."
+}

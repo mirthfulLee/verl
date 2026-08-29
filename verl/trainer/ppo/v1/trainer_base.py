@@ -129,6 +129,9 @@ class PPOTrainer(ABC):
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
+        self.streamopd_kv_enabled = bool(
+            self.config.get("distillation", {}).get("streamopd_kv", {}).get("enabled", False)
+        )
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -559,9 +562,11 @@ class PPOTrainer(ABC):
         # 3. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
-        # 4. compute old_log_prob
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
-            batch = self._compute_old_log_prob(batch, metrics=metrics)
+        # 4. Direct StreamOPD-KV never consumes PPO ratios or entropy. Its
+        # serving KV already supplies the no-grad causal trace used by training.
+        if not self.streamopd_kv_enabled:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
 
         # 5. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
@@ -573,9 +578,11 @@ class PPOTrainer(ABC):
             with marked_timer("values", timing_raw, color="cyan"):
                 batch = self._compute_values(batch, metrics=metrics)
 
-        # 7. compute advantage and return
-        with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics=metrics)
+        # 7. Direct StreamOPD-KV optimizes only the token-level distillation
+        # objective, so it has no policy-gradient advantages to compute.
+        if not self.streamopd_kv_enabled:
+            with marked_timer("adv", timing_raw, color="brown"):
+                batch = self._compute_advantage(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:

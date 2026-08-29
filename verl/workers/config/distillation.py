@@ -22,7 +22,7 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "StreamOPDKVConfig", "DistillationConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -219,6 +219,49 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 
 @dataclass
+class StreamOPDKVConfig(BaseConfig):
+    """Experimental two-pool strict OPD execution settings.
+
+    This flag is fail-closed. The initial backend supports text-only,
+    single-teacher Qwen3 jobs with exact dense attention and vLLM KV export.
+    """
+
+    enabled: bool = False
+    token_chunk_size: int = 256
+    reverse_chunk_size: int = 256
+    reverse_batch_size: int = 16
+    reverse_batch_max_tokens: int = 8192
+    max_pending_teacher_chunks: int = 128
+    kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
+    rollout_backend: str = "vllm"
+    exact_dense_attention: bool = True
+    require_same_tokenizer: bool = True
+    cleanup_after_step: bool = True
+    validate_teacher_artifacts: bool = False
+    validate_full_forward_loss: bool = False
+    validation_atol: float = 1e-4
+
+    def __post_init__(self) -> None:
+        for name in (
+            "token_chunk_size",
+            "reverse_chunk_size",
+            "reverse_batch_size",
+            "reverse_batch_max_tokens",
+            "max_pending_teacher_chunks",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"streamopd_kv.{name} must be positive")
+        if not self.kv_handoff_dir:
+            raise ValueError("streamopd_kv.kv_handoff_dir must be non-empty")
+        if self.validation_atol < 0:
+            raise ValueError("streamopd_kv.validation_atol must be non-negative")
+        if self.enabled and self.rollout_backend != "vllm":
+            raise NotImplementedError("StreamOPD-KV MVP supports rollout_backend='vllm' only")
+        if self.enabled and not self.exact_dense_attention:
+            raise ValueError("strict StreamOPD-KV requires exact_dense_attention=true")
+
+
+@dataclass
 class DistillationConfig(BaseConfig):
     """Configuration for on-policy distillation.
 
@@ -265,8 +308,16 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    streamopd_kv: StreamOPDKVConfig = field(default_factory=StreamOPDKVConfig)
 
     def __post_init__(self):
+        object.__setattr__(
+            self,
+            "streamopd_kv",
+            omega_conf_to_dataclass(self.streamopd_kv, dataclass_type=StreamOPDKVConfig),
+        )
+        if self.streamopd_kv.enabled and not self.enabled:
+            raise ValueError("streamopd_kv.enabled requires distillation.enabled=true")
         if not self.enabled:
             return
 
@@ -278,6 +329,8 @@ class DistillationConfig(BaseConfig):
                 topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size
+        if self.streamopd_kv.enabled and len(self.teacher_models) != 1:
+            raise NotImplementedError("StreamOPD-KV MVP supports exactly one teacher model")
         total_pool_size = self.n_gpus_per_node * self.nnodes
         if teacher_world_size_sum != total_pool_size:
             raise ValueError(

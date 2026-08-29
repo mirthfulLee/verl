@@ -465,6 +465,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
+        streamopd_config = getattr(distillation_config, "streamopd_kv", None)
+        if streamopd_config is not None and getattr(streamopd_config, "enabled", False):
+            if config.actor.strategy not in ("fsdp", "fsdp2"):
+                raise NotImplementedError("StreamOPD-KV training currently supports FSDP/FSDP2 only")
+            from verl.experimental.streamopd_kv.fsdp_worker import StreamOPDKVTrainingWorker
+
+            self.actor_worker_cls = StreamOPDKVTrainingWorker
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
@@ -611,6 +618,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=actor_config.checkpoint,
                 profiler_config=actor_profiler_config,
             )
+            if distillation_config is not None and distillation_config.streamopd_kv.enabled:
+                actor_training_config.extra_context["streamopd_kv"] = distillation_config.streamopd_kv
+                actor_training_config.extra_context["distillation"] = distillation_config
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz
 

@@ -15,6 +15,13 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     """Validate the MVP envelope and install the out-of-tree vLLM connector."""
 
     stream_config = config.distillation.get("streamopd_kv", {})
+    if stream_config.get("colocate_teacher_with_student", False):
+        if not config.trainer.use_v1 or config.trainer.v1.trainer_mode != "sync":
+            raise ValueError("teacher/student phase colocation requires verl V1 sync trainer")
+        if config.trainer.nnodes != 1 or config.distillation.nnodes != 1:
+            raise NotImplementedError("StreamOPD teacher/student colocation currently supports one node only")
+        if config.distillation.n_gpus_per_node >= config.trainer.n_gpus_per_node:
+            raise ValueError("colocated teacher GPU count must be smaller than the student pool GPU count")
     if not stream_config.get("enabled", False):
         return
     if not config.trainer.use_v1 or config.trainer.v1.trainer_mode != "sync":
@@ -39,6 +46,20 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
             "StreamOPD-KV MVP requires direct distillation-only forward_kl_topk: "
             "loss_mode=forward_kl_topk, use_policy_gradient=false, use_task_rewards=false"
         )
+
+    if stream_config.get("overlap_rollout_training", False):
+        train_batch_size = int(config.data.train_batch_size)
+        rollout_micro_batch_size = int(stream_config.get("rollout_micro_batch_size", 0))
+        if rollout_micro_batch_size < 1 or train_batch_size % rollout_micro_batch_size:
+            raise ValueError(
+                "StreamOPD overlap requires data.train_batch_size to be divisible by "
+                "streamopd_kv.rollout_micro_batch_size"
+            )
+        accumulation_steps = train_batch_size // rollout_micro_batch_size
+        if accumulation_steps < 2:
+            raise ValueError("StreamOPD overlap requires at least two rollout microbatches")
+        with open_dict(config.trainer.v1.sync):
+            config.trainer.v1.sync.parameter_sync_step = accumulation_steps
 
     engine_kwargs = rollout.get("engine_kwargs")
     if engine_kwargs is None:

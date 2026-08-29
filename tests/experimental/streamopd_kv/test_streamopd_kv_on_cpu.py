@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
+from tensordict import TensorDict
 from torch import nn
 
 from verl.experimental.streamopd_kv import (
@@ -40,6 +41,7 @@ from verl.experimental.streamopd_kv import (
 )
 from verl.experimental.streamopd_kv.fsdp_worker import (
     _forward_kl_topk_sum,
+    _has_valid_response,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
 )
@@ -261,10 +263,24 @@ def test_reverse_microbatch_partition_and_call_count() -> None:
     assert _reverse_backward_calls([8, 12], chunk_size=5) == 3
 
 
+def test_zero_loss_synthetic_padding_is_not_trainable() -> None:
+    real = torch.tensor([1, 1, 0], dtype=torch.int64)
+    padding = torch.zeros(1, dtype=torch.int64)
+
+    assert _has_valid_response(TensorDict({"response_mask": real}, batch_size=[])) is True
+    assert _has_valid_response(TensorDict({"response_mask": padding}, batch_size=[])) is False
+
+
 def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     config = OmegaConf.create(
         {
-            "trainer": {"use_v1": True, "v1": {"trainer_mode": "sync"}},
+            "trainer": {
+                "use_v1": True,
+                "n_gpus_per_node": 4,
+                "nnodes": 1,
+                "v1": {"trainer_mode": "sync", "sync": {}},
+            },
+            "data": {"train_batch_size": 128},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -280,6 +296,8 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
                 },
             },
             "distillation": {
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
                 "streamopd_kv": {"enabled": True, "kv_handoff_dir": "/tmp/test-streamopd"},
                 "distillation_loss": {
                     "loss_mode": "forward_kl_topk",
@@ -293,6 +311,17 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     connector = config.actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config
     assert connector.kv_connector == "StreamOPDKVConnector"
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
+
+    overlap_config = copy.deepcopy(config)
+    overlap_config.distillation.streamopd_kv.overlap_rollout_training = True
+    overlap_config.distillation.streamopd_kv.rollout_micro_batch_size = 32
+    prepare_streamopd_kv_config(overlap_config)
+    assert overlap_config.trainer.v1.sync.parameter_sync_step == 4
+
+    colocated_config = copy.deepcopy(config)
+    colocated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
+    prepare_streamopd_kv_config(colocated_config)
+
     config.trainer.v1.trainer_mode = "separate_async"
     with pytest.raises(ValueError, match="trainer_mode=sync"):
         prepare_streamopd_kv_config(config)

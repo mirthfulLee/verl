@@ -36,7 +36,20 @@ class PPOTrainerSync(PPOTrainer):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
+            if self.use_teacher_policy and self.distillation_config.streamopd_kv.colocate_teacher_with_student:
+                self.teacher_model_manager.wake_up()
 
     def on_sample_end(self):
+        if (
+            self.streamopd_kv_enabled
+            and self.distillation_config.streamopd_kv.overlap_rollout_training
+            and self.local_trigger_step < self.parameter_sync_step - 1
+        ):
+            # Keep rollout and teacher work active while reverse backward
+            # accumulates gradients for train-ready microbatches. Parameters
+            # remain unchanged until the final trigger.
+            return
         # sleep all replicas to discard weights and kv cache
+        if self.use_teacher_policy and self.distillation_config.streamopd_kv.colocate_teacher_with_student:
+            self.teacher_model_manager.sleep()
         self.checkpoint_manager.sleep_replicas()

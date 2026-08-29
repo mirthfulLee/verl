@@ -231,6 +231,9 @@ class StreamOPDKVConfig(BaseConfig):
     reverse_chunk_size: int = 256
     reverse_batch_size: int = 16
     reverse_batch_max_tokens: int = 8192
+    overlap_rollout_training: bool = False
+    rollout_micro_batch_size: int = 32
+    colocate_teacher_with_student: bool = False
     max_pending_teacher_chunks: int = 128
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"
@@ -247,6 +250,7 @@ class StreamOPDKVConfig(BaseConfig):
             "reverse_chunk_size",
             "reverse_batch_size",
             "reverse_batch_max_tokens",
+            "rollout_micro_batch_size",
             "max_pending_teacher_chunks",
         ):
             if getattr(self, name) < 1:

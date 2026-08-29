@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 
 
 class _StubTrainer(PPOTrainer):
@@ -195,3 +196,63 @@ def test_streamopd_skips_unused_ppo_computations_without_changing_sync_baseline(
     baseline_trainer = run(streamopd_enabled=False)
     baseline_trainer._compute_old_log_prob.assert_called_once()
     baseline_trainer._compute_advantage.assert_called_once()
+
+
+def test_streamopd_batch_multiple_only_aligns_data_parallel_ranks():
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.streamopd_kv_enabled = True
+    trainer.use_teacher_policy = True
+
+    assert trainer._get_required_batch_multiple(dp_size=3) == 3
+
+
+def test_streamopd_overlap_keeps_one_optimizer_update_per_global_step():
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.streamopd_kv_enabled = True
+    trainer.parameter_sync_step = 4
+    trainer.config = OmegaConf.create({"distillation": {"streamopd_kv": {"overlap_rollout_training": True}}})
+
+    assert trainer._optimizer_updates_per_global_step() == 1
+
+    trainer.config.distillation.streamopd_kv.overlap_rollout_training = False
+    assert trainer._optimizer_updates_per_global_step() == 4
+
+
+def test_streamopd_overlap_only_sleeps_rollout_before_final_trigger():
+    trainer = PPOTrainerSync.__new__(PPOTrainerSync)
+    trainer.streamopd_kv_enabled = True
+    trainer.use_teacher_policy = True
+    trainer.distillation_config = MagicMock()
+    trainer.distillation_config.streamopd_kv.overlap_rollout_training = True
+    trainer.distillation_config.streamopd_kv.colocate_teacher_with_student = False
+    trainer.parameter_sync_step = 4
+    trainer.checkpoint_manager = MagicMock()
+
+    trainer.local_trigger_step = 0
+    trainer.on_sample_end()
+    trainer.checkpoint_manager.sleep_replicas.assert_not_called()
+
+    trainer.local_trigger_step = 3
+    trainer.on_sample_end()
+    trainer.checkpoint_manager.sleep_replicas.assert_called_once()
+
+
+def test_streamopd_colocation_sleeps_and_wakes_teacher_with_phase_switch():
+    trainer = PPOTrainerSync.__new__(PPOTrainerSync)
+    trainer.streamopd_kv_enabled = True
+    trainer.use_teacher_policy = True
+    trainer.distillation_config = MagicMock()
+    trainer.distillation_config.streamopd_kv.overlap_rollout_training = False
+    trainer.distillation_config.streamopd_kv.colocate_teacher_with_student = True
+    trainer.checkpoint_manager = MagicMock()
+    trainer.teacher_model_manager = MagicMock()
+    trainer.timing_raw = {}
+    trainer.global_steps = 1
+
+    trainer.on_sample_end()
+    trainer.teacher_model_manager.sleep.assert_called_once()
+    trainer.checkpoint_manager.sleep_replicas.assert_called_once()
+
+    trainer.on_step_end()
+    trainer.checkpoint_manager.update_weights.assert_called_once_with(1)
+    trainer.teacher_model_manager.wake_up.assert_called_once()

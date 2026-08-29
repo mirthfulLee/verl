@@ -47,6 +47,7 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
+from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.checkpoint_callback import build_checkpoint_callback
@@ -342,12 +343,21 @@ class PPOTrainer(ABC):
 
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            if self.config.distillation.streamopd_kv.colocate_teacher_with_student:
+                teacher_world_size = sum(
+                    teacher.world_size for teacher in self.distillation_config.teacher_models.values()
+                )
+                remaining = teacher_resource_pool.world_size - teacher_world_size
+                teacher_resource_pool = split_resource_pool(
+                    teacher_resource_pool,
+                    split_size=[teacher_world_size, remaining],
+                )[0]
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
@@ -727,10 +737,10 @@ class PPOTrainer(ABC):
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
-        # The LR scheduler steps once per local update, and each global step performs
-        # ``parameter_sync_step`` local updates (see ``PPOTrainer.step``). The optimizer's
-        # schedule horizon must therefore count optimizer updates.
-        optim_total_training_steps = total_training_steps * self.parameter_sync_step
+        # Most V1 modes take one optimizer step per trigger. Strict StreamOPD
+        # overlap instead accumulates every trigger and finalizes exactly once
+        # at the policy-version barrier.
+        optim_total_training_steps = total_training_steps * self._optimizer_updates_per_global_step()
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
@@ -791,9 +801,12 @@ class PPOTrainer(ABC):
             if distillation_config.nnodes <= 0:
                 raise ValueError("config.distillation.nnodes must be greater than 0")
 
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            self.mapping[Role.TeacherModel] = "teacher_pool"
+            if distillation_config.streamopd_kv.get("colocate_teacher_with_student", False):
+                self.mapping[Role.TeacherModel] = global_pool_id
+            else:
+                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
+                self.mapping[Role.TeacherModel] = "teacher_pool"
 
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
@@ -1502,6 +1515,13 @@ class PPOTrainer(ABC):
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
+        # The reverse StreamOPD worker consumes the rank-local cohort directly and
+        # does not iterate PPO mini-batches. Requiring lcm(dp_size,
+        # ppo_mini_batch_size) can otherwise turn batch 128 / DP 3 into 384
+        # trajectories. A single zero-loss synthetic sample is sufficient.
+        if self.streamopd_kv_enabled:
+            return dp_size
+
         required_multiple = dp_size
 
         # If enabled with critic training, the batch should align with critic PPO mini-batches.
@@ -1518,6 +1538,14 @@ class PPOTrainer(ABC):
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
+
+    def _optimizer_updates_per_global_step(self) -> int:
+        overlap_rollout_training = bool(
+            OmegaConf.select(self.config, "distillation.streamopd_kv.overlap_rollout_training", default=False)
+        )
+        if getattr(self, "streamopd_kv_enabled", False) and overlap_rollout_training:
+            return 1
+        return self.parameter_sync_step
 
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
@@ -1769,6 +1797,13 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        if self.streamopd_kv_enabled:
+            extra_info.update(
+                {
+                    "streamopd_accumulation_step": self.local_trigger_step,
+                    "streamopd_accumulation_steps": self.parameter_sync_step,
+                }
+            )
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

@@ -20,14 +20,19 @@ export VERL_USE_UV=0
 Run the matched 4K-total-trajectory experiment (prompt is capped at 1024, so response is capped at 3072):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 \
 bash benchmarks/streamopd_kv/run_qwen3_1p7b4b_b128_total4k.sh
 ```
 
-The wrapper defaults to one measured step, batch 128, Qwen3-1.7B student, Qwen3-4B teacher, `MAX_PROMPT_LENGTH=1024`,
-and `TOTAL_TRAJECTORY_LENGTH=4096`. Set `TOTAL_TRAJECTORY_LENGTH=8192` for the 8K variant; the response limit is
-derived as `total - prompt`. `ACTOR_MAX_TOKENS_PER_GPU` is only the dynamic training microbatch budget and does not
-change the per-trajectory cap.
+The wrapper defaults to two measured steps, batch 128, Qwen3-1.7B student, Qwen3-4B teacher,
+`MAX_PROMPT_LENGTH=1024`, and `TOTAL_TRAJECTORY_LENGTH=4096`. It uses four student execution ranks and two teacher
+replicas on the same four physical GPUs. The teachers are active during rollout and sleep before all four GPUs enter
+reverse training. Step 2 is the stable measurement because V1 creates some workers lazily during step 1.
+
+Set `TOTAL_TRAJECTORY_LENGTH=8192` for the 8K variant; the response limit is derived as `total - prompt`.
+`ACTOR_MAX_TOKENS_PER_GPU` is only the dynamic training microbatch budget and does not change the per-trajectory cap.
+`NCCL_P2P_DISABLE=1` is required by the GPU 0-3 topology on the measured host, but is not a general StreamOPD-KV
+requirement.
 
 For a quick two-GPU stage benchmark using DAPO data and independent student/teacher CUDA processes:
 
@@ -49,25 +54,48 @@ is required to measure the current pinned-CPU/safetensors transport.
 
 ### End-to-end V1 sync comparison (total trajectory length 4096)
 
-Four A100-80GB GPUs are split into a two-GPU Student Hybrid Pool and a two-GPU Teacher Pool. Student execution is
-FP32 for the strict numerical audit; the frozen teacher is BF16. The reported values are from one complete training
-step after model and service initialization.
+The primary comparison uses the same phase-shared placement on four A100-80GB GPUs: four student execution ranks,
+two teacher replicas on GPU ranks 0-1 during rollout, then four student trainer ranks after the teachers sleep.
+Student execution is FP32 for the strict numerical audit; the frozen teacher is BF16. Values below are stable step 2.
 
-| Path | Step | Response mean / max | Actor peak allocated | Actor peak reserved |
+| Path | Step | Generation / teacher | Student scoring + update | Actor peak allocated |
 | --- | ---: | ---: | ---: | ---: |
-| `verl-sync-opd` | 448.61 s | 3063 / 3072 | 55.16 GiB | 60.76 GiB |
-| StreamOPD-KV (1024/2048 chunks) | 393.64 s | 3058 / 3072 | 64.66 GiB | 71.03 GiB |
+| `verl-sync-opd` | 312.77 s | 129.82 s | 46.03 + 130.31 s | 51.54 GiB |
+| StreamOPD-KV (1536/2048 chunks) | 291.76 s | 141.98 s | 143.15 s | 64.36 GiB |
 
-StreamOPD-KV is **1.140x faster** and reduces step time by **12.26%** (54.97 seconds) on four A100-80GB GPUs.
-Both runs use this checkout's `verl-sync-opd` (`trainer.use_v1=True`, `trainer.v1.trainer_mode=sync`) as the strict
-no-staleness denominator, with the same policy version, models, data, precision, batch, and total trajectory cap.
-The Stream run overlaps teacher chunk scoring with rollout, reuses the sealed rollout KV, and performs reverse OPD;
-the sync run post-processes teacher scores and recomputes the student sequence. Exact stage metrics are in
-`results/qwen3_1p7b_4b_b128_total4k.json`.
+StreamOPD-KV is **1.072x faster** and reduces both step time and four-GPU-seconds by **6.72%** (21.01 seconds).
+Both paths use this checkout's V1 Native OPD with `trainer_mode=sync`, the same placement, models, data, precision,
+batch, and 4096-token total trajectory cap. Both report maximum trajectory staleness zero. StreamOPD-KV removes the
+46.03-second conventional student scoring pass; reverse training costs 12.84 seconds more than the conventional
+actor update, leaving the measured net gain.
 
-The selected long-trajectory granularity is a 1024-token teacher chunk and 2048-token reverse chunk. It cuts reverse
-backward calls from 128 to 64 while remaining below the 80-GiB card limit. The correctness-first safetensors handoff
-is linear in trajectory length, so use a large data filesystem for 4K/8K runs.
+The selected long-trajectory granularity is a 1536-token teacher chunk and a 2048-token reverse chunk. A full
+3072-token response therefore submits teacher work once before EOS and once at completion. Terminal-only scoring is
+an 8.45% throughput upper bound on this workload, but is kept as an ablation because it removes pre-EOS streaming.
+The correctness-first safetensors handoff is linear in trajectory length, so use a large data filesystem for 4K/8K
+runs. Exact metrics and ablations are in
+`results/qwen3_1p7b_4b_b128_total4k_phase_shared.json`.
+
+### Scheduling and topology ablations
+
+| StreamOPD-KV placement / schedule | Step | Generation / teacher | Reverse actor | Result |
+| --- | ---: | ---: | ---: | --- |
+| Dedicated 2 student + 2 teacher, rollout concurrency 32 | 381.57 s | 163.00 s | 189.91 s | Better batching, but only two trainer GPUs |
+| Dedicated 3 student + 1 teacher | 367.00 s | 155.02 s | 184.39 s | Teacher GPU is idle during reverse training |
+| Same-card rollout/training overlap, cohorts of 32 | 395.55 s | 95.31 s wait | 267.48 s | Strict, but kernel and memory contention dominate |
+| Same-card rollout/training overlap, cohorts of 64 | 392.13 s | 105.12 s wait | 259.10 s | Strict, still slower than phase switching |
+| Phase-shared 4 student + 2 teacher, terminal-only | 286.36 s | 137.91 s | 141.83 s | Throughput upper bound |
+| Phase-shared 4 student + 2 teacher, two chunks | 291.76 s | 141.98 s | 143.15 s | Selected full streaming |
+
+The overlap mode accumulates unnormalized gradients across rollout cohorts and performs exactly one normalization,
+clip, optimizer step, and weight publication at the final version barrier. It is therefore strict on-policy, but is
+disabled by default because concurrent vLLM and backward kernels were slower here; a 2048-token overlap run also
+exceeded 80 GiB. The 3:1 direct split is valid with DP=3 padding, but phase sharing is 1.134x faster in matched
+one-step runs because all four GPUs train after the teacher sleeps.
+
+A 4096-token reverse chunk with two trajectories per microbatch OOMed near 78.29 GiB. Reducing it to one trajectory
+completed at 315.90 seconds with a 141.26-second actor update, which did not improve over the selected 2048-token
+chunk. The 2048-token setting remains the performance and memory default.
 
 ### Correctness
 

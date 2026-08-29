@@ -1,0 +1,109 @@
+{
+  "date": "2026-08-29",
+  "dataset": "open-r1/DAPO-Math-17k-Processed",
+  "hardware": "4x NVIDIA A100-SXM4-80GB",
+  "student": "/models/store/Qwen/Qwen3-1.7B",
+  "teacher": "/models/store/Qwen/Qwen3-4B",
+  "student_dtype": "float32",
+  "teacher_dtype": "bfloat16",
+  "batch_size": 128,
+  "max_prompt_tokens": 1024,
+  "max_response_tokens": 3072,
+  "max_total_trajectory_tokens": 4096,
+  "topk": 32,
+  "phase_shared_topology": {
+    "physical_gpus": 4,
+    "student_execution_ranks": 4,
+    "teacher_replicas": 2,
+    "teacher_replica_gpu_ranks": [0, 1],
+    "teacher_sleeps_during_training": true,
+    "rollout_sleeps_during_training": true
+  },
+  "matched_verl_sync_opd": {
+    "trainer_mode": "sync",
+    "stable_step": 2,
+    "step_seconds": 312.7713492801413,
+    "generation_seconds": 129.82272081682459,
+    "old_log_prob_seconds": 46.026613514870405,
+    "update_actor_seconds": 130.31023767590523,
+    "weight_update_seconds": 6.179230308160186,
+    "response_length_mean": 3072.0,
+    "response_length_max": 3072.0,
+    "actor_peak_allocated_gb": 51.540380001068115,
+    "actor_peak_reserved_gb": 57.2421875,
+    "trajectory_staleness_max": 0
+  },
+  "streamopd_kv": {
+    "stable_step": 2,
+    "token_chunk_size": 1536,
+    "reverse_chunk_size": 2048,
+    "reverse_batch_size": 4,
+    "reverse_batch_max_tokens": 8192,
+    "rollout_max_num_seqs": 24,
+    "step_seconds": 291.7580686949659,
+    "generation_teacher_overlap_seconds": 141.9785978719592,
+    "reverse_training_seconds": 142.9625159520656,
+    "update_actor_seconds": 143.14975078310817,
+    "kv_handoff_seconds": 4.902917064493522,
+    "weight_update_seconds": 6.425875939894468,
+    "reverse_chunks": 64.0,
+    "reverse_backward_calls": 32.0,
+    "reverse_microbatches": 16.0,
+    "response_length_mean": 3063.9140625,
+    "response_length_max": 3072.0,
+    "actor_peak_allocated_gb": 64.3552770614624,
+    "actor_peak_reserved_gb": 70.50390625,
+    "trajectory_staleness_max": 0
+  },
+  "matched_speedup": 1.072022962995,
+  "matched_step_time_reduction": 0.067184160677,
+  "matched_gpu_seconds_reduction": 0.067184160677,
+  "ablations": {
+    "dedicated_2_student_2_teacher_streamopd": {
+      "step_seconds": 381.572627176065,
+      "generation_teacher_overlap_seconds": 163.0043123930227,
+      "update_actor_seconds": 189.91261553298682,
+      "rollout_max_num_seqs": 32
+    },
+    "dedicated_3_student_1_teacher_streamopd": {
+      "step_seconds": 367.00165578187443,
+      "generation_teacher_overlap_seconds": 155.02336262515746,
+      "update_actor_seconds": 184.38696493697353,
+      "trajectory_staleness_max": 0
+    },
+    "same_gpu_overlap_microbatch_32": {
+      "step_seconds": 395.54742294806056,
+      "generation_wait_seconds": 95.31016023340635,
+      "update_actor_seconds": 267.47767066420056,
+      "accumulation_steps": 4,
+      "trajectory_staleness_max": 0
+    },
+    "same_gpu_overlap_microbatch_64": {
+      "step_seconds": 392.1295402511023,
+      "generation_wait_seconds": 105.11760868690908,
+      "update_actor_seconds": 259.1044720360078,
+      "accumulation_steps": 2,
+      "trajectory_staleness_max": 0
+    },
+    "terminal_only_teacher_chunk": {
+      "token_chunk_size": 3072,
+      "stable_step": 2,
+      "step_seconds": 286.3552312699612,
+      "generation_teacher_seconds": 137.9076210029889,
+      "update_actor_seconds": 141.8322015281301,
+      "speedup_over_matched_sync": 1.092249468931,
+      "note": "Throughput upper bound without pre-EOS teacher scoring; not the selected full-streaming configuration."
+    },
+    "full_trajectory_reverse_4096_single_sequence": {
+      "step_seconds": 315.8968868309166,
+      "update_actor_seconds": 141.25702536688186,
+      "actor_peak_allocated_gb": 49.93561792373657,
+      "actor_peak_reserved_gb": 55.345703125
+    },
+    "full_trajectory_reverse_4096_two_sequences": {
+      "status": "CUDA OOM",
+      "peak_before_failure_gb": 78.29
+    }
+  },
+  "notes": "The primary comparison uses the same four physical GPUs and phase-shared placement for both paths. Step 2 is reported to exclude lazy worker startup. The selected 1536-token chunk produces two teacher submissions for a full 3072-token response, including pre-EOS scoring. All successful paths have zero policy staleness. On this host, NCCL_P2P_DISABLE=1 is required for FSDP groups spanning GPUs 0-3."
+}

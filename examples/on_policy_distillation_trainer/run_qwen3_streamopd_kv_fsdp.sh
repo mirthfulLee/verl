@@ -15,6 +15,12 @@ REVERSE_CHUNK_SIZE=${REVERSE_CHUNK_SIZE:-2048}
 REVERSE_BATCH_SIZE=${REVERSE_BATCH_SIZE:-4}
 REVERSE_BATCH_MAX_TOKENS=${REVERSE_BATCH_MAX_TOKENS:-8192}
 ACTOR_MAX_TOKENS_PER_GPU=${ACTOR_MAX_TOKENS_PER_GPU:-$TOTAL_TRAJECTORY_LENGTH}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-256}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.45}
+TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.55}
+OVERLAP_ROLLOUT_TRAINING=${OVERLAP_ROLLOUT_TRAINING:-False}
+ROLLOUT_MICRO_BATCH_SIZE=${ROLLOUT_MICRO_BATCH_SIZE:-32}
+COLOCATE_TEACHER_WITH_STUDENT=${COLOCATE_TEACHER_WITH_STUDENT:-False}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 STREAMOPD_KV_ENABLED=${STREAMOPD_KV_ENABLED:-True}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-streamopd_kv_qwen3}
@@ -59,7 +65,8 @@ fi
   actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1)) \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+  actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
+  actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
   trainer.use_v1=True \
   trainer.v1.trainer_mode=sync \
   trainer.n_gpus_per_node="$STUDENT_GPUS" \
@@ -77,6 +84,7 @@ fi
   distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL" \
   distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
   distillation.teacher_models.teacher_model.inference.max_model_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1)) \
+  distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="$TEACHER_GPU_MEMORY_UTILIZATION" \
   distillation.distillation_loss.loss_mode=forward_kl_topk \
   distillation.distillation_loss.topk=32 \
   distillation.distillation_loss.use_task_rewards=False \
@@ -86,5 +94,8 @@ fi
   distillation.streamopd_kv.reverse_chunk_size="$REVERSE_CHUNK_SIZE" \
   distillation.streamopd_kv.reverse_batch_size="$REVERSE_BATCH_SIZE" \
   distillation.streamopd_kv.reverse_batch_max_tokens="$REVERSE_BATCH_MAX_TOKENS" \
+  distillation.streamopd_kv.overlap_rollout_training="$OVERLAP_ROLLOUT_TRAINING" \
+  distillation.streamopd_kv.rollout_micro_batch_size="$ROLLOUT_MICRO_BATCH_SIZE" \
+  distillation.streamopd_kv.colocate_teacher_with_student="$COLOCATE_TEACHER_WITH_STUDENT" \
   "${RAY[@]}" \
   "$@"

@@ -849,6 +849,9 @@ distillation:
     reverse_chunk_size: 256
     reverse_batch_size: 16
     reverse_batch_max_tokens: 8192
+    overlap_rollout_training: false
+    rollout_micro_batch_size: 32
+    colocate_teacher_with_student: false
     max_pending_teacher_chunks: 128
     kv_handoff_dir: /tmp/verl-streamopd-kv
     rollout_backend: vllm

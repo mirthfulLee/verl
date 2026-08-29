@@ -50,6 +50,13 @@ def _partition_reverse_microbatches(
     return groups
 
 
+def _has_valid_response(sample: TensorDict) -> bool:
+    response_mask = sample["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.values()
+    return bool(response_mask.sum().item())
+
+
 def _forward_kl_topk_sum(
     logits: torch.Tensor,
     teacher_ids: torch.Tensor,
@@ -101,6 +108,16 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             )
         if self.engine_config.ulysses_sequence_parallel_size != 1:
             raise NotImplementedError("StreamOPD-KV FSDP MVP does not support Ulysses sequence parallelism")
+        self._accum_policy_version: int | None = None
+        self._accum_next_step = 0
+        self._accum_global_valid_tokens = 0.0
+
+    def _reset_accumulation(self, *, zero_grad: bool) -> None:
+        if zero_grad:
+            self.engine.optimizer_zero_grad()
+        self._accum_policy_version = None
+        self._accum_next_step = 0
+        self._accum_global_valid_tokens = 0.0
 
     @staticmethod
     def _sample_tensor(sample: TensorDict, name: str) -> torch.Tensor:
@@ -138,16 +155,34 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
 
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
         disable_auto_offload = bool(tu.pop(data, key="disable_auto_offload", default=False))
-        with self.engine.train_mode(disable_auto_offload=disable_auto_offload):
-            return self._train_streamopd_mini_batch(data)
+        accumulation_step = int(tu.get_non_tensor_data(data, "streamopd_accumulation_step", 0))
+        accumulation_steps = int(tu.get_non_tensor_data(data, "streamopd_accumulation_steps", 1))
+        if not 0 <= accumulation_step < accumulation_steps:
+            raise ValueError(f"invalid StreamOPD accumulation trigger {accumulation_step}/{accumulation_steps}")
+        finalize = accumulation_step == accumulation_steps - 1
+        with self.engine.train_mode(
+            disable_auto_offload=disable_auto_offload,
+            zero_grad_on_exit=finalize,
+        ):
+            return self._train_streamopd_mini_batch(
+                data,
+                accumulation_step=accumulation_step,
+                accumulation_steps=accumulation_steps,
+            )
 
-    def _train_streamopd_mini_batch(self, data: TensorDict) -> TensorDict:
+    def _train_streamopd_mini_batch(
+        self,
+        data: TensorDict,
+        *,
+        accumulation_step: int,
+        accumulation_steps: int,
+    ) -> TensorDict:
         epochs = int(tu.get_non_tensor_data(data, "epochs", 1))
         if epochs != 1:
             raise ValueError("strict StreamOPD-KV requires ppo_epochs=1")
 
-        samples = list(data.unbind(0))
-        policy_versions = {int(sample["streamopd_policy_version"]) for sample in samples}
+        all_samples = list(data.unbind(0))
+        policy_versions = {int(sample["streamopd_policy_version"]) for sample in all_samples}
         if len(policy_versions) != 1:
             raise RuntimeError(f"StreamOPD cohort mixes policy versions: {sorted(policy_versions)}")
         local_policy_version = next(iter(policy_versions))
@@ -160,6 +195,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 "StreamOPD data-parallel ranks mix policy versions: "
                 f"minimum={minimum_version.item()}, maximum={maximum_version.item()}"
             )
+        # V1 pads a cohort to the data-parallel world size with a minimal
+        # response whose mask is all zero. It has no serving KV snapshot and
+        # must not enter reverse recomputation or snapshot cleanup.
+        samples = [sample for sample in all_samples if _has_valid_response(sample)]
         trajectory_ids = [str(sample["streamopd_trajectory_id"]) for sample in samples]
         if len(set(trajectory_ids)) != len(trajectory_ids):
             raise RuntimeError("StreamOPD cohort contains duplicate trajectory identities")
@@ -186,6 +225,20 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         if global_valid_tokens.item() < 1:
             raise RuntimeError("StreamOPD cohort contains no valid response tokens")
 
+        if accumulation_step == 0:
+            if self._accum_policy_version is not None:
+                raise RuntimeError("StreamOPD started a new cohort while gradient accumulation is active")
+            self.engine.optimizer_zero_grad()
+            self._accum_policy_version = local_policy_version
+            self._accum_next_step = 0
+            self._accum_global_valid_tokens = 0.0
+        elif self._accum_policy_version != local_policy_version or self._accum_next_step != accumulation_step:
+            raise RuntimeError(
+                "StreamOPD accumulation order/version mismatch: "
+                f"expected version={self._accum_policy_version}, step={self._accum_next_step}; "
+                f"got version={local_policy_version}, step={accumulation_step}"
+            )
+
         model = self.engine.module
         parameter_dtype = next(model.parameters()).dtype
         forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
@@ -203,7 +256,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         handoff_seconds = 0.0
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
-        self.engine.optimizer_zero_grad()
+        finalize = accumulation_step == accumulation_steps - 1
 
         def backward_context(chunk_idx: int, trajectory_chunks: int):
             del chunk_idx, trajectory_chunks
@@ -287,13 +340,22 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 with backward_context(0, 1), mixed_precision_context():
                     self.engine.module(input_ids=dummy_token, use_cache=False).logits.sum().mul(0.0).backward()
 
-            scale = self.engine.get_data_parallel_size() / global_valid_tokens.item()
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(scale)
-            grad_norm = self.engine.optimizer_step()
-            lr = self.engine.lr_scheduler_step()
+            self._accum_global_valid_tokens += global_valid_tokens.item()
+            self._accum_next_step = accumulation_step + 1
+            if finalize:
+                scale = self.engine.get_data_parallel_size() / self._accum_global_valid_tokens
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(scale)
+                grad_norm = self.engine.optimizer_step()
+                lr = self.engine.lr_scheduler_step()
+            else:
+                grad_norm = 0.0
+                lr = self.engine.optimizer.param_groups[0]["lr"]
             step_succeeded = True
+        except Exception:
+            self._reset_accumulation(zero_grad=True)
+            raise
         finally:
             model.train(was_training)
             if self.streamopd_config.cleanup_after_step or not step_succeeded:
@@ -321,6 +383,9 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/handoff_seconds": handoff_seconds,
             "streamopd/training_seconds": elapsed,
             "streamopd/valid_tokens": local_valid_tokens,
+            "streamopd/accumulation_step": accumulation_step,
+            "streamopd/accumulation_steps": accumulation_steps,
+            "streamopd/optimizer_finalized": float(finalize),
             "perf/max_memory_allocated_gb": get_torch_device().max_memory_allocated() / (1024**3),
             "perf/max_memory_reserved_gb": get_torch_device().max_memory_reserved() / (1024**3),
         }
@@ -331,4 +396,6 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             metrics["streamopd/full_forward_loss_abs_error"] = abs(
                 metrics["streamopd/full_forward_validation_loss"] - metrics["loss"]
             )
+        if finalize:
+            self._reset_accumulation(zero_grad=False)
         return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

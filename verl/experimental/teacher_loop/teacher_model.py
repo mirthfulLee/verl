@@ -213,3 +213,23 @@ class MultiTeacherModelManager:
                 load_balancer_handle=manager.load_balancer_handle,
             )
         return teacher_clients
+
+    @auto_await
+    async def sleep(self) -> None:
+        await asyncio.gather(
+            *(
+                replica.sleep()
+                for manager in self.teacher_model_managers.values()
+                for replica in manager.rollout_replicas
+            )
+        )
+
+    @auto_await
+    async def wake_up(self) -> None:
+        await asyncio.gather(
+            *(
+                replica.wake_up()
+                for manager in self.teacher_model_managers.values()
+                for replica in manager.rollout_replicas
+            )
+        )

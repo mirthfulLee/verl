@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from types import SimpleNamespace
 
@@ -125,8 +126,8 @@ async def test_committed_chunk_publisher_emits_only_accepted_contiguous_tokens()
     await publisher.observe([10, 11, 12, 13], terminal=True)
 
     assert [(chunk.start, chunk.token_ids, chunk.terminal) for chunk in emitted] == [
-        (0, (10, 11), False),
-        (2, (12, 13), True),
+        (0, (10, 11, 12), False),
+        (3, (13,), True),
     ]
     assert emitted[0].prompt_ids == (1, 2)
     assert emitted[1].prompt_ids == ()
@@ -137,12 +138,56 @@ async def test_committed_chunk_publisher_emits_only_accepted_contiguous_tokens()
 
 
 @pytest.mark.asyncio
-async def test_teacher_streaming_scores_increasing_prefixes_and_closes_exact_chunk_boundary() -> None:
+async def test_committed_chunk_publisher_streams_every_complete_chunk_before_eos() -> None:
+    emitted = []
+
+    async def submit(chunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(TrajectoryKey(4, "every-chunk"), [1], chunk_size=2, submit=submit)
+    await publisher.observe([10, 11])
+    await publisher.observe([10, 11, 12, 13])
+    await publisher.observe([10, 11, 12, 13, 14, 15])
+
+    assert [(chunk.start, chunk.end, chunk.terminal) for chunk in emitted] == [
+        (0, 2, False),
+        (2, 4, False),
+        (4, 6, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_committed_chunk_publisher_sends_longest_page_aligned_progress() -> None:
+    emitted = []
+
+    async def submit(chunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(
+        TrajectoryKey(4, "page-aligned"),
+        [1],
+        chunk_size=2,
+        page_size=4,
+        submit=submit,
+    )
+    await publisher.observe(list(range(7)))
+    await publisher.observe(list(range(10)))
+    await publisher.observe(list(range(11)), terminal=True)
+
+    assert [(chunk.start, chunk.end, chunk.terminal) for chunk in emitted] == [
+        (0, 4, False),
+        (4, 8, False),
+        (8, 11, True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_teacher_streaming_coalesces_queued_progress_before_prefill() -> None:
     calls = []
 
-    async def score(sequence: list[int], request_id: str, artifact_start: int) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append((list(sequence), request_id, artifact_start))
-        ids = torch.tensor(sequence[artifact_start:]).unsqueeze(-1)
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((list(fragment), request_id, terminal))
+        ids = torch.tensor(fragment).unsqueeze(-1)
         return ids, -ids.float()
 
     coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=2)
@@ -153,11 +198,118 @@ async def test_teacher_streaming_scores_increasing_prefixes_and_closes_exact_chu
     await coordinator.submit(CommittedTokenChunk(key=key, start=2, token_ids=(12, 13), terminal=False))
     await coordinator.submit(CommittedTokenChunk(key=key, start=4, token_ids=(), terminal=True))
     ids, logprobs = await coordinator.result(key, required_completion_tokens=4)
-    assert [call[0] for call in calls] == [[1, 2, 10, 11], [1, 2, 10, 11, 12, 13]]
-    assert calls[0][1] == calls[1][1]
-    assert [call[2] for call in calls] == [0, 3]
+    assert [call[0] for call in calls] == [[1, 2, 10, 11, 12, 13]]
+    assert [call[2] for call in calls] == [True]
     torch.testing.assert_close(ids[:, 0], torch.tensor([1, 2, 10, 11, 12, 13]))
     torch.testing.assert_close(logprobs[:, 0], -ids[:, 0].float())
+
+
+@pytest.mark.asyncio
+async def test_teacher_streaming_serializes_chunks_for_one_trajectory() -> None:
+    calls = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    active = 0
+    max_active = 0
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        calls.append((list(fragment), request_id, terminal))
+        if len(calls) == 1:
+            first_started.set()
+            await release_first.wait()
+        ids = torch.tensor(fragment).unsqueeze(-1)
+        active -= 1
+        return ids, -ids.float()
+
+    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=8, kv_page_size=1)
+    key = TrajectoryKey(9, "serial")
+    await coordinator.submit(
+        CommittedTokenChunk(key=key, start=0, token_ids=(10, 11), prompt_ids=(1, 2), terminal=False)
+    )
+    await first_started.wait()
+    await coordinator.submit(CommittedTokenChunk(key=key, start=2, token_ids=(12, 13), terminal=True))
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    release_first.set()
+    ids, _ = await coordinator.result(key, required_completion_tokens=4)
+
+    assert max_active == 1
+    assert [call[0] for call in calls] == [[1, 2, 10, 11], [12, 13]]
+    assert calls[0][1] == calls[1][1]
+    assert [call[2] for call in calls] == [False, True]
+    torch.testing.assert_close(ids[:, 0], torch.tensor([1, 2, 10, 11, 12, 13]))
+
+
+@pytest.mark.asyncio
+async def test_teacher_streaming_closes_session_on_empty_terminal_marker() -> None:
+    calls = []
+    first_done = asyncio.Event()
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((fragment, terminal))
+        values = torch.tensor(fragment, dtype=torch.int32).unsqueeze(-1)
+        if len(calls) == 1:
+            first_done.set()
+        return values, values.float()
+
+    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=8, kv_page_size=1)
+    key = TrajectoryKey(9, "empty-terminal")
+    await coordinator.submit(CommittedTokenChunk(key=key, start=0, token_ids=(10, 11), prompt_ids=(1,), terminal=False))
+    await first_done.wait()
+    await coordinator.submit(CommittedTokenChunk(key=key, start=2, token_ids=(), terminal=True))
+    ids, _ = await coordinator.result(key, required_completion_tokens=2)
+
+    assert calls == [([1, 10, 11], False), ([], True)]
+    torch.testing.assert_close(ids[:, 0], torch.tensor([1, 10, 11], dtype=torch.int32))
+
+
+@pytest.mark.asyncio
+async def test_teacher_streaming_limits_active_trajectories_and_kv_tokens() -> None:
+    started = asyncio.Queue()
+    release = asyncio.Event()
+    active = 0
+    max_active = 0
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await started.put(request_id)
+        await release.wait()
+        ids = torch.tensor(fragment).unsqueeze(-1)
+        active -= 1
+        return ids, -ids.float()
+
+    coordinator = StreamingTeacherCoordinator(
+        score,
+        max_pending_chunks=8,
+        max_active_trajectories=2,
+        max_active_kv_tokens=7,
+        kv_page_size=1,
+    )
+    keys = [TrajectoryKey(4, f"budget-{idx}") for idx in range(3)]
+    for idx, key in enumerate(keys):
+        await coordinator.submit(
+            CommittedTokenChunk(
+                key=key,
+                start=0,
+                token_ids=(10 + idx, 20 + idx, 30 + idx),
+                prompt_ids=(1,),
+                terminal=True,
+            )
+        )
+
+    await started.get()
+    await asyncio.sleep(0.01)
+    # Each active request owns four prefix tokens, so the seven-token budget
+    # admits only one trajectory even though the count limit is two.
+    assert active == 1
+    release.set()
+    await asyncio.gather(*(coordinator.result(key, required_completion_tokens=3) for key in keys))
+    assert max_active == 1
 
 
 @pytest.mark.asyncio
@@ -648,6 +800,40 @@ def test_teacher_and_training_admission_are_mutually_exclusive() -> None:
     assert scheduler.try_teacher_started(11) is True
     scheduler.teacher_finished(11)
     scheduler.end_policy(11)
+
+
+def test_teacher_admission_limits_active_trajectory_count_and_kv_tokens() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(12)
+    for _ in range(3):
+        scheduler.teacher_enqueued(12)
+
+    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is True
+    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is False
+    assert scheduler.snapshot()["teacher_active_kv_tokens"] == 4
+    scheduler.teacher_finished(12, 4)
+    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is True
+    scheduler.teacher_finished(12, 4)
+    scheduler.teacher_cancelled(12)
+    scheduler.end_policy(12)
+
+
+def test_teacher_session_reservation_is_held_until_eos() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(13)
+    assert scheduler.try_teacher_session_admitted(13, "a", 4096, 16, 8192) is True
+    assert scheduler.try_teacher_session_admitted(13, "b", 4096, 16, 8192) is True
+    assert scheduler.try_teacher_session_admitted(13, "c", 4096, 16, 8192) is False
+    state = scheduler.snapshot()
+    assert state["teacher_sessions"] == 2
+    assert state["teacher_session_kv_tokens"] == 8192
+    with pytest.raises(RuntimeError, match="teacher_sessions=2"):
+        scheduler.end_policy(13)
+    scheduler.teacher_session_released(13, "a")
+    assert scheduler.try_teacher_session_admitted(13, "c", 4096, 16, 8192) is True
+    scheduler.teacher_session_released(13, "b")
+    scheduler.teacher_session_released(13, "c")
+    scheduler.end_policy(13)
 
 
 @pytest.mark.parametrize("use_chunked_topk", [False, True])

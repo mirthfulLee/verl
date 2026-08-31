@@ -25,6 +25,7 @@ from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
 import torch
+from packaging import version
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
@@ -230,6 +231,67 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+
+    def enable_streaming_prompt_logprobs(self) -> bool:
+        """Emit prompt logprobs for every vLLM 0.15.1 StreamingInput update.
+
+        vLLM 0.15.1 keeps the KV cache for resumable requests, but its legacy
+        GPU runner removes prompt-logprob bookkeeping after the first input.
+        Re-arm that bookkeeping and return only the newly appended rows.  The
+        patch is installed only on teacher workers and can be removed once the
+        corresponding vLLM behavior is available upstream.
+        """
+        import vllm
+
+        if version.parse(vllm.__version__) != version.parse("0.15.1"):
+            return False
+
+        model_runner = self.model_runner
+        original = getattr(model_runner, "_get_prompt_logprobs_dict", None)
+        if original is None:
+            logger.warning("vLLM 0.15.1 streaming prompt-logprob patch skipped: unsupported model runner")
+            return False
+
+        emitted_prompt_lens: dict[str, int] = {}
+
+        def get_streaming_prompt_logprobs(runner, hidden_states, num_scheduled_tokens):
+            active_request_ids = set(runner.requests)
+            for request_id in tuple(emitted_prompt_lens):
+                if request_id not in active_request_ids:
+                    del emitted_prompt_lens[request_id]
+
+            # A resumable request is scheduled as a cached request after its
+            # first input, so the stock runner does not re-register it here.
+            for request_id in num_scheduled_tokens:
+                request = runner.requests.get(request_id)
+                sampling_params = getattr(request, "sampling_params", None)
+                num_logprobs = getattr(sampling_params, "prompt_logprobs", None)
+                if num_logprobs is not None:
+                    runner.num_prompt_logprobs.setdefault(request_id, num_logprobs)
+
+            outputs = original(hidden_states, num_scheduled_tokens)
+            for request_id, tensors in tuple(outputs.items()):
+                if tensors is None:
+                    continue
+                request = runner.requests[request_id]
+                prompt_len = len(request.prompt_token_ids or ())
+                previous_prompt_len = emitted_prompt_lens.get(request_id, 0)
+                if previous_prompt_len:
+                    # Absolute tensor row i scores prompt token i + 1.  The
+                    # first token in an appended fragment is already covered
+                    # by the prior chunk's sampled-logprob row.
+                    start = min(previous_prompt_len, tensors.logprobs.shape[0])
+                    outputs[request_id] = type(tensors)(
+                        logprob_token_ids=tensors.logprob_token_ids[start:],
+                        logprobs=tensors.logprobs[start:],
+                        selected_token_ranks=tensors.selected_token_ranks[start:],
+                    )
+                emitted_prompt_lens[request_id] = prompt_len
+            return outputs
+
+        model_runner._get_prompt_logprobs_dict = MethodType(get_streaming_prompt_logprobs, model_runner)
+        logger.info("Enabled vLLM 0.15.1 StreamingInput prompt-logprob compatibility patch")
+        return True
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""

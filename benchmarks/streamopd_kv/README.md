@@ -29,6 +29,21 @@ This workspace was configured with `uv` in `.venv-cu128`. The measured environme
 PyTorch 2.9.1+cu128, vLLM 0.15.1, and transformers 4.57.6.
 The CUDA 12.8 environment is used because this host's 560.35.03 driver cannot load the repository's CUDA 13 lock.
 
+The teacher path uses vLLM 0.15.1's resumable `StreamingInput` API. Validate it independently with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 .venv-cu128/bin/python \
+  benchmarks/streamopd_kv/validate_vllm_streaming_input.py \
+  --model /models/store/Qwen/Qwen3-4B --num-sessions 16 \
+  --max-model-len 4097 --max-num-batched-tokens 2048 \
+  --sequence-length 3200 --prompt-length 100 --response-chunk 1066 \
+  --skip-tokenizer-init
+```
+
+On GPU0 this produced three artifact fragments per session, released all sessions at EOS, and completed 16
+concurrent sessions in about 4.0 seconds (model loading excluded). The server-side compatibility patch is only
+enabled for vLLM 0.15.1 and only on teacher workers; it re-arms prompt-logprob extraction for appended fragments.
+
 Activate it for Ray workers as well as the driver:
 
 ```bash
@@ -101,12 +116,30 @@ occurs in the policy loop. A forced 8192 width-8 run OOMed, validating the width
 `max_num_batched_tokens` from 2048 to 4096 is a stable 8192 tuning and lowers mb16 to 291.06 s (1.519x vs sync),
 while 8192 teacher tokens make one teacher process consume 65.29 GiB and OOM, so it is not a default.
 
-Rollout uses independent continuous batching (`max_num_seqs` is tuned separately from microbatch). KV chunk files
-enter the Teacher/Trainer Pool-visible host cache during generation, before EOS; multiple in-progress or sealed MBs
-may be host-resident. Each trainer worker has a fail-closed single-MB GPU KV lease, and the next ready MB is loaded
-only after the current update releases it. All successful runs recorded pre-EOS KV chunks, one optimizer
+Rollout uses independent continuous batching (`max_num_seqs` is tuned separately from microbatch). In the normal
+streaming path every committed rollout/KV chunk is submitted to the stateful teacher immediately; the teacher chunk
+size should match the rollout/KV chunk size. Each trajectory keeps one resumable teacher session alive from its first
+fragment to EOS. Admission reserves the configured full trajectory KV footprint up front, while the host can cache
+additional in-progress or sealed microbatches. The terminal-only setting is an explicit ablation and is not the default.
+KV chunk files enter the Teacher/Trainer Pool-visible host
+cache during generation, before EOS; multiple in-progress or sealed MBs may be host-resident. Each trainer worker has
+a fail-closed single-MB GPU KV lease, and the next ready MB is loaded only after the current update releases it. All successful runs recorded pre-EOS KV chunks, one optimizer
 finalization, and zero policy staleness. Machine-readable results are in
 `results/optimized_flash_wavefront_b128/summary.json`.
+
+### vLLM StreamingInput sample
+
+After switching teacher scoring from repeated full-prefix requests to resumable `StreamingInput`, a GPU0-3 one-step
+sample with Qwen3-1.7B/Qwen3-4B, BF16, total trajectory length 4096, and rollout batch 128 completed as follows:
+
+| Live teacher sessions | Teacher KV reservation | Step | Rollout | Reverse units | Teacher fragments | Throughput |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 32768 tokens | 107.65 s | 42.20 s | 4 | 256 | 936.69 tok/s |
+
+The corresponding recorded `verl-sync-opd` step is 284.65 s (355.64 tok/s), so this sample is 2.64x faster. A
+rollout batch 32 / live-session 8 sample completed in 65.19 s with 64 teacher fragments and two reverse units.
+These samples use `micro_batch_size=32` only for Teacher/Trainer scheduling; rollout continuous batching is configured
+independently.
 
 ### End-to-end V1 sync comparison (total trajectory length 4096)
 

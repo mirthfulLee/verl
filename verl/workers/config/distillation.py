@@ -246,6 +246,9 @@ class StreamOPDKVConfig(BaseConfig):
     scheduler_timeout_seconds: float = 600.0
     scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
+    teacher_prefill_max_active_trajectories: int = 16
+    teacher_prefill_max_active_kv_tokens: int = 65536
+    teacher_prefill_kv_page_size: int = 64
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"
     exact_dense_attention: bool = True
@@ -268,6 +271,9 @@ class StreamOPDKVConfig(BaseConfig):
             "rollout_micro_batch_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
+            "teacher_prefill_max_active_trajectories",
+            "teacher_prefill_max_active_kv_tokens",
+            "teacher_prefill_kv_page_size",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"streamopd_kv.{name} must be positive")
@@ -277,6 +283,8 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.reverse_chunk_min_size must not exceed reverse_chunk_size")
         if self.reverse_page_size < 16 or self.reverse_page_size & (self.reverse_page_size - 1):
             raise ValueError("streamopd_kv.reverse_page_size must be a power of two and at least 16")
+        if self.teacher_prefill_kv_page_size & (self.teacher_prefill_kv_page_size - 1):
+            raise ValueError("streamopd_kv.teacher_prefill_kv_page_size must be a power of two")
         if self.reverse_chunk_size % self.reverse_page_size or self.reverse_chunk_min_size % self.reverse_page_size:
             raise ValueError("StreamOPD reverse chunk sizes must be divisible by reverse_page_size")
         if self.validation_atol < 0:

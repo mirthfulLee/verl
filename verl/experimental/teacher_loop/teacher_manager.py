@@ -144,3 +144,25 @@ class AsyncTeacherLLMServerManager:
         expected_rows = len(sequence_ids) - prompt_logprobs_start
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == expected_rows
         return teacher_ids, teacher_logprobs
+
+    async def compute_teacher_logprobs_streaming(
+        self,
+        token_ids: list[int],
+        request_id: str,
+        terminal: bool,
+        routing_key: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score one new token fragment while retaining the teacher's vLLM KV."""
+        teacher_key = self._resolve_teacher_key(routing_key)
+        teacher_model_config = self.teacher_model_configs[teacher_key]
+        teacher_output = await self.teacher_client[teacher_key].stream_teacher_chunk(
+            request_id=request_id,
+            token_ids=token_ids,
+            sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
+            terminal=terminal,
+        )
+        teacher_ids = torch.as_tensor(teacher_output["prompt_ids"], dtype=torch.int32)
+        teacher_logprobs = torch.as_tensor(teacher_output["prompt_logprobs"])
+        if teacher_ids.shape[0] != len(token_ids) or teacher_logprobs.shape[0] != len(token_ids):
+            raise RuntimeError("resumable teacher returned an incomplete token fragment")
+        return teacher_ids, teacher_logprobs

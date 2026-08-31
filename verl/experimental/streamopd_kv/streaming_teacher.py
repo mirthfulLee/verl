@@ -16,7 +16,7 @@ import torch
 
 from .protocol import CommittedTokenChunk, TrajectoryKey
 
-TeacherScoreFn = Callable[[list[int], str, int], Awaitable[tuple[torch.Tensor, torch.Tensor]]]
+TeacherScoreFn = Callable[[list[int], str, bool], Awaitable[tuple[torch.Tensor, torch.Tensor]]]
 
 
 @dataclass
@@ -27,6 +27,44 @@ class _TeacherSession:
     terminal: bool = False
     latest_ids: torch.Tensor | None = None
     latest_logprobs: torch.Tensor | None = None
+    scored_response_tokens: int = 0
+    updated: asyncio.Event = field(default_factory=asyncio.Event)
+    admitted: bool = False
+    stream_closed: bool = False
+
+
+class _LocalTeacherAdmission:
+    """Fallback admission control for tests without the global scheduler."""
+
+    def __init__(self, max_trajectories: int, max_kv_tokens: int) -> None:
+        self._slots = asyncio.Semaphore(max_trajectories)
+        self._max_kv_tokens = max_kv_tokens
+        self._active_kv_tokens = 0
+        self._condition = asyncio.Condition()
+
+    async def acquire(self, kv_tokens: int) -> None:
+        await self._slots.acquire()
+        try:
+            async with self._condition:
+                await self._condition.wait_for(
+                    lambda: (
+                        self._active_kv_tokens == 0
+                        if kv_tokens > self._max_kv_tokens
+                        else self._active_kv_tokens + kv_tokens <= self._max_kv_tokens
+                    )
+                )
+                self._active_kv_tokens += kv_tokens
+        except BaseException:
+            self._slots.release()
+            raise
+
+    async def release(self, kv_tokens: int) -> None:
+        async with self._condition:
+            self._active_kv_tokens -= kv_tokens
+            if self._active_kv_tokens < 0:
+                raise RuntimeError("teacher KV admission accounting became negative")
+            self._condition.notify_all()
+        self._slots.release()
 
 
 class StreamingTeacherCoordinator:
@@ -38,26 +76,76 @@ class StreamingTeacherCoordinator:
         max_pending_chunks: int,
         scheduler=None,
         scheduler_poll_interval_ms: int = 10,
+        max_active_trajectories: int | None = None,
+        max_active_kv_tokens: int = 65536,
+        kv_page_size: int = 64,
+        kv_reservation_tokens: int | None = None,
     ) -> None:
         if max_pending_chunks < 1:
             raise ValueError("max_pending_chunks must be positive")
+        max_active_trajectories = max_active_trajectories or max_pending_chunks
+        if max_active_trajectories < 1 or max_active_kv_tokens < 1 or kv_page_size < 1:
+            raise ValueError("teacher trajectory, KV-token, and page limits must be positive")
         self._score = score
-        self._slots = asyncio.Semaphore(max_pending_chunks)
         self._sessions: dict[TrajectoryKey, _TeacherSession] = {}
         self._scheduler = scheduler
+        self._max_active_trajectories = max_active_trajectories
+        self._max_active_kv_tokens = max_active_kv_tokens
+        self._kv_page_size = kv_page_size
+        self._kv_reservation_tokens = kv_reservation_tokens
+        if kv_reservation_tokens is not None and kv_reservation_tokens < 1:
+            raise ValueError("teacher KV reservation must be positive")
+        self._local_admission = _LocalTeacherAdmission(max_active_trajectories, max_active_kv_tokens)
         self._scheduler_poll_seconds = scheduler_poll_interval_ms / 1000.0
         if self._scheduler_poll_seconds <= 0:
             raise ValueError("scheduler_poll_interval_ms must be positive")
 
-    async def _schedule(self, method: str, policy_version: int) -> None:
+    async def _schedule(self, method: str, policy_version: int, *args) -> None:
         if self._scheduler is not None:
-            await getattr(self._scheduler, method).remote(policy_version)
+            await getattr(self._scheduler, method).remote(policy_version, *args)
 
-    async def _acquire_teacher(self, policy_version: int) -> None:
+    async def _acquire_teacher(self, policy_version: int, kv_tokens: int) -> None:
         if self._scheduler is None:
             return
-        while not await self._scheduler.try_teacher_started.remote(policy_version):
+        while not await self._scheduler.try_teacher_started.remote(
+            policy_version,
+            kv_tokens,
+            self._max_active_trajectories,
+            self._max_active_kv_tokens,
+        ):
             await asyncio.sleep(self._scheduler_poll_seconds)
+
+    async def _release_teacher(self, policy_version: int, kv_tokens: int, *, started: bool) -> None:
+        if self._scheduler is not None:
+            await self._schedule("teacher_finished" if started else "teacher_cancelled", policy_version, kv_tokens)
+
+    async def _admit_session(self, key: TrajectoryKey, reservation: int) -> None:
+        globally_admitted = False
+        session_id = f"v{key.policy_version}-{key.trajectory_id}"
+        try:
+            if self._scheduler is not None:
+                while not await self._scheduler.try_teacher_session_admitted.remote(
+                    key.policy_version,
+                    session_id,
+                    reservation,
+                    self._max_active_trajectories,
+                    self._max_active_kv_tokens,
+                ):
+                    await asyncio.sleep(self._scheduler_poll_seconds)
+                globally_admitted = True
+            await self._local_admission.acquire(reservation)
+        except BaseException:
+            if globally_admitted:
+                await self._schedule("teacher_session_released", key.policy_version, session_id)
+            raise
+
+    async def _release_session(self, key: TrajectoryKey, reservation: int) -> None:
+        session_id = f"v{key.policy_version}-{key.trajectory_id}"
+        try:
+            if self._scheduler is not None:
+                await self._schedule("teacher_session_released", key.policy_version, session_id)
+        finally:
+            await self._local_admission.release(reservation)
 
     async def submit(self, chunk: CommittedTokenChunk) -> None:
         session = self._sessions.get(chunk.key)
@@ -76,59 +164,88 @@ class StreamingTeacherCoordinator:
                 f"expected {len(session.response_ids)}, got {chunk.start}"
             )
 
-        prior = session.tail
         session.response_ids.extend(chunk.token_ids)
-        sequence = list(session.prompt_ids) + list(session.response_ids)
-        # The prior prefix ends in a dummy row because there is no next token
-        # yet. Re-fetch that boundary row when a later chunk makes it valid.
-        artifact_start = 0 if chunk.start == 0 else len(session.prompt_ids) + chunk.start - 1
         session.terminal = chunk.terminal
-        await self._schedule("teacher_enqueued", chunk.key.policy_version)
+        session.updated.set()
+        if session.tail is None:
+            session.tail = asyncio.create_task(
+                self._run_session(chunk.key, session),
+                name=f"streamopd-teacher-{chunk.key.trajectory_id}",
+            )
+
+    def _target_response_tokens(self, session: _TeacherSession) -> int:
+        available = len(session.response_ids)
+        if session.terminal:
+            return available
+        aligned_total = (len(session.prompt_ids) + available) // self._kv_page_size * self._kv_page_size
+        return max(0, aligned_total - len(session.prompt_ids))
+
+    async def _run_session(self, key: TrajectoryKey, session: _TeacherSession) -> None:
+        reservation = self._kv_reservation_tokens or self._max_active_kv_tokens
         try:
-            await self._slots.acquire()
-        except BaseException:
-            await self._schedule("teacher_cancelled", chunk.key.policy_version)
-            raise
-
-        async def score_chunk() -> None:
-            started = False
-            try:
-                if prior is not None:
-                    await prior
-                await self._acquire_teacher(chunk.key.policy_version)
-                started = True
-                if not chunk.token_ids and artifact_start:
-                    return
-                request_id = f"streamopd-teacher-v{chunk.key.policy_version}-{chunk.key.trajectory_id}"
-                teacher_ids, teacher_logprobs = await self._score(sequence, request_id, artifact_start)
-                expected_rows = len(sequence) - artifact_start
-                if teacher_ids.shape[0] != expected_rows or teacher_logprobs.shape[0] != expected_rows:
-                    raise RuntimeError(
-                        f"teacher returned incomplete prefix for {chunk.key}: "
-                        f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, expected={expected_rows}"
-                    )
-                # The last prompt-logprob row is a dummy because it has no
-                # next-token target yet. A later prefix replaces that row, so
-                # retaining only the latest full result is required for exact
-                # next-token alignment across chunk boundaries.
-                if artifact_start:
-                    if session.latest_ids is None or session.latest_logprobs is None:
-                        raise RuntimeError(f"teacher session {chunk.key} is missing its prior artifact prefix")
-                    session.latest_ids = torch.cat((session.latest_ids[:artifact_start], teacher_ids.detach().cpu()))
-                    session.latest_logprobs = torch.cat(
-                        (session.latest_logprobs[:artifact_start], teacher_logprobs.detach().cpu())
-                    )
-                else:
-                    session.latest_ids = teacher_ids.detach().cpu()
-                    session.latest_logprobs = teacher_logprobs.detach().cpu()
-            finally:
-                if started:
-                    await self._schedule("teacher_finished", chunk.key.policy_version)
-                else:
-                    await self._schedule("teacher_cancelled", chunk.key.policy_version)
-                self._slots.release()
-
-        session.tail = asyncio.create_task(score_chunk(), name=f"streamopd-teacher-{chunk.key.trajectory_id}")
+            while True:
+                await session.updated.wait()
+                session.updated.clear()
+                while True:
+                    target_response_tokens = self._target_response_tokens(session)
+                    if target_response_tokens <= session.scored_response_tokens:
+                        if session.terminal and session.scored_response_tokens == len(session.response_ids):
+                            if not session.stream_closed:
+                                request_id = f"streamopd-teacher-v{key.policy_version}-{key.trajectory_id}"
+                                await self._score([], request_id, True)
+                                session.stream_closed = True
+                            return
+                        break
+                    scored_response_tokens = session.scored_response_tokens
+                    if scored_response_tokens == 0:
+                        fragment = list(session.prompt_ids) + list(session.response_ids[:target_response_tokens])
+                    else:
+                        fragment = list(session.response_ids[scored_response_tokens:target_response_tokens])
+                    terminal = session.terminal and target_response_tokens == len(session.response_ids)
+                    kv_tokens = len(session.prompt_ids) + target_response_tokens
+                    if kv_tokens > reservation:
+                        raise RuntimeError(
+                            f"teacher session {key} exceeded its {reservation}-token KV reservation: {kv_tokens}"
+                        )
+                    if not session.admitted:
+                        await self._admit_session(key, reservation)
+                        session.admitted = True
+                    await self._schedule("teacher_enqueued", key.policy_version)
+                    started = False
+                    acquired = False
+                    try:
+                        await self._acquire_teacher(key.policy_version, kv_tokens)
+                        acquired = True
+                        started = True
+                        request_id = f"streamopd-teacher-v{key.policy_version}-{key.trajectory_id}"
+                        teacher_ids, teacher_logprobs = await self._score(fragment, request_id, terminal)
+                        expected_rows = len(fragment)
+                        if teacher_ids.shape[0] != expected_rows or teacher_logprobs.shape[0] != expected_rows:
+                            raise RuntimeError(
+                                f"teacher returned incomplete fragment for {key}: "
+                                f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, "
+                                f"expected={expected_rows}"
+                            )
+                        if session.latest_ids is not None and session.latest_logprobs is not None:
+                            session.latest_ids = torch.cat((session.latest_ids, teacher_ids.detach().cpu()))
+                            session.latest_logprobs = torch.cat(
+                                (session.latest_logprobs, teacher_logprobs.detach().cpu())
+                            )
+                        else:
+                            session.latest_ids = teacher_ids.detach().cpu()
+                            session.latest_logprobs = teacher_logprobs.detach().cpu()
+                        session.scored_response_tokens = target_response_tokens
+                        if terminal:
+                            session.stream_closed = True
+                    finally:
+                        if acquired:
+                            await self._release_teacher(key.policy_version, kv_tokens, started=started)
+                        elif self._scheduler is not None:
+                            await self._schedule("teacher_cancelled", key.policy_version, kv_tokens)
+        finally:
+            if session.admitted:
+                await self._release_session(key, reservation)
+                session.admitted = False
 
     async def result(self, key: TrajectoryKey, required_completion_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
         session = self._sessions.get(key)

@@ -24,10 +24,16 @@ The initial backend deliberately fails closed outside this envelope:
 
 ## Execution path
 
-1. `CommittedChunkPublisher` observes cumulative vLLM outputs and publishes only accepted token prefixes.
-2. `StreamingTeacherCoordinator` appends teacher work to a central queue. Teacher forward waits while a reverse
-   training unit is active; reverse training waits for the configured teacher backlog threshold. The scheduler uses
-   atomic admission, so teacher and trainer kernels never overlap on the shared GPU pool.
+1. `CommittedChunkPublisher` observes cumulative vLLM outputs and publishes every accepted token chunk as soon as
+   it reaches the configured teacher chunk size. The recommended chunk size matches the rollout/KV chunk size so
+   each committed rollout chunk is scored exactly once. `teacher_terminal_only_after_initial` is false by default; when
+   explicitly enabled, only the first chunk and the EOS catch-up chunk are submitted as a performance ablation.
+2. `StreamingTeacherCoordinator` appends teacher work to a central queue. With vLLM 0.15.1+, each trajectory is a
+   resumable `StreamingInput` session: the first request contains the prompt and first response fragment, and later
+   requests contain only newly committed response tokens. vLLM retains the causal KV session and discards its dummy
+   sampled token when the next fragment arrives, so no completed-prefix forward is repeated. Teacher forward waits
+   while a reverse training unit is active; reverse training waits for the configured teacher backlog threshold. The
+   scheduler uses atomic admission, so teacher and trainer kernels never overlap on the shared GPU pool.
 3. The rollout vLLM engine uses continuous batching independently of the Teacher/Trainer microbatch.
    `StreamOPDKVConnector` observes computed-token progress on every scheduler step. Each complete token range is
    copied from the live NHD pages to pinned CPU memory and serialized into the Teacher/Trainer Pool-visible host
@@ -45,7 +51,9 @@ The initial backend deliberately fails closed outside this envelope:
    `max_sequence_length * batch_size <= reverse_batch_max_tokens`.
    Finished trajectories leave the batch at higher reverse depths, so shorter traces do not execute zero-loss
    suffix chunks.
-   The worker starts from the largest configured chunk. Before policy version zero it samples reusable memory once,
+   Each live teacher `StreamingInput` session reserves `prompt_length + response_length` KV tokens before its first
+   fragment and releases that reservation only after EOS. This keeps the number of resident teacher sessions bounded
+   even while rollout is still producing fragments. The worker starts from the largest configured chunk. Before policy version zero it samples reusable memory once,
    then analytically accounts for persistent KV, activation/backward workspace, vocabulary logits/gradients, and
    reserve space. It first preserves the large chunk and reduces the power-of-two wavefront width as needed; only if
    that is insufficient does it reduce the chunk. The resulting plan is reused for every step, so there is no

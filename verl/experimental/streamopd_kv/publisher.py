@@ -18,7 +18,9 @@ class CommittedChunkPublisher:
 
     vLLM and SGLang expose cumulative accepted output IDs while streaming.
     Rejected speculative tokens never appear in that list.  A non-prefix update
-    therefore indicates a backend contract violation and fails closed.
+    therefore indicates a backend contract violation and fails closed. In the
+    normal mode every complete chunk is submitted immediately; terminal-only
+    catch-up is retained as an explicit ablation for older workloads.
     """
 
     def __init__(
@@ -28,14 +30,16 @@ class CommittedChunkPublisher:
         chunk_size: int,
         submit: Callable[[CommittedTokenChunk], Awaitable[None]],
         terminal_only_after_initial: bool = False,
+        page_size: int = 1,
     ) -> None:
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
+        if chunk_size < 1 or page_size < 1:
+            raise ValueError("chunk_size and page_size must be positive")
         self.key = key
         self.prompt_ids = tuple(int(token_id) for token_id in prompt_ids)
         self.chunk_size = chunk_size
         self.submit = submit
         self.terminal_only_after_initial = terminal_only_after_initial
+        self.page_size = page_size
         self._accepted: tuple[int, ...] = ()
         self._emitted = 0
         self._terminal = False
@@ -52,7 +56,11 @@ class CommittedChunkPublisher:
         while len(self._accepted) - self._emitted >= self.chunk_size and (
             not self.terminal_only_after_initial or self._emitted == 0
         ):
-            end = self._emitted + self.chunk_size
+            end = len(self._accepted)
+            if not terminal:
+                end = end // self.page_size * self.page_size
+            if end <= self._emitted:
+                break
             chunk_is_terminal = terminal and end == len(self._accepted)
             await self._emit(end, terminal=chunk_is_terminal)
             terminal_sent = terminal_sent or chunk_is_terminal

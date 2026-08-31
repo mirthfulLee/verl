@@ -520,6 +520,10 @@ class AgentLoopWorker:
                     max_pending_chunks=int(streamopd_config.get("max_pending_teacher_chunks", 128)),
                     scheduler=scheduler,
                     scheduler_poll_interval_ms=int(streamopd_config.get("scheduler_poll_interval_ms", 10)),
+                    max_active_trajectories=int(streamopd_config.get("teacher_prefill_max_active_trajectories", 16)),
+                    max_active_kv_tokens=int(streamopd_config.get("teacher_prefill_max_active_kv_tokens", 65536)),
+                    kv_page_size=int(streamopd_config.get("teacher_prefill_kv_page_size", 64)),
+                    kv_reservation_tokens=int(self.rollout_config.prompt_length + self.rollout_config.response_length),
                 )
                 self.llm_client.streamopd_callback = ray.get_runtime_context().current_actor
                 self.llm_client.streamopd_chunk_size = int(
@@ -531,6 +535,7 @@ class AgentLoopWorker:
                 self.llm_client.streamopd_terminal_only_after_initial = bool(
                     streamopd_config.get("teacher_terminal_only_after_initial", False)
                 )
+                self.llm_client.streamopd_page_size = int(streamopd_config.get("teacher_prefill_kv_page_size", 64))
         else:
             self.streamopd_config = {}
             self.streamopd_kv_enabled = False
@@ -710,12 +715,12 @@ class AgentLoopWorker:
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     async def _score_streamopd_teacher_prefix(
-        self, sequence_ids: list[int], request_id: str, artifact_start: int
+        self, token_ids: list[int], request_id: str, terminal: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return await self.teacher_server_manager.compute_teacher_logprobs_single(
-            sequence_ids=sequence_ids,
+        return await self.teacher_server_manager.compute_teacher_logprobs_streaming(
+            token_ids=token_ids,
             request_id=request_id,
-            prompt_logprobs_start=artifact_start,
+            terminal=terminal,
         )
 
     async def submit_streamopd_chunk(self, value: dict[str, Any]) -> None:

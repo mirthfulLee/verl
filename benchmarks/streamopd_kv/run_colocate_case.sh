@@ -31,6 +31,9 @@ export VERL_USE_UV=${VERL_USE_UV:-0}
 export ACTOR_MAX_TOKENS_PER_GPU=${ACTOR_MAX_TOKENS_PER_GPU:-$TOTAL_TRAJECTORY_LENGTH}
 export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
 export TEACHER_MAX_BATCHED_TOKENS=${TEACHER_MAX_BATCHED_TOKENS:-2048}
+export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=${TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES:-16}
+export TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS=${TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS:-65536}
+export TEACHER_PREFILL_KV_PAGE_SIZE=${TEACHER_PREFILL_KV_PAGE_SIZE:-64}
 export TOKEN_CHUNK_SIZE=${TOKEN_CHUNK_SIZE:-$(((MAX_RESPONSE_LENGTH + 1) / 2))}
 export REVERSE_CHUNK_SIZE=${REVERSE_CHUNK_SIZE:-1024}
 export REVERSE_CHUNK_MIN_SIZE=${REVERSE_CHUNK_MIN_SIZE:-256}
@@ -75,8 +78,13 @@ case "$MODE" in
     USE_LIGER=${USE_LIGER:-True}
     ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
     TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
-    TEACHER_INITIAL_CHUNK_SIZE=${TEACHER_INITIAL_CHUNK_SIZE:-256}
-    TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-True}
+    # Score every rollout/KV chunk. The default follows TOKEN_CHUNK_SIZE so
+    # each committed 1536-token chunk creates one stateful teacher forward.
+    TEACHER_INITIAL_CHUNK_SIZE=${TEACHER_INITIAL_CHUNK_SIZE:-$TOKEN_CHUNK_SIZE}
+    # Normal StreamOPD semantics: every committed rollout chunk is scored by
+    # the stateful teacher as soon as it arrives. Set this to True only for the
+    # terminal-catch-up performance ablation.
+    TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
     CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-bfloat16}
     ;;
   *)
@@ -106,6 +114,9 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   distillation.teacher_models.teacher_model.inference.enable_prefix_caching=True \
   distillation.streamopd_kv.teacher_initial_chunk_size="$TEACHER_INITIAL_CHUNK_SIZE" \
   distillation.streamopd_kv.teacher_terminal_only_after_initial="$TEACHER_TERMINAL_ONLY_AFTER_INITIAL" \
+  distillation.streamopd_kv.teacher_prefill_max_active_trajectories="$TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES" \
+  distillation.streamopd_kv.teacher_prefill_max_active_kv_tokens="$TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS" \
+  distillation.streamopd_kv.teacher_prefill_kv_page_size="$TEACHER_PREFILL_KV_PAGE_SIZE" \
   actor_rollout_ref.rollout.do_sample=False \
   actor_rollout_ref.rollout.agent.num_workers="$AGENT_LOOP_WORKERS" \
   distillation.streamopd_kv.kv_handoff_dir="$KV_HANDOFF_DIR" \

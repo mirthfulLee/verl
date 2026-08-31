@@ -236,6 +236,26 @@ class LLMServerClient:
             return request_id
         return uuid4().hex
 
+    async def stream_teacher_chunk(
+        self,
+        request_id: str,
+        *,
+        token_ids: list[int],
+        sampling_params: dict[str, Any],
+        terminal: bool,
+    ) -> dict[str, Any]:
+        """Append tokens to one sticky vLLM StreamingInput teacher session."""
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            return await server.stream_teacher_chunk.remote(
+                request_id=request_id,
+                token_ids=token_ids,
+                sampling_params=sampling_params,
+                terminal=terminal,
+            )
+        finally:
+            self._release_server(server_id)
+
     @rollout_trace_op
     async def generate(
         self,
@@ -274,6 +294,7 @@ class LLMServerClient:
                     "streamopd_terminal_only_after_initial",
                     False,
                 )
+                kwargs["streamopd_page_size"] = getattr(self, "streamopd_page_size", 1)
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data

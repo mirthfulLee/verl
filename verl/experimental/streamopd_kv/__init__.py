@@ -31,6 +31,7 @@ from .snapshot_io import (
     extract_vllm_nhd_token_range,
     extract_vllm_nhd_tokens,
     load_vllm_snapshot,
+    move_vllm_snapshot,
 )
 from .streaming_teacher import StreamingTeacherCoordinator
 
@@ -56,6 +57,7 @@ __all__ = [
     "extract_vllm_nhd_token_range",
     "extract_vllm_nhd_tokens",
     "load_vllm_snapshot",
+    "move_vllm_snapshot",
     "prepare_streamopd_kv_config",
     "use_qwen3_reverse_attention",
 ]

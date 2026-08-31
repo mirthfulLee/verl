@@ -21,6 +21,20 @@ from safetensors import safe_open
 from .protocol import KVLayout, SealedKVSnapshot, TrajectoryKey
 
 
+def _pin_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
+    """Pin a CPU handoff buffer when CUDA can consume it asynchronously."""
+
+    if not pin_memory or tensor.device.type != "cpu":
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        # CPU-only test environments and installations without a usable CUDA
+        # driver cannot create pinned allocations.  Pageable memory remains a
+        # correct transport; the trainer simply performs a synchronous H2D.
+        return tensor
+
+
 def extract_vllm_nhd_tokens(
     kv_cache: torch.Tensor,
     block_ids: Sequence[int],
@@ -86,6 +100,7 @@ def _load_streamed_vllm_snapshot(
     expected_token_ids: Sequence[int] | None,
     expected_prompt_length: int | None,
     device: torch.device | str,
+    pin_memory: bool,
     started: float,
 ) -> SealedKVSnapshot:
     manifest = f"{base_path}.tp{tp_rank}.manifest.safetensors"
@@ -165,6 +180,8 @@ def _load_streamed_vllm_snapshot(
             axis_order=axis_order,
             rope_convention=rope_convention,
         )
+        if pin_memory:
+            layers = tuple((_pin_host_tensor(key, True), _pin_host_tensor(value, True)) for key, value in layers)
         return SealedKVSnapshot(
             key=key,
             token_ids=token_ids,
@@ -187,8 +204,13 @@ def load_vllm_snapshot(
     expected_token_ids: Sequence[int] | None = None,
     expected_prompt_length: int | None = None,
     device: torch.device | str = "cpu",
+    pin_memory: bool = False,
 ) -> SealedKVSnapshot:
-    """Acquire one TP-aligned vLLM shard after its async handoff completes."""
+    """Acquire one TP-aligned vLLM shard after its async handoff completes.
+
+    ``pin_memory`` is intended for host-side prefetch. It is best effort so
+    the same loader remains usable in CPU-only test environments.
+    """
 
     started = time.perf_counter()
     manifest_lock = f"{base_path}.tp{tp_rank}.manifest.safetensors.lock"
@@ -201,6 +223,7 @@ def load_vllm_snapshot(
             expected_token_ids=expected_token_ids,
             expected_prompt_length=expected_prompt_length,
             device=device,
+            pin_memory=pin_memory,
             started=started,
         )
     filename = f"{base_path}.tp{tp_rank}.safetensors"
@@ -241,6 +264,8 @@ def load_vllm_snapshot(
                 raise RuntimeError("KV layer metadata does not match the stored tensors")
             if not layers:
                 raise RuntimeError("KV snapshot contains no attention layers")
+            if pin_memory:
+                layers = tuple((_pin_host_tensor(key, True), _pin_host_tensor(value, True)) for key, value in layers)
             layout = KVLayout(
                 num_layers=len(layers),
                 num_kv_heads=layers[0][0].shape[1],
@@ -262,6 +287,44 @@ def load_vllm_snapshot(
                 handoff_seconds=time.perf_counter() - started,
             )
     return snapshot
+
+
+def move_vllm_snapshot(
+    snapshot: SealedKVSnapshot,
+    device: torch.device | str,
+    *,
+    non_blocking: bool = True,
+) -> SealedKVSnapshot:
+    """Stage a host snapshot on one trainer device.
+
+    Host snapshots are deliberately kept separate from the GPU lease.  The
+    caller can therefore load the next reverse unit in a background thread,
+    then move only the unit about to run onto the trainer device.  A new
+    ownership object is returned so releasing the GPU lease never invalidates
+    a host-prefetched snapshot that is still in the queue.
+    """
+
+    target = torch.device(device)
+    if all(key.device == target and value.device == target for key, value in snapshot.layers):
+        return snapshot
+    layers = tuple(
+        (
+            key.to(device=target, non_blocking=non_blocking),
+            value.to(device=target, non_blocking=non_blocking),
+        )
+        for key, value in snapshot.layers
+    )
+    return SealedKVSnapshot(
+        key=snapshot.key,
+        token_ids=snapshot.token_ids,
+        prompt_length=snapshot.prompt_length,
+        layout=snapshot.layout,
+        layers=layers,
+        source=snapshot.source,
+        handoff_seconds=snapshot.handoff_seconds,
+        streamed_tokens_before_eos=snapshot.streamed_tokens_before_eos,
+        streamed_chunks_before_eos=snapshot.streamed_chunks_before_eos,
+    )
 
 
 def cleanup_vllm_snapshot(base_path: str, tp_size: int) -> None:

@@ -28,6 +28,8 @@ class StreamOPDTaskScheduler:
         self.teacher_sessions: dict[str, int] = {}
         self.teacher_session_kv_tokens = 0
         self.training_active = 0
+        self.training_waiters: list[int] = []
+        self.max_training_waiters = 0
         self.teacher_chunks = 0
         self.teacher_notifications = 0
         self.training_units = 0
@@ -42,14 +44,17 @@ class StreamOPDTaskScheduler:
         self.policy_started_at = 0.0
 
     def begin_policy(self, policy_version: int) -> None:
-        if self.teacher_pending or self.training_active or self.teacher_sessions:
+        if self.teacher_pending or self.training_active or self.teacher_sessions or self.training_waiters:
             raise RuntimeError(
                 "cannot begin a StreamOPD policy version while work is active: "
-                f"teacher_pending={self.teacher_pending}, training_active={self.training_active}"
+                f"teacher_pending={self.teacher_pending}, training_active={self.training_active}, "
+                f"training_waiters={len(self.training_waiters)}"
             )
         self.policy_version = int(policy_version)
         self.teacher_active_kv_tokens = 0
         self.teacher_session_kv_tokens = 0
+        self.training_waiters = []
+        self.max_training_waiters = 0
         self.teacher_chunks = 0
         self.teacher_notifications = 0
         self.training_units = 0
@@ -131,6 +136,7 @@ class StreamOPDTaskScheduler:
         self._check_version(policy_version)
         if (
             self.training_active
+            or (self.training_waiters and self.teacher_queued <= min(self.training_waiters))
             or self.teacher_active >= max_active_trajectories
             or (self.teacher_active and self.teacher_active_kv_tokens + kv_tokens > max_active_kv_tokens)
         ):
@@ -167,12 +173,29 @@ class StreamOPDTaskScheduler:
         self.training_units += 1
         self._training_busy_started_at = time.perf_counter()
 
+    def training_waiting(self, policy_version: int, teacher_queue_threshold: int) -> None:
+        """Register a ready reverse unit while it waits for pool ownership."""
+
+        self._check_version(policy_version)
+        if teacher_queue_threshold < 0:
+            raise ValueError("teacher_queue_threshold must be non-negative")
+        self.training_waiters.append(int(teacher_queue_threshold))
+        self.max_training_waiters = max(self.max_training_waiters, len(self.training_waiters))
+
+    def training_waiting_cancelled(self, policy_version: int) -> None:
+        self._check_version(policy_version)
+        if not self.training_waiters:
+            raise RuntimeError("training_waiting_cancelled without a waiting reverse unit")
+        self.training_waiters.pop(0)
+
     def try_training_started(self, policy_version: int, teacher_queue_threshold: int) -> bool:
         self._check_version(policy_version)
         if teacher_queue_threshold < 0:
             raise ValueError("teacher_queue_threshold must be non-negative")
         if self.teacher_active or self.teacher_queued > teacher_queue_threshold:
             return False
+        if self.training_waiters:
+            self.training_waiters.pop(0)
         self.training_started(policy_version)
         return True
 
@@ -194,6 +217,8 @@ class StreamOPDTaskScheduler:
             "teacher_session_kv_tokens": self.teacher_session_kv_tokens,
             "teacher_pending": self.teacher_pending,
             "training_active": self.training_active,
+            "training_waiters": len(self.training_waiters),
+            "max_training_waiters": self.max_training_waiters,
             "teacher_chunks": self.teacher_chunks,
             "teacher_notifications": self.teacher_notifications,
             "training_units": self.training_units,
@@ -207,17 +232,18 @@ class StreamOPDTaskScheduler:
 
     def end_policy(self, policy_version: int) -> dict[str, float]:
         self._check_version(policy_version)
-        if self.teacher_pending or self.training_active or self.teacher_sessions:
+        if self.teacher_pending or self.training_active or self.teacher_sessions or self.training_waiters:
             raise RuntimeError(
                 "StreamOPD policy barrier reached with unfinished work: "
                 f"teacher_pending={self.teacher_pending}, teacher_sessions={len(self.teacher_sessions)}, "
-                f"training_active={self.training_active}"
+                f"training_active={self.training_active}, training_waiters={len(self.training_waiters)}"
             )
         metrics = {
             "streamopd/scheduler_teacher_chunks": float(self.teacher_chunks),
             "streamopd/scheduler_teacher_notifications": float(self.teacher_notifications),
             "streamopd/scheduler_teacher_coalesced_fragments": float(self.teacher_notifications - self.teacher_chunks),
             "streamopd/scheduler_training_units": float(self.training_units),
+            "streamopd/scheduler_max_training_waiters": float(self.max_training_waiters),
             "streamopd/scheduler_max_teacher_pending": float(self.max_teacher_pending),
             "streamopd/scheduler_max_teacher_active": float(self.max_teacher_active),
             "streamopd/scheduler_max_teacher_sessions": float(self.max_teacher_sessions),

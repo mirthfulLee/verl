@@ -39,6 +39,7 @@ from verl.experimental.streamopd_kv import (
     extract_vllm_nhd_token_range,
     extract_vllm_nhd_tokens,
     load_vllm_snapshot,
+    move_vllm_snapshot,
     prepare_streamopd_kv_config,
 )
 from verl.experimental.streamopd_kv.fsdp_worker import (
@@ -422,6 +423,7 @@ def test_vllm_snapshot_loader_validates_identity_and_restores_layout(tmp_path) -
         expected_tp_size=1,
         expected_token_ids=[4, 5, 6],
         expected_prompt_length=2,
+        pin_memory=True,
     )
     assert snapshot.layout.num_layers == 1
     assert snapshot.layout.num_kv_heads == 2
@@ -442,6 +444,30 @@ def test_vllm_snapshot_loader_validates_identity_and_restores_layout(tmp_path) -
             tp_rank=0,
             expected_tp_size=1,
         )
+
+
+def test_move_vllm_snapshot_preserves_ownership_metadata() -> None:
+    key = TrajectoryKey(5, "prefetch")
+    layout = KVLayout(num_layers=1, num_kv_heads=2, head_dim=4, dtype="float32", page_size=16)
+    source = SealedKVSnapshot(
+        key=key,
+        token_ids=(1, 2, 3),
+        prompt_length=1,
+        layout=layout,
+        layers=((torch.ones(1, 2, 3, 4), torch.zeros(1, 2, 3, 4)),),
+        source="host-prefetch",
+        handoff_seconds=0.25,
+        streamed_tokens_before_eos=2,
+        streamed_chunks_before_eos=1,
+    )
+    staged = move_vllm_snapshot(source, "meta", non_blocking=False)
+    assert staged is not source
+    assert staged.state is SnapshotState.SEALED
+    assert staged.key == key
+    assert staged.source == source.source
+    assert staged.handoff_seconds == source.handoff_seconds
+    assert staged.layers[0][0].device.type == "meta"
+    assert source.layers[0][0].device.type == "cpu"
 
 
 def test_streamed_vllm_snapshot_loader_assembles_contiguous_chunks(tmp_path) -> None:
@@ -826,6 +852,19 @@ def test_teacher_and_training_admission_are_mutually_exclusive() -> None:
     assert scheduler.try_teacher_started(11) is True
     scheduler.teacher_finished(11)
     scheduler.end_policy(11)
+
+
+def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(14)
+    scheduler.training_waiting(14, teacher_queue_threshold=1)
+    scheduler.teacher_enqueued(14)
+    assert scheduler.try_teacher_started(14) is False
+    assert scheduler.try_training_started(14, teacher_queue_threshold=1) is True
+    assert scheduler.snapshot()["training_waiters"] == 0
+    scheduler.training_finished(14)
+    scheduler.teacher_cancelled(14)
+    scheduler.end_policy(14)
 
 
 def test_teacher_admission_limits_active_trajectory_count_and_kv_tokens() -> None:

@@ -252,6 +252,12 @@ class StreamOPDKVConfig(BaseConfig):
     # prompt+response trajectory length.
     teacher_prefill_max_active_kv_tokens: int = 32768
     teacher_prefill_kv_page_size: int = 64
+    # Host-side KV prefetch is overlapped with the current reverse unit.  The
+    # GPU lease remains limited to one reverse microbatch; depth only controls
+    # how many sealed host snapshots may be in flight.
+    kv_prefetch_depth: int = 1
+    kv_prefetch_workers: int = 2
+    kv_prefetch_pin_memory: bool = True
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"
     exact_dense_attention: bool = True
@@ -277,6 +283,8 @@ class StreamOPDKVConfig(BaseConfig):
             "teacher_prefill_max_active_trajectories",
             "teacher_prefill_max_active_kv_tokens",
             "teacher_prefill_kv_page_size",
+            "kv_prefetch_depth",
+            "kv_prefetch_workers",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"streamopd_kv.{name} must be positive")

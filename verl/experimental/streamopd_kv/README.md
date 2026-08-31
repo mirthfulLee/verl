@@ -44,8 +44,12 @@ The initial backend deliberately fails closed outside this envelope:
 4. A trainer worker may hold only one microbatch GPU KV lease. The controller waits for the current update to return
    before it admits the next ready microbatch, and the worker fails closed on a second lease. Readiness gates reverse
    backward (`EOS && KV manifest complete && teacher supervision complete`), not the earlier host-side KV transfer.
-   The leased rollout KV is the no-grad Stage-1 trace. During suffix-to-prefix recomputation, exact dense attention
-   propagates dK/dV into earlier chunks and returns current-chunk gradients to the trainable K/V projections.
+   The leased rollout KV is the no-grad Stage-1 trace. A bounded host-side prefetch queue reads the next reverse units
+   while the current reverse kernels run; only the unit about to execute is staged on the trainer GPU. Set
+   `kv_prefetch_depth` to control the number of in-flight host units and `kv_prefetch_workers` to control parallel
+   snapshot readers. This overlaps handoff I/O without ever holding two GPU KV leases. During suffix-to-prefix
+   recomputation, exact dense attention propagates dK/dV into earlier chunks and returns current-chunk gradients to the
+   trainable K/V projections.
 5. `micro_batch_size` configures Teacher/Trainer work only; rollout continuous-batching limits remain independent.
    In `streamopd_colocate`, a sealed EOS cohort can start reverse as soon as it reaches
    `min(micro_batch_size, reverse_batch_size)` trajectories. The resulting units accumulate raw gradients across

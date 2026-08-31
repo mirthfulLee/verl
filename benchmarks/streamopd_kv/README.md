@@ -25,6 +25,13 @@ new `streamopd_colocate` trainer keeps rollout in its dedicated rollout pool and
 with the sharded student trainer; the scheduler serializes those two users of the teacher/trainer pool. Do not use
 the legacy `sync` topology description when interpreting the StreamOPD-colocate measurements.
 
+The colocated trainer accepts `KV_PREFETCH_DEPTH` and `KV_PREFETCH_WORKERS` (defaults `1` and `2`). These bound the
+number of host snapshot readers; they do not change rollout continuous batching or the single-microbatch GPU KV
+lease. `KV_PREFETCH_PIN_MEMORY=True` enables best-effort pinned host buffers for asynchronous CUDA H2D copies. The
+logs report `actor/streamopd/kv_prefetch_host_seconds`, `kv_prefetch_wait_seconds`, and
+`kv_prefetch_transfer_seconds` separately, so host work hidden by reverse kernels is distinguishable from actual
+trainer stalls.
+
 This workspace was configured with `uv` in `.venv-cu128`. The measured environment uses Python 3.12.13,
 PyTorch 2.9.1+cu128, vLLM 0.15.1, and transformers 4.57.6.
 The CUDA 12.8 environment is used because this host's 560.35.03 driver cannot load the repository's CUDA 13 lock.

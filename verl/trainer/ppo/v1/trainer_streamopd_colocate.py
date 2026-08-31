@@ -129,14 +129,22 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         poll_seconds = int(stream_config.scheduler_poll_interval_ms) / 1000.0
         timeout = float(stream_config.scheduler_timeout_seconds)
         started = time.perf_counter()
-        while True:
-            granted = ray.get(self._scheduler.try_training_started.remote(self._policy_version, threshold))
-            if granted:
-                return time.perf_counter() - started
-            if time.perf_counter() - started > timeout:
-                state = ray.get(self._scheduler.snapshot.remote())
-                raise TimeoutError(f"timed out waiting for StreamOPD teacher priority queue: {state}")
-            time.sleep(poll_seconds)
+        registered = False
+        ray.get(self._scheduler.training_waiting.remote(self._policy_version, threshold))
+        registered = True
+        try:
+            while True:
+                granted = ray.get(self._scheduler.try_training_started.remote(self._policy_version, threshold))
+                if granted:
+                    registered = False
+                    return time.perf_counter() - started
+                if time.perf_counter() - started > timeout:
+                    state = ray.get(self._scheduler.snapshot.remote())
+                    raise TimeoutError(f"timed out waiting for StreamOPD teacher priority queue: {state}")
+                time.sleep(poll_seconds)
+        finally:
+            if registered:
+                ray.get(self._scheduler.training_waiting_cancelled.remote(self._policy_version))
 
     def on_step_end(self):
         if self._policy_version is None:

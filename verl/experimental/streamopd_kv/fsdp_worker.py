@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 
 import torch
@@ -23,7 +24,7 @@ from verl.workers.engine_workers import TrainingWorker
 from .attention import LayerKVTrace
 from .protocol import TrajectoryKey
 from .qwen3 import Qwen3ReverseTrainer
-from .snapshot_io import cleanup_vllm_snapshot, load_vllm_snapshot
+from .snapshot_io import cleanup_vllm_snapshot, load_vllm_snapshot, move_vllm_snapshot
 
 
 def _reverse_backward_calls(lengths: list[int], chunk_size: int) -> int:
@@ -292,6 +293,15 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._accum_global_valid_tokens = 0.0
         self._reverse_available_memory_bytes: int | None = None
         self._gpu_kv_lease_active = False
+        self._kv_prefetch_executor: ThreadPoolExecutor | None = None
+
+    def _get_kv_prefetch_executor(self) -> ThreadPoolExecutor:
+        if self._kv_prefetch_executor is None:
+            self._kv_prefetch_executor = ThreadPoolExecutor(
+                max_workers=int(self.streamopd_config.kv_prefetch_workers),
+                thread_name_prefix="streamopd-kv-prefetch",
+            )
+        return self._kv_prefetch_executor
 
     def _reset_accumulation(self, *, zero_grad: bool) -> None:
         if zero_grad:
@@ -494,9 +504,60 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         lm_head_tokens = 0
         dense_lm_head_tokens = 0
         handoff_seconds = 0.0
+        prefetch_host_seconds = 0.0
+        prefetch_wait_seconds = 0.0
+        prefetch_transfer_seconds = 0.0
+        prefetched_snapshots = 0
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
         finalize = accumulation_step == accumulation_steps - 1
+
+        # Read sealed KV into host memory ahead of the reverse unit.  This
+        # queue is intentionally bounded by reverse units rather than
+        # trajectories: the trainer still owns at most one GPU KV lease, while
+        # the next unit's disk reads can run during the current reverse kernel.
+        prefetch_depth = int(self.streamopd_config.kv_prefetch_depth)
+        snapshot_specs: dict[int, tuple[str, TrajectoryKey, tuple[int, ...], int]] = {}
+        for sample_idx, sample in enumerate(samples):
+            input_ids_cpu = self._sample_tensor(sample, "input_ids").detach().cpu()
+            if input_ids_cpu.dtype != torch.long:
+                input_ids_cpu = input_ids_cpu.long()
+            prompt = self._sample_tensor(sample, "prompts")
+            snapshot_specs[sample_idx] = (
+                str(sample["streamopd_kv_path"]),
+                TrajectoryKey(int(sample["streamopd_policy_version"]), str(sample["streamopd_trajectory_id"])),
+                tuple(int(token) for token in input_ids_cpu[:-1].tolist()),
+                int(prompt.numel()),
+            )
+        prefetch_executor = self._get_kv_prefetch_executor()
+        prefetch_futures: dict[int, list[tuple[int, Future]]] = {}
+
+        def load_host_snapshot(sample_idx: int):
+            base_path, key, token_ids, prompt_length = snapshot_specs[sample_idx]
+            started = time.perf_counter()
+            snapshot = load_vllm_snapshot(
+                base_path,
+                key=key,
+                tp_rank=0,
+                expected_tp_size=1,
+                expected_token_ids=token_ids,
+                expected_prompt_length=prompt_length,
+                device="cpu",
+                pin_memory=bool(self.streamopd_config.kv_prefetch_pin_memory),
+            )
+            return snapshot, time.perf_counter() - started
+
+        def schedule_prefetch(group_idx: int) -> None:
+            if group_idx >= len(reverse_microbatches) or group_idx in prefetch_futures:
+                return
+            futures = []
+            for sample_idx in reverse_microbatches[group_idx]:
+                future = prefetch_executor.submit(load_host_snapshot, sample_idx)
+                futures.append((sample_idx, future))
+            prefetch_futures[group_idx] = futures
+
+        for group_idx in range(min(len(reverse_microbatches), prefetch_depth + 1)):
+            schedule_prefetch(group_idx)
 
         def backward_context(chunk_idx: int, trajectory_chunks: int):
             del chunk_idx, trajectory_chunks
@@ -507,13 +568,27 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
 
         try:
             model.eval()
-            for group, chunk_size in zip(reverse_microbatches, reverse_chunk_sizes, strict=True):
+            for group_idx, (group, chunk_size) in enumerate(
+                zip(reverse_microbatches, reverse_chunk_sizes, strict=True)
+            ):
+                group_futures = prefetch_futures[group_idx]
+                host_snapshots = []
+                for _, future in group_futures:
+                    wait_started = time.perf_counter() if not future.done() else None
+                    snapshot, load_seconds = future.result()
+                    prefetch_host_seconds += load_seconds
+                    if wait_started is not None:
+                        prefetch_wait_seconds += time.perf_counter() - wait_started
+                    host_snapshots.append(snapshot)
+                prefetch_futures.pop(group_idx)
+                prefetched_snapshots += len(host_snapshots)
+                schedule_prefetch(group_idx + prefetch_depth + 1)
                 snapshots = []
                 try:
                     sequences = []
                     trajectory_layers = []
                     loss_fns = []
-                    for sample_idx in group:
+                    for sample_idx, host_snapshot in zip(group, host_snapshots, strict=True):
                         sample = samples[sample_idx]
                         sequence = self._sample_tensor(sample, "input_ids").long().to(self.device_name)
                         prompt = self._sample_tensor(sample, "prompts")
@@ -521,18 +596,14 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                             raise RuntimeError("StreamOPD trajectory has an empty prompt")
                         response_mask = self._sample_tensor(sample, "response_mask").bool().cpu()
                         trace_ids = sequence[:-1]
-                        trajectory_id = str(sample["streamopd_trajectory_id"])
                         policy_version = int(sample["streamopd_policy_version"])
-                        base_path = str(sample["streamopd_kv_path"])
-                        snapshot = load_vllm_snapshot(
-                            base_path,
-                            key=TrajectoryKey(policy_version, trajectory_id),
-                            tp_rank=0,
-                            expected_tp_size=1,
-                            expected_token_ids=trace_ids.cpu().tolist(),
-                            expected_prompt_length=prompt.numel(),
-                            device=self.device_name,
+                        transfer_started = time.perf_counter()
+                        snapshot = move_vllm_snapshot(
+                            host_snapshot,
+                            self.device_name,
+                            non_blocking=True,
                         ).acquire(policy_version)
+                        prefetch_transfer_seconds += time.perf_counter() - transfer_started
                         snapshots.append(snapshot)
                         streamed_tokens_before_eos += snapshot.streamed_tokens_before_eos
                         streamed_chunks_before_eos += snapshot.streamed_chunks_before_eos
@@ -555,6 +626,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                         sequences.append(trace_ids.unsqueeze(0))
                         trajectory_layers.append([LayerKVTrace(key, value) for key, value in snapshot.layers])
                         loss_fns.append(self._loss_fn(teacher_ids, teacher_logprobs, valid_positions, temperature))
+                    del host_snapshots
 
                     if self.streamopd_config.validate_full_forward_loss:
                         with torch.no_grad(), mixed_precision_context():
@@ -609,6 +681,16 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             self._reset_accumulation(zero_grad=True)
             raise
         finally:
+            for futures in prefetch_futures.values():
+                for _, future in futures:
+                    future.cancel()
+                    try:
+                        future.result()
+                    except BaseException:
+                        # The training exception, if any, is the actionable
+                        # error.  Futures are joined before snapshot cleanup so
+                        # no background reader can race file deletion.
+                        pass
             model.train(was_training)
             if self.streamopd_config.cleanup_after_step or not step_succeeded:
                 for base_path in paths_to_cleanup:
@@ -641,6 +723,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/reverse_page_size": page_size,
             "streamopd/reverse_memory_budget_gib": (available_memory_bytes or 0) / (1024**3),
             "streamopd/handoff_seconds": handoff_seconds,
+            "streamopd/kv_prefetch_host_seconds": prefetch_host_seconds,
+            "streamopd/kv_prefetch_wait_seconds": prefetch_wait_seconds,
+            "streamopd/kv_prefetch_transfer_seconds": prefetch_transfer_seconds,
+            "streamopd/kv_prefetched_snapshots": prefetched_snapshots,
             "streamopd/kv_streamed_tokens_before_eos": streamed_tokens_before_eos,
             "streamopd/kv_streamed_chunks_before_eos": streamed_chunks_before_eos,
             "streamopd/training_seconds": elapsed,

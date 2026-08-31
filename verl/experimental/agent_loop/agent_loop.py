@@ -522,7 +522,15 @@ class AgentLoopWorker:
                     scheduler_poll_interval_ms=int(streamopd_config.get("scheduler_poll_interval_ms", 10)),
                 )
                 self.llm_client.streamopd_callback = ray.get_runtime_context().current_actor
-                self.llm_client.streamopd_chunk_size = int(streamopd_config.get("token_chunk_size", 256))
+                self.llm_client.streamopd_chunk_size = int(
+                    streamopd_config.get(
+                        "teacher_initial_chunk_size",
+                        streamopd_config.get("token_chunk_size", 256),
+                    )
+                )
+                self.llm_client.streamopd_terminal_only_after_initial = bool(
+                    streamopd_config.get("teacher_terminal_only_after_initial", False)
+                )
         else:
             self.streamopd_config = {}
             self.streamopd_kv_enabled = False
@@ -702,11 +710,12 @@ class AgentLoopWorker:
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     async def _score_streamopd_teacher_prefix(
-        self, sequence_ids: list[int], request_id: str
+        self, sequence_ids: list[int], request_id: str, artifact_start: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return await self.teacher_server_manager.compute_teacher_logprobs_single(
             sequence_ids=sequence_ids,
             request_id=request_id,
+            prompt_logprobs_start=artifact_start,
         )
 
     async def submit_streamopd_chunk(self, value: dict[str, Any]) -> None:

@@ -228,12 +228,17 @@ class StreamOPDKVConfig(BaseConfig):
 
     enabled: bool = False
     token_chunk_size: int = 256
+    teacher_initial_chunk_size: int = 256
+    teacher_terminal_only_after_initial: bool = False
     reverse_chunk_size: int = 256
     reverse_chunk_min_size: int = 64
     reverse_page_size: int = 64
     reverse_batch_size: int = 16
     reverse_batch_max_tokens: int = 32768
     overlap_rollout_training: bool = False
+    micro_batch_size: int = 32
+    # Legacy same-pool overlap setting. Dedicated streamopd_colocate uses the
+    # trainer/teacher micro_batch_size above.
     rollout_micro_batch_size: int = 32
     colocate_teacher_with_student: bool = False
     teacher_priority_threshold: int = 0
@@ -253,11 +258,13 @@ class StreamOPDKVConfig(BaseConfig):
     def __post_init__(self) -> None:
         for name in (
             "token_chunk_size",
+            "teacher_initial_chunk_size",
             "reverse_chunk_size",
             "reverse_chunk_min_size",
             "reverse_page_size",
             "reverse_batch_size",
             "reverse_batch_max_tokens",
+            "micro_batch_size",
             "rollout_micro_batch_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",

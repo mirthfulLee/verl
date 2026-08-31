@@ -119,6 +119,7 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
+        prompt_logprobs_start: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -133,10 +134,13 @@ class AsyncTeacherLLMServerManager:
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
+            prompt_logprobs_start=prompt_logprobs_start,
+            prompt_logprobs_as_tensors=True,
         )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
-        teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
-        teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        teacher_ids = torch.as_tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
+        teacher_logprobs = torch.as_tensor(teacher_output.extra_fields["prompt_logprobs"])
+        expected_rows = len(sequence_ids) - prompt_logprobs_start
+        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == expected_rows
         return teacher_ids, teacher_logprobs

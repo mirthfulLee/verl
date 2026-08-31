@@ -560,6 +560,9 @@ class vLLMHttpServer:
         kv_transfer_params: Optional[dict] = None,
         streamopd_callback: Optional[ray.actor.ActorHandle] = None,
         streamopd_chunk_size: Optional[int] = None,
+        streamopd_terminal_only_after_initial: bool = False,
+        prompt_logprobs_start: int = 0,
+        prompt_logprobs_as_tensors: bool = False,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
@@ -597,6 +600,7 @@ class vLLMHttpServer:
                 prompt_ids=prompt_ids,
                 chunk_size=streamopd_chunk_size,
                 submit=submit_streamopd_chunk,
+                terminal_only_after_initial=streamopd_terminal_only_after_initial,
             )
             kv_transfer_params = dict(kv_transfer_params or {})
             kv_transfer_params.update(
@@ -728,6 +732,8 @@ class vLLMHttpServer:
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
+            start=prompt_logprobs_start,
+            as_tensors=prompt_logprobs_as_tensors,
         )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None

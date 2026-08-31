@@ -559,26 +559,33 @@ class CheckpointEngineManager:
 
 
 async def split_weight_chunks(
-    weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int, meta_only: bool = False
+    weights: Generator[tuple[str, torch.Tensor], None, None],
+    bucket_size: int,
+    meta_only: bool = False,
+    floating_dtype: torch.dtype | None = None,
 ) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor | None], None]:
     """Split the weight into chunks.
 
     Args:
         weights: The weights generator.
         bucket_size: Max bucket size in bytes.
+        floating_dtype: Optional wire dtype for floating-point tensors.
 
     Yields:
         A tuple of the weight chunk metadata and the buffer.
     """
     async for name, weight in ensure_async_iterator(weights):
-        buffer = None if meta_only else weight.view(-1).view(torch.uint8)
+        wire_dtype = floating_dtype if floating_dtype is not None and weight.dtype.is_floating_point else weight.dtype
+        wire_weight = None if meta_only else weight.to(wire_dtype)
+        buffer = None if wire_weight is None else wire_weight.view(-1).view(torch.uint8)
+        wire_nbytes = weight.shape.numel() * wire_dtype.itemsize
         chunk_offset = 0
-        while chunk_offset < weight.nbytes:
-            chunk_size = min(bucket_size, weight.nbytes - chunk_offset)
+        while chunk_offset < wire_nbytes:
+            chunk_size = min(bucket_size, wire_nbytes - chunk_offset)
             tensor_meta = TensorMeta(
                 name=name,
                 shape=weight.shape,
-                dtype=weight.dtype,
+                dtype=wire_dtype,
                 chunk_offset=chunk_offset,
                 chunk_size=chunk_size,
                 offset=None,

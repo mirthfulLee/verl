@@ -18,8 +18,8 @@ The initial backend deliberately fails closed outside this envelope:
 - global `token-mean` loss aggregation;
 - `actor.use_torch_compile=false`, because reverse traversal replaces Qwen3 attention dynamically;
 - no task-reward or policy-gradient term;
-- exact dense attention through the vendored OOMB paged Triton kernel, with no SDPA fallback and no sparse or
-  page-selection approximation;
+- exact dense attention through CUDA FlashAttention for batched wavefront reverse and the vendored OOMB paged
+  Triton kernel for singleton validation, with no SDPA fallback and no sparse or page-selection approximation;
 - BF16 CUDA KV/query tensors, `head_dim <= 256`, right-padded reverse batches, and page-aligned reverse chunks.
 
 ## Execution path
@@ -28,31 +28,36 @@ The initial backend deliberately fails closed outside this envelope:
 2. `StreamingTeacherCoordinator` appends teacher work to a central queue. Teacher forward waits while a reverse
    training unit is active; reverse training waits for the configured teacher backlog threshold. The scheduler uses
    atomic admission, so teacher and trainer kernels never overlap on the shared GPU pool.
-3. `StreamOPDKVConnector` observes computed-token progress on every vLLM scheduler step. Each complete token range is
-   copied from the live NHD pages to pinned CPU memory and serialized as a numbered chunk before EOS. The finish
-   callback writes only the tail and a manifest containing token identity, policy version, and contiguous extents.
-4. `StreamOPDKVTrainingWorker` waits for `EOS && KV manifest complete && teacher supervision complete`, validates the
-   trace identity/layout/dtype, and treats the streamed rollout KV as the no-grad Stage-1 trace. Prefix-aligned KV
-   chunks are split into GPU pages. During suffix-to-prefix recomputation, the OOMB backward kernel atomically
-   accumulates dK/dV into earlier pages and returns the current page gradients to the trainable K/V projections.
-5. Reverse chunk size is bounded between `reverse_chunk_min_size` and `reverse_chunk_size`, aligned to
-   `reverse_page_size`, and reduced according to rollout microbatch size and trajectory length. The A100 benchmark
-   defaults to page size 64, maximum chunk 1024, and minimum chunk 256. Equal-rank trajectories are packed into
-   wavefront batches of at most sixteen while `max_sequence_length * batch_size <= reverse_batch_max_tokens`.
+3. The rollout vLLM engine uses continuous batching independently of the Teacher/Trainer microbatch.
+   `StreamOPDKVConnector` observes computed-token progress on every scheduler step. Each complete token range is
+   copied from the live NHD pages to pinned CPU memory and serialized into the Teacher/Trainer Pool-visible host
+   cache before EOS. Several generating or sealed microbatches may coexist in this host cache. The finish callback
+   writes only the tail and a manifest containing token identity, policy version, and contiguous extents.
+4. A trainer worker may hold only one microbatch GPU KV lease. The controller waits for the current update to return
+   before it admits the next ready microbatch, and the worker fails closed on a second lease. Readiness gates reverse
+   backward (`EOS && KV manifest complete && teacher supervision complete`), not the earlier host-side KV transfer.
+   The leased rollout KV is the no-grad Stage-1 trace. During suffix-to-prefix recomputation, exact dense attention
+   propagates dK/dV into earlier chunks and returns current-chunk gradients to the trainable K/V projections.
+5. `micro_batch_size` configures Teacher/Trainer work only; rollout continuous-batching limits remain independent.
+   Reverse chunk size is bounded between `reverse_chunk_min_size` and `reverse_chunk_size` and aligned to
+   `reverse_page_size`. The A100 benchmark defaults to page size 64, maximum chunk 1024, and minimum chunk 256.
+   Equal-rank trajectories are packed into wavefront batches while
+   `max_sequence_length * batch_size <= reverse_batch_max_tokens`.
    Finished trajectories leave the batch at higher reverse depths, so shorter traces do not execute zero-loss
    suffix chunks.
-   The worker starts from the largest configured chunk and uses the available CUDA memory plus a model/KV/activation
-   estimate to reduce it only when the working-set budget would be exceeded. The allocator budget is queried once
-   before the first policy version, after the persistent teacher/trainer and rollout services are initialized, and is
-   reused for all subsequent steps; no allocator query is on the Triton launch path. This lets a memory-rich run keep
-   a 1024-token chunk for both microbatch sizes while still shrinking safely under pressure.
+   The worker starts from the largest configured chunk. Before policy version zero it samples reusable memory once,
+   then analytically accounts for persistent KV, activation/backward workspace, vocabulary logits/gradients, and
+   reserve space. It first preserves the large chunk and reduces the power-of-two wavefront width as needed; only if
+   that is insufficient does it reduce the chunk. The resulting plan is reused for every step, so there is no
+   allocator query, OOM retry, or kernel-shape change on the training path.
 6. All local raw token-loss sums are backwarded before global token normalization, gradient clipping, and the single
    optimizer step. Parameters remain at `theta_k` for the entire global cohort; `theta_(k+1)` is published to the
    standalone rollout pool only after the policy-version barrier.
 
-The numbered safetensors handoff is a correctness-first incremental transport. It proves that KV is copied during
-generation rather than recovered after EOS, but a production multi-node implementation should replace filesystem
-serialization with CUDA IPC, RDMA, or an equivalent streaming transport.
+The numbered safetensors handoff is a correctness-first incremental host transport. It proves that KV enters the
+trainer-side cache during generation rather than being recovered after EOS. A production multi-node implementation
+should preserve the same multi-MB host-cache/single-MB GPU-lease contract while replacing filesystem serialization
+with CUDA IPC, RDMA, or an equivalent streaming transport.
 
 Dedicated rollout pools publish each new policy version through the `host` checkpoint engine. Actor rank 0 writes
 immutable buckets to a unique node-local `/dev/shm` session while the other FSDP ranks participate in parameter

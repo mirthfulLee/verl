@@ -102,3 +102,19 @@ def test_meta_only_weight_split_does_not_view_payload() -> None:
     chunks = asyncio.run(collect())
     assert [meta.chunk_size for meta, payload in chunks] == [16, 16]
     assert all(payload is None for _, payload in chunks)
+
+
+def test_weight_split_casts_only_floating_wire_tensors() -> None:
+    async def collect():
+        weights = iter(
+            (
+                ("floating", torch.arange(8, dtype=torch.float32)),
+                ("integer", torch.arange(4, dtype=torch.int64)),
+            )
+        )
+        return [item async for item in split_weight_chunks(weights, 64, floating_dtype=torch.bfloat16)]
+
+    chunks = asyncio.run(collect())
+    assert [meta.dtype for meta, _ in chunks] == [torch.bfloat16, torch.int64]
+    assert [meta.chunk_size for meta, _ in chunks] == [16, 32]
+    torch.testing.assert_close(chunks[0][1].view(torch.bfloat16), torch.arange(8, dtype=torch.bfloat16))

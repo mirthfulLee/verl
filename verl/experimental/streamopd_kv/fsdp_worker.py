@@ -87,6 +87,7 @@ def _reverse_memory_estimate(
     hidden_size = int(getattr(config, "hidden_size", 0) or 0)
     layers = len(getattr(base_model, "layers", ()))
     kv_heads = int(getattr(config, "num_key_value_heads", 0) or 0)
+    vocab_size = int(getattr(config, "vocab_size", 0) or 0)
     head_dim = int(getattr(config, "head_dim", 0) or 0)
     if head_dim < 1 and hidden_size > 0:
         query_heads = int(getattr(config, "num_attention_heads", 1) or 1)
@@ -94,10 +95,48 @@ def _reverse_memory_estimate(
     dtype_bytes = torch.tensor([], dtype=dtype).element_size()
     # Account for the staged snapshot plus the contiguous OOMB page backing.
     kv_bytes = trajectory_count * trace_length * layers * kv_heads * head_dim * dtype_bytes * 2 * 2
-    # Per-layer hidden, Q/K/V, MLP input, and output tensors are kept live by
-    # the reverse recomputation. The factor is deliberately conservative.
-    activation_bytes_per_token = trajectory_count * layers * hidden_size * dtype_bytes * 10
-    return kv_bytes, activation_bytes_per_token
+    # Per-layer hidden, Q/K/V, gated-MLP intermediates, and their backward
+    # workspaces are kept live by the reverse recomputation. The coefficient
+    # is calibrated against the preflight peak probe rather than allocator
+    # retries in the policy loop.
+    activation_bytes_per_token = trajectory_count * layers * hidden_size * dtype_bytes * 32
+    # The compact LM head still covers every valid response position. Account
+    # for logits, log-prob workspace, and the logits gradient retained around
+    # the loss/linear backward boundary.
+    lm_head_bytes_per_token = trajectory_count * vocab_size * dtype_bytes * 3
+    return kv_bytes, activation_bytes_per_token + lm_head_bytes_per_token
+
+
+def _memory_limited_reverse_batch_size(
+    model: torch.nn.Module,
+    *,
+    configured_batch_size: int,
+    trace_length: int,
+    chunk_size: int,
+    dtype: torch.dtype,
+    available_memory_bytes: int | None,
+    reserve_bytes: int = 4 * 1024**3,
+) -> int:
+    """Choose a stable wavefront width from the pre-policy memory budget."""
+
+    if configured_batch_size < 1 or trace_length < 1 or chunk_size < 1:
+        raise ValueError("invalid reverse batch planning configuration")
+    if available_memory_bytes is None:
+        return configured_batch_size
+
+    candidate = 1 << (configured_batch_size.bit_length() - 1)
+    budget = int(available_memory_bytes * 0.85)
+    while candidate > 1:
+        fixed_bytes, bytes_per_token = _reverse_memory_estimate(
+            model,
+            trajectory_count=candidate,
+            trace_length=trace_length,
+            dtype=dtype,
+        )
+        if reserve_bytes + fixed_bytes + chunk_size * bytes_per_token <= budget:
+            break
+        candidate //= 2
+    return candidate
 
 
 def _available_cuda_memory(device: str | torch.device) -> int:
@@ -179,6 +218,58 @@ def _forward_kl_topk_sum(
     return token_loss.sum()
 
 
+class _StreamOPDTopKLoss:
+    """Top-k loss that lets reverse recomputation skip unused LM-head rows."""
+
+    def __init__(
+        self,
+        teacher_ids: torch.Tensor,
+        teacher_logprobs: torch.Tensor,
+        valid_positions: torch.Tensor,
+        *,
+        temperature: float,
+        use_chunked_topk: bool,
+        log_prob_min_clamp: float | None,
+        loss_max_clamp: float | None,
+    ) -> None:
+        if valid_positions.device.type != "cpu" or valid_positions.dtype != torch.bool:
+            raise ValueError("StreamOPD compact loss positions must be a CPU bool tensor")
+        if valid_positions.ndim != 1:
+            raise ValueError("StreamOPD compact loss positions must be one-dimensional")
+        if teacher_ids.shape[0] != valid_positions.numel() or teacher_logprobs.shape[0] != valid_positions.numel():
+            raise ValueError("teacher artifacts and compact loss positions must cover the same token range")
+        self.teacher_ids = teacher_ids
+        self.teacher_logprobs = teacher_logprobs
+        self.valid_positions = valid_positions
+        self.temperature = temperature
+        self.use_chunked_topk = use_chunked_topk
+        self.log_prob_min_clamp = log_prob_min_clamp
+        self.loss_max_clamp = loss_max_clamp
+
+    def compact(self, logits: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, int]:
+        valid_count = positions.numel()
+        if valid_count == 0:
+            return logits.sum() * 0.0, 0
+        return (
+            _forward_kl_topk_sum(
+                logits[0],
+                self.teacher_ids.index_select(0, positions),
+                self.teacher_logprobs.index_select(0, positions),
+                temperature=self.temperature,
+                use_chunked_topk=self.use_chunked_topk,
+                log_prob_min_clamp=self.log_prob_min_clamp,
+                loss_max_clamp=self.loss_max_clamp,
+            ),
+            valid_count,
+        )
+
+    def __call__(self, logits: torch.Tensor, start: int, end: int) -> tuple[torch.Tensor, int]:
+        local_positions = self.valid_positions[start:end].nonzero(as_tuple=False).flatten()
+        positions = (start + local_positions).to(logits.device)
+        selected_logits = logits.index_select(1, local_positions.to(logits.device))
+        return self.compact(selected_logits, positions)
+
+
 class StreamOPDKVTrainingWorker(TrainingWorker):
     """FSDP actor worker for exact direct forward-KL reverse training."""
 
@@ -200,6 +291,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._accum_next_step = 0
         self._accum_global_valid_tokens = 0.0
         self._reverse_available_memory_bytes: int | None = None
+        self._gpu_kv_lease_active = False
 
     def _reset_accumulation(self, *, zero_grad: bool) -> None:
         if zero_grad:
@@ -233,43 +325,41 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         temperature: float,
     ):
         loss_config = self.distillation_config.distillation_loss
-
-        def loss(logits: torch.Tensor, start: int, end: int) -> tuple[torch.Tensor, int]:
-            local_mask = valid_positions[start:end]
-            valid_count = int(local_mask.sum().item())
-            if valid_count == 0:
-                return logits.sum() * 0.0, 0
-            return (
-                _forward_kl_topk_sum(
-                    logits[0, local_mask],
-                    teacher_ids[start:end][local_mask],
-                    teacher_logprobs[start:end][local_mask],
-                    temperature=temperature,
-                    use_chunked_topk=loss_config.use_chunked_topk,
-                    log_prob_min_clamp=loss_config.log_prob_min_clamp,
-                    loss_max_clamp=loss_config.loss_max_clamp,
-                ),
-                valid_count,
-            )
-
-        return loss
+        return _StreamOPDTopKLoss(
+            teacher_ids,
+            teacher_logprobs,
+            valid_positions,
+            temperature=temperature,
+            use_chunked_topk=loss_config.use_chunked_topk,
+            log_prob_min_clamp=loss_config.log_prob_min_clamp,
+            loss_max_clamp=loss_config.loss_max_clamp,
+        )
 
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
-        disable_auto_offload = bool(tu.pop(data, key="disable_auto_offload", default=False))
-        accumulation_step = int(tu.get_non_tensor_data(data, "streamopd_accumulation_step", 0))
-        accumulation_steps = int(tu.get_non_tensor_data(data, "streamopd_accumulation_steps", 1))
-        if not 0 <= accumulation_step < accumulation_steps:
-            raise ValueError(f"invalid StreamOPD accumulation trigger {accumulation_step}/{accumulation_steps}")
-        finalize = accumulation_step == accumulation_steps - 1
-        with self.engine.train_mode(
-            disable_auto_offload=disable_auto_offload,
-            zero_grad_on_exit=finalize,
-        ):
-            return self._train_streamopd_mini_batch(
-                data,
-                accumulation_step=accumulation_step,
-                accumulation_steps=accumulation_steps,
-            )
+        # Rollout may seal several host-resident microbatches ahead of the
+        # trainer, but only the currently scheduled microbatch may acquire GPU
+        # storage for its KV trace.
+        if self._gpu_kv_lease_active:
+            raise RuntimeError("StreamOPD trainer already holds a GPU KV lease for another microbatch")
+        self._gpu_kv_lease_active = True
+        try:
+            disable_auto_offload = bool(tu.pop(data, key="disable_auto_offload", default=False))
+            accumulation_step = int(tu.get_non_tensor_data(data, "streamopd_accumulation_step", 0))
+            accumulation_steps = int(tu.get_non_tensor_data(data, "streamopd_accumulation_steps", 1))
+            if not 0 <= accumulation_step < accumulation_steps:
+                raise ValueError(f"invalid StreamOPD accumulation trigger {accumulation_step}/{accumulation_steps}")
+            finalize = accumulation_step == accumulation_steps - 1
+            with self.engine.train_mode(
+                disable_auto_offload=disable_auto_offload,
+                zero_grad_on_exit=finalize,
+            ):
+                return self._train_streamopd_mini_batch(
+                    data,
+                    accumulation_step=accumulation_step,
+                    accumulation_steps=accumulation_steps,
+                )
+        finally:
+            self._gpu_kv_lease_active = False
 
     def _train_streamopd_mini_batch(
         self,
@@ -312,15 +402,24 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         min_chunk_size = int(self.streamopd_config.reverse_chunk_min_size)
         page_size = int(self.streamopd_config.reverse_page_size)
         trace_lengths = [self._sample_tensor(sample, "input_ids").numel() - 1 for sample in samples]
+        # The memory budget was captured once by prepare_reverse_plan before
+        # policy version zero. Planning below is deterministic and does not
+        # query the allocator or change kernel shapes after training starts.
+        available_memory_bytes = self._reverse_available_memory_bytes or None
+        planned_batch_size = _memory_limited_reverse_batch_size(
+            model,
+            configured_batch_size=int(self.streamopd_config.reverse_batch_size),
+            trace_length=max(trace_lengths),
+            chunk_size=max_chunk_size,
+            dtype=forward_dtype,
+            available_memory_bytes=available_memory_bytes,
+        )
         reverse_microbatches = _partition_reverse_microbatches(
             trace_lengths,
-            max_batch_size=int(self.streamopd_config.reverse_batch_size),
+            max_batch_size=planned_batch_size,
             max_batch_tokens=int(self.streamopd_config.reverse_batch_max_tokens),
         )
         target_trace_length = min(8192, int(self.streamopd_config.reverse_batch_max_tokens))
-        # The allocator budget is populated by prepare_reverse_plan during
-        # trainer initialization. Keep this path free of CUDA memory queries.
-        available_memory_bytes = self._reverse_available_memory_bytes or None
         reverse_chunk_sizes = []
         for group in reverse_microbatches:
             max_trace_length = max(trace_lengths[idx] for idx in group)
@@ -338,7 +437,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 _dynamic_reverse_chunk_size(
                     max_chunk_size,
                     min_chunk_size,
-                    int(self.streamopd_config.rollout_micro_batch_size),
+                    int(self.streamopd_config.micro_batch_size),
                     max_trace_length=max_trace_length,
                     target_trace_length=target_trace_length,
                     alignment=page_size,
@@ -392,6 +491,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         full_forward_validation_loss = torch.zeros((), device=self.device_name)
         processed_backward_calls = 0
         max_parallel_trajectories = 0
+        lm_head_tokens = 0
+        dense_lm_head_tokens = 0
         handoff_seconds = 0.0
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
@@ -418,7 +519,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                         prompt = self._sample_tensor(sample, "prompts")
                         if prompt.numel() < 1:
                             raise RuntimeError("StreamOPD trajectory has an empty prompt")
-                        response_mask = self._sample_tensor(sample, "response_mask").bool().to(self.device_name)
+                        response_mask = self._sample_tensor(sample, "response_mask").bool().cpu()
                         trace_ids = sequence[:-1]
                         trajectory_id = str(sample["streamopd_trajectory_id"])
                         policy_version = int(sample["streamopd_policy_version"])
@@ -447,7 +548,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                         teacher_logprobs = self._sample_tensor(sample, "teacher_logprobs")[: trace_ids.numel()].to(
                             self.device_name
                         )
-                        valid_positions = torch.zeros(trace_ids.numel(), dtype=torch.bool, device=self.device_name)
+                        valid_positions = torch.zeros(trace_ids.numel(), dtype=torch.bool)
                         first_target = prompt.numel() - 1
                         valid_positions[first_target : first_target + response_mask.numel()] = response_mask
                         temperature = float(tu.get_non_tensor_data(sample, "temperature", 1.0))
@@ -478,6 +579,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                             stage1_release=release_stage1_snapshots,
                         )
                     max_parallel_trajectories = max(max_parallel_trajectories, result.max_parallel_trajectories)
+                    lm_head_tokens += result.lm_head_tokens
+                    dense_lm_head_tokens += result.dense_lm_head_tokens
                     total_loss += result.loss_sum
                 finally:
                     for snapshot in snapshots:
@@ -529,7 +632,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/reverse_chunks": local_chunks,
             "streamopd/reverse_backward_calls": processed_backward_calls,
             "streamopd/reverse_microbatches": len(reverse_microbatches),
+            "streamopd/reverse_planned_batch_size": planned_batch_size,
             "streamopd/reverse_max_parallel_trajectories": max_parallel_trajectories,
+            "streamopd/lm_head_tokens": lm_head_tokens,
+            "streamopd/lm_head_token_fraction": lm_head_tokens / max(1, dense_lm_head_tokens),
             "streamopd/reverse_chunk_size_min": min(reverse_chunk_sizes, default=0),
             "streamopd/reverse_chunk_size_max": max(reverse_chunk_sizes, default=0),
             "streamopd/reverse_page_size": page_size,
@@ -542,6 +648,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/accumulation_step": accumulation_step,
             "streamopd/accumulation_steps": accumulation_steps,
             "streamopd/optimizer_finalized": float(finalize),
+            "streamopd/gradient_syncs": 1.0,
             "perf/max_memory_allocated_gb": get_torch_device().max_memory_allocated() / (1024**3),
             "perf/max_memory_reserved_gb": get_torch_device().max_memory_reserved() / (1024**3),
         }

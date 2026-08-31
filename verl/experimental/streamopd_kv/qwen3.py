@@ -20,6 +20,39 @@ import torch
 from .attention import LayerKVTrace
 
 
+def _compact_loss_mask(loss_fn: Callable, sequence_length: int) -> torch.Tensor | None:
+    """Return a CPU target mask when a loss supports compact LM-head logits."""
+
+    mask = getattr(loss_fn, "valid_positions", None)
+    compact = getattr(loss_fn, "compact", None)
+    if not isinstance(mask, torch.Tensor) or not callable(compact):
+        return None
+    if mask.device.type != "cpu" or mask.dtype != torch.bool or mask.ndim != 1:
+        raise ValueError("compact reverse losses require a one-dimensional CPU bool valid_positions mask")
+    if mask.numel() != sequence_length:
+        raise ValueError(
+            f"compact reverse loss mask length differs from the trajectory: {mask.numel()} != {sequence_length}"
+        )
+    return mask
+
+
+def _wavefront_logit_indices(
+    loss_masks: Sequence[torch.Tensor],
+    active: Sequence[int],
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Build the local token indices needed by at least one active trajectory."""
+
+    union = torch.zeros(end - start, dtype=torch.bool)
+    for trajectory_idx in active:
+        mask = loss_masks[trajectory_idx]
+        sample_end = min(end, mask.numel())
+        if start < sample_end:
+            union[: sample_end - start] |= mask[start:sample_end]
+    return union.nonzero(as_tuple=False).flatten()
+
+
 def capture_qwen3_kv_trace(model: torch.nn.Module, input_ids: torch.Tensor) -> tuple[LayerKVTrace, ...]:
     """Build the reference trace used to validate a serving-time KV handoff."""
 
@@ -106,6 +139,8 @@ class ReverseTrainingResult:
     chunks: int
     backward_calls: int = 0
     max_parallel_trajectories: int = 1
+    lm_head_tokens: int = 0
+    dense_lm_head_tokens: int = 0
 
 
 def _build_reverse_wavefront(sequence_lengths: Sequence[int], chunk_size: int) -> list[tuple[int, list[int]]]:
@@ -161,6 +196,9 @@ class Qwen3ReverseTrainer:
         loss_sum = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         valid_tokens = 0
         chunks = 0
+        lm_head_tokens = 0
+        dense_lm_head_tokens = 0
+        loss_mask = _compact_loss_mask(loss_fn, sequence_length)
         bounds = [
             (start, min(start + self.chunk_size, sequence_length))
             for start in range(0, sequence_length, self.chunk_size)
@@ -171,13 +209,26 @@ class Qwen3ReverseTrainer:
                 state.begin(start, end)
                 position_ids = torch.arange(start, end, device=input_ids.device).unsqueeze(0)
                 position_ids = position_ids.expand(input_ids.shape[0], -1)
+                model_kwargs = {}
+                if loss_mask is not None:
+                    logit_indices = loss_mask[start:end].nonzero(as_tuple=False).flatten()
+                    model_kwargs["logits_to_keep"] = logit_indices.to(input_ids.device)
+                    lm_head_tokens += input_ids.shape[0] * logit_indices.numel()
+                else:
+                    lm_head_tokens += input_ids.shape[0] * (end - start)
+                dense_lm_head_tokens += input_ids.shape[0] * (end - start)
                 output = self.model(
                     input_ids=input_ids[:, start:end],
                     position_ids=position_ids,
                     use_cache=False,
                     return_dict=True,
+                    **model_kwargs,
                 )
-                chunk_loss, chunk_valid_tokens = loss_fn(output.logits, start, end)
+                if loss_mask is None:
+                    chunk_loss, chunk_valid_tokens = loss_fn(output.logits, start, end)
+                else:
+                    positions = (start + logit_indices).to(input_ids.device)
+                    chunk_loss, chunk_valid_tokens = loss_fn.compact(output.logits, positions)
                 if chunk_loss.ndim != 0 or chunk_valid_tokens < 0:
                     raise ValueError("loss_fn must return a scalar loss sum and a non-negative token count")
                 sync_context = backward_context(chunks, total_chunks) if backward_context else nullcontext()
@@ -187,7 +238,13 @@ class Qwen3ReverseTrainer:
                 loss_sum = loss_sum + chunk_loss.detach().float()
                 valid_tokens += chunk_valid_tokens
                 chunks += 1
-        return ReverseTrainingResult(loss_sum=loss_sum, valid_tokens=valid_tokens, chunks=chunks)
+        return ReverseTrainingResult(
+            loss_sum=loss_sum,
+            valid_tokens=valid_tokens,
+            chunks=chunks,
+            lm_head_tokens=lm_head_tokens,
+            dense_lm_head_tokens=dense_lm_head_tokens,
+        )
 
     def backward_batched(
         self,
@@ -221,26 +278,33 @@ class Qwen3ReverseTrainer:
         padded_trajectories = [
             [
                 LayerKVTrace(
-                    torch.nn.functional.pad(layer.key, (0, 0, 0, padded_length - sequence_length)),
-                    torch.nn.functional.pad(layer.value, (0, 0, 0, padded_length - sequence_length)),
+                    layer.key
+                    if padded_length == sequence_length
+                    else torch.nn.functional.pad(layer.key, (0, 0, 0, padded_length - sequence_length)),
+                    layer.value
+                    if padded_length == sequence_length
+                    else torch.nn.functional.pad(layer.value, (0, 0, 0, padded_length - sequence_length)),
                 )
                 for layer in trace
             ]
             for sequence_length, padded_length, trace in zip(sequence_lengths, padded_lengths, layers, strict=True)
         ]
-        from .oomb_paged_attention import OOMBPagedWavefrontState
+        from .oomb_paged_attention import OOMBFlashWavefrontState
 
-        state = OOMBPagedWavefrontState(
-            padded_trajectories,
-            chunk_size=self.chunk_size,
-            page_size=self.page_size,
-        )
         if stage1_release is not None:
             stage1_release()
+        state = OOMBFlashWavefrontState(padded_trajectories)
 
         schedule = _build_reverse_wavefront(sequence_lengths, self.chunk_size)
+        compact_masks = [
+            _compact_loss_mask(loss_fn, length) for loss_fn, length in zip(loss_fns, sequence_lengths, strict=True)
+        ]
+        use_compact_logits = all(mask is not None for mask in compact_masks)
+        loss_masks = [mask for mask in compact_masks if mask is not None]
         loss_sum = torch.zeros((), device=input_ids[0].device, dtype=torch.float32)
         valid_tokens = 0
+        lm_head_tokens = 0
+        dense_lm_head_tokens = 0
         total_chunks = sum(math.ceil(length / self.chunk_size) for length in sequence_lengths)
         with use_qwen3_reverse_attention(self.model, state):
             for call_idx, (depth, active) in enumerate(schedule):
@@ -249,23 +313,45 @@ class Qwen3ReverseTrainer:
                 state.begin(active, start, end)
                 chunk_ids = torch.cat([padded_input_ids[idx][:, start:end] for idx in active], dim=0)
                 position_ids = torch.arange(start, end, device=chunk_ids.device).unsqueeze(0)
+                model_kwargs = {}
+                if use_compact_logits:
+                    logit_indices = _wavefront_logit_indices(loss_masks, active, start, end)
+                    model_kwargs["logits_to_keep"] = logit_indices.to(chunk_ids.device)
+                    lm_head_tokens += len(active) * logit_indices.numel()
+                else:
+                    lm_head_tokens += len(active) * (end - start)
+                dense_lm_head_tokens += len(active) * (end - start)
                 output = self.model(
                     input_ids=chunk_ids,
                     position_ids=position_ids.expand(len(active), -1),
                     use_cache=False,
                     return_dict=True,
+                    **model_kwargs,
                 )
-                chunk_loss = output.logits.sum() * 0.0
+                chunk_loss = torch.zeros((), device=chunk_ids.device, dtype=torch.float32)
                 chunk_valid_tokens = 0
                 for row, trajectory_idx in enumerate(active):
                     sample_end = min(end, sequence_lengths[trajectory_idx])
                     if start >= sample_end:
                         continue
-                    sample_loss, sample_valid_tokens = loss_fns[trajectory_idx](
-                        output.logits[row : row + 1, : sample_end - start],
-                        start,
-                        sample_end,
-                    )
+                    if use_compact_logits:
+                        sample_mask = loss_masks[trajectory_idx][start:sample_end]
+                        trajectory_union_rows = (logit_indices < sample_end - start).nonzero(as_tuple=False).flatten()
+                        local_indices = logit_indices[trajectory_union_rows]
+                        selected_union_rows = trajectory_union_rows[
+                            sample_mask[local_indices].nonzero(as_tuple=False).flatten()
+                        ]
+                        positions = (start + logit_indices[selected_union_rows]).to(chunk_ids.device)
+                        sample_loss, sample_valid_tokens = loss_fns[trajectory_idx].compact(
+                            output.logits[row : row + 1].index_select(1, selected_union_rows.to(chunk_ids.device)),
+                            positions,
+                        )
+                    else:
+                        sample_loss, sample_valid_tokens = loss_fns[trajectory_idx](
+                            output.logits[row : row + 1, : sample_end - start],
+                            start,
+                            sample_end,
+                        )
                     if sample_loss.ndim != 0 or sample_valid_tokens < 0:
                         raise ValueError("loss_fn must return a scalar loss sum and a non-negative token count")
                     chunk_loss = chunk_loss + sample_loss
@@ -283,4 +369,6 @@ class Qwen3ReverseTrainer:
             chunks=total_chunks,
             backward_calls=len(schedule),
             max_parallel_trajectories=max(len(active) for _, active in schedule),
+            lm_head_tokens=lm_head_tokens,
+            dense_lm_head_tokens=dense_lm_head_tokens,
         )

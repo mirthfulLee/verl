@@ -63,6 +63,7 @@ class HostCheckpointEngine(CheckpointEngine):
         directory: str = "/dev/shm/verl-checkpoint",
         poll_interval: float = 0.01,
         timeout: float = 600.0,
+        rollout_dtype: str | torch.dtype | None = None,
     ) -> None:
         if bucket_size <= 0:
             raise ValueError(f"bucket_size must be positive, got {bucket_size}")
@@ -76,6 +77,12 @@ class HostCheckpointEngine(CheckpointEngine):
         self.directory = Path(directory).expanduser().resolve()
         self.poll_interval = poll_interval
         self.timeout = timeout
+        if isinstance(rollout_dtype, str):
+            dtype_name = rollout_dtype.removeprefix("torch.")
+            rollout_dtype = getattr(torch, dtype_name, None)
+            if not isinstance(rollout_dtype, torch.dtype):
+                raise ValueError(f"unsupported host checkpoint rollout_dtype: {dtype_name}")
+        self.rollout_dtype = rollout_dtype
         self.role: str | None = None
         self.session_dir: Path | None = None
         self.actor_world_size = 0
@@ -179,7 +186,11 @@ class HostCheckpointEngine(CheckpointEngine):
         contains_cuda_copy = False
         total_bytes = 0
 
-        async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
+        async for tensor_meta, chunk in split_weight_chunks(
+            weights,
+            self.bucket_size,
+            floating_dtype=self.rollout_dtype,
+        ):
             assert chunk is not None
             if bucket is None:
                 try:
@@ -235,7 +246,12 @@ class HostCheckpointEngine(CheckpointEngine):
 
     async def _participate(self, weights: Generator[tuple[str, torch.Tensor], None, None]) -> None:
         offset = 0
-        async for tensor_meta, _ in split_weight_chunks(weights, self.bucket_size, meta_only=True):
+        async for tensor_meta, _ in split_weight_chunks(
+            weights,
+            self.bucket_size,
+            meta_only=True,
+            floating_dtype=self.rollout_dtype,
+        ):
             if offset + tensor_meta.chunk_size > self.bucket_size:
                 self._actor_barrier()
                 offset = 0

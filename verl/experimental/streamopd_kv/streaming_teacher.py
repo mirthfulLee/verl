@@ -16,7 +16,7 @@ import torch
 
 from .protocol import CommittedTokenChunk, TrajectoryKey
 
-TeacherScoreFn = Callable[[list[int], str], Awaitable[tuple[torch.Tensor, torch.Tensor]]]
+TeacherScoreFn = Callable[[list[int], str, int], Awaitable[tuple[torch.Tensor, torch.Tensor]]]
 
 
 @dataclass
@@ -79,7 +79,9 @@ class StreamingTeacherCoordinator:
         prior = session.tail
         session.response_ids.extend(chunk.token_ids)
         sequence = list(session.prompt_ids) + list(session.response_ids)
-        artifact_start = 0 if chunk.start == 0 else len(session.prompt_ids) + chunk.start
+        # The prior prefix ends in a dummy row because there is no next token
+        # yet. Re-fetch that boundary row when a later chunk makes it valid.
+        artifact_start = 0 if chunk.start == 0 else len(session.prompt_ids) + chunk.start - 1
         session.terminal = chunk.terminal
         await self._schedule("teacher_enqueued", chunk.key.policy_version)
         try:
@@ -98,18 +100,27 @@ class StreamingTeacherCoordinator:
                 if not chunk.token_ids and artifact_start:
                     return
                 request_id = f"streamopd-teacher-v{chunk.key.policy_version}-{chunk.key.trajectory_id}"
-                teacher_ids, teacher_logprobs = await self._score(sequence, request_id)
-                if teacher_ids.shape[0] != len(sequence) or teacher_logprobs.shape[0] != len(sequence):
+                teacher_ids, teacher_logprobs = await self._score(sequence, request_id, artifact_start)
+                expected_rows = len(sequence) - artifact_start
+                if teacher_ids.shape[0] != expected_rows or teacher_logprobs.shape[0] != expected_rows:
                     raise RuntimeError(
                         f"teacher returned incomplete prefix for {chunk.key}: "
-                        f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, expected={len(sequence)}"
+                        f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, expected={expected_rows}"
                     )
                 # The last prompt-logprob row is a dummy because it has no
                 # next-token target yet. A later prefix replaces that row, so
                 # retaining only the latest full result is required for exact
                 # next-token alignment across chunk boundaries.
-                session.latest_ids = teacher_ids.detach().cpu()
-                session.latest_logprobs = teacher_logprobs.detach().cpu()
+                if artifact_start:
+                    if session.latest_ids is None or session.latest_logprobs is None:
+                        raise RuntimeError(f"teacher session {chunk.key} is missing its prior artifact prefix")
+                    session.latest_ids = torch.cat((session.latest_ids[:artifact_start], teacher_ids.detach().cpu()))
+                    session.latest_logprobs = torch.cat(
+                        (session.latest_logprobs[:artifact_start], teacher_logprobs.detach().cpu())
+                    )
+                else:
+                    session.latest_ids = teacher_ids.detach().cpu()
+                    session.latest_logprobs = teacher_logprobs.detach().cpu()
             finally:
                 if started:
                     await self._schedule("teacher_finished", chunk.key.policy_version)

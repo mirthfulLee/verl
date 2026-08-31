@@ -65,15 +65,14 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
             raise ValueError("streamopd_colocate requires a cross-pool checkpoint engine such as host or nccl")
 
         train_batch_size = int(config.data.train_batch_size)
-        rollout_micro_batch_size = int(stream_config.get("rollout_micro_batch_size", 0))
-        if rollout_micro_batch_size < 1 or train_batch_size % rollout_micro_batch_size:
+        micro_batch_size = int(stream_config.get("micro_batch_size", 0))
+        if micro_batch_size < 1 or train_batch_size % micro_batch_size:
             raise ValueError(
-                "StreamOPD-colocate requires data.train_batch_size to be divisible by "
-                "streamopd_kv.rollout_micro_batch_size"
+                "StreamOPD-colocate requires data.train_batch_size to be divisible by streamopd_kv.micro_batch_size"
             )
-        accumulation_steps = train_batch_size // rollout_micro_batch_size
+        accumulation_steps = train_batch_size // micro_batch_size
         with open_dict(config.trainer.v1.streamopd_colocate):
-            config.trainer.v1.streamopd_colocate.micro_batch_size = rollout_micro_batch_size
+            config.trainer.v1.streamopd_colocate.micro_batch_size = micro_batch_size
             config.trainer.v1.streamopd_colocate.parameter_sync_step = accumulation_steps
         with open_dict(config.trainer.v1.sampler):
             # ReplayBuffer measures the number of policy versions spanned by a

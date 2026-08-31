@@ -511,14 +511,23 @@ def build_mtp_speculative_config(
     }
 
 
-def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
-    """Extract prompt log probabilities from generation output."""
+def extract_prompt_logprobs(
+    output: RequestOutput,
+    num_prompt_logprobs: Optional[int],
+    result_dict: dict[str, Any],
+    start: int = 0,
+    as_tensors: bool = False,
+):
+    """Extract prompt log probabilities, optionally starting at an artifact row."""
     if num_prompt_logprobs is None:
         return
+    prompt_length = len(output.prompt_logprobs)
+    if not 0 <= start < prompt_length:
+        raise ValueError(f"prompt-logprob start {start} is outside [0, {prompt_length})")
 
     prompt_logprobs_ls, prompt_ids_ls = [], []
     # NOTE: logprob of first prompt token is None.
-    for logprobs_dict in output.prompt_logprobs[1:]:
+    for logprobs_dict in output.prompt_logprobs[start + 1 :]:
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob
@@ -543,5 +552,9 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
 
-    result_dict["prompt_ids"] = prompt_ids_ls
-    result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    if as_tensors:
+        result_dict["prompt_ids"] = torch.tensor(prompt_ids_ls, dtype=torch.int32)
+        result_dict["prompt_logprobs"] = torch.tensor(prompt_logprobs_ls, dtype=torch.float32)
+    else:
+        result_dict["prompt_ids"] = prompt_ids_ls
+        result_dict["prompt_logprobs"] = prompt_logprobs_ls

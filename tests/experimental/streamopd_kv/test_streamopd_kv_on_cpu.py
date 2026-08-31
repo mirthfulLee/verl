@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,9 +41,11 @@ from verl.experimental.streamopd_kv import (
     prepare_streamopd_kv_config,
 )
 from verl.experimental.streamopd_kv.fsdp_worker import (
+    StreamOPDKVTrainingWorker,
     _dynamic_reverse_chunk_size,
     _forward_kl_topk_sum,
     _has_valid_response,
+    _memory_limited_reverse_batch_size,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
 )
@@ -137,10 +140,10 @@ async def test_committed_chunk_publisher_emits_only_accepted_contiguous_tokens()
 async def test_teacher_streaming_scores_increasing_prefixes_and_closes_exact_chunk_boundary() -> None:
     calls = []
 
-    async def score(sequence: list[int], request_id: str) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append((list(sequence), request_id))
-        ids = torch.tensor(sequence).unsqueeze(-1)
-        return ids, -ids.float() - len(sequence)
+    async def score(sequence: list[int], request_id: str, artifact_start: int) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((list(sequence), request_id, artifact_start))
+        ids = torch.tensor(sequence[artifact_start:]).unsqueeze(-1)
+        return ids, -ids.float()
 
     coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=2)
     key = TrajectoryKey(9, "streamed")
@@ -152,8 +155,51 @@ async def test_teacher_streaming_scores_increasing_prefixes_and_closes_exact_chu
     ids, logprobs = await coordinator.result(key, required_completion_tokens=4)
     assert [call[0] for call in calls] == [[1, 2, 10, 11], [1, 2, 10, 11, 12, 13]]
     assert calls[0][1] == calls[1][1]
+    assert [call[2] for call in calls] == [0, 3]
     torch.testing.assert_close(ids[:, 0], torch.tensor([1, 2, 10, 11, 12, 13]))
-    torch.testing.assert_close(logprobs[:, 0], -ids[:, 0].float() - 6)
+    torch.testing.assert_close(logprobs[:, 0], -ids[:, 0].float())
+
+
+@pytest.mark.asyncio
+async def test_committed_publisher_can_emit_one_early_chunk_then_terminal_catch_up() -> None:
+    emitted = []
+
+    async def submit(chunk: CommittedTokenChunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(
+        TrajectoryKey(5, "terminal-catch-up"),
+        [1, 2],
+        2,
+        submit,
+        terminal_only_after_initial=True,
+    )
+    await publisher.observe([10, 11])
+    await publisher.observe([10, 11, 12, 13])
+    await publisher.observe([10, 11, 12, 13, 14], terminal=True)
+
+    assert [(chunk.start, chunk.token_ids, chunk.terminal) for chunk in emitted] == [
+        (0, (10, 11), False),
+        (2, (12, 13, 14), True),
+    ]
+
+
+def test_vllm_prompt_logprobs_can_extract_incremental_tensor_suffix() -> None:
+    from verl.workers.rollout.vllm_rollout.utils import extract_prompt_logprobs
+
+    def row(first: int):
+        return {
+            first: SimpleNamespace(rank=1, logprob=-0.1 * first),
+            first + 1: SimpleNamespace(rank=2, logprob=-0.1 * (first + 1)),
+        }
+
+    output = SimpleNamespace(prompt_logprobs=[None, row(10), row(20), row(30)])
+    result = {}
+    extract_prompt_logprobs(output, 2, result, start=1, as_tensors=True)
+
+    assert result["prompt_ids"].dtype == torch.int32
+    assert result["prompt_logprobs"].dtype == torch.float32
+    torch.testing.assert_close(result["prompt_ids"], torch.tensor([[20, 21], [30, 31], [0, 0]], dtype=torch.int32))
 
 
 def test_snapshot_lifecycle_teacher_coverage_and_version_barrier() -> None:
@@ -389,6 +435,59 @@ def test_dynamic_reverse_chunk_size_prefers_maximum_with_memory_headroom() -> No
     )
 
 
+def test_reverse_batch_planner_preserves_chunk_size_and_uses_stable_power_of_two() -> None:
+    config = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=28,
+        num_key_value_heads=8,
+        num_attention_heads=16,
+        head_dim=128,
+        vocab_size=151936,
+    )
+    model = SimpleNamespace(config=config, model=SimpleNamespace(layers=[object()] * 28))
+
+    assert (
+        _memory_limited_reverse_batch_size(
+            model,
+            configured_batch_size=16,
+            trace_length=4096,
+            chunk_size=1024,
+            dtype=torch.bfloat16,
+            available_memory_bytes=int(58.5 * 1024**3),
+        )
+        == 8
+    )
+    assert (
+        _memory_limited_reverse_batch_size(
+            model,
+            configured_batch_size=16,
+            trace_length=8192,
+            chunk_size=1024,
+            dtype=torch.bfloat16,
+            available_memory_bytes=int(58.5 * 1024**3),
+        )
+        == 4
+    )
+    assert (
+        _memory_limited_reverse_batch_size(
+            model,
+            configured_batch_size=32,
+            trace_length=4096,
+            chunk_size=1024,
+            dtype=torch.bfloat16,
+            available_memory_bytes=256 * 1024**3,
+        )
+        == 32
+    )
+
+
+def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
+    worker = StreamOPDKVTrainingWorker.__new__(StreamOPDKVTrainingWorker)
+    worker._gpu_kv_lease_active = True
+    with pytest.raises(RuntimeError, match="already holds a GPU KV lease"):
+        worker.train_mini_batch(TensorDict({}, batch_size=[]))
+
+
 def test_vllm_nhd_page_extraction_preserves_logical_token_order() -> None:
     cache = torch.arange(3 * 2 * 4 * 2 * 3).reshape(3, 2, 4, 2, 3)
     extracted = extract_vllm_nhd_tokens(cache, block_ids=[2, 0], block_size=4, num_tokens=6)
@@ -493,8 +592,9 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     dedicated_config.actor_rollout_ref.rollout.n_gpus_per_node = 2
     dedicated_config.actor_rollout_ref.rollout.checkpoint_engine = {"backend": "nccl"}
     dedicated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
-    dedicated_config.distillation.streamopd_kv.rollout_micro_batch_size = 16
+    dedicated_config.distillation.streamopd_kv.micro_batch_size = 16
     prepare_streamopd_kv_config(dedicated_config)
+    assert dedicated_config.trainer.v1.streamopd_colocate.micro_batch_size == 16
     assert dedicated_config.trainer.v1.streamopd_colocate.parameter_sync_step == 8
     assert dedicated_config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert dedicated_config.trainer.v1.sampler.max_off_policy_strategy == "drop"

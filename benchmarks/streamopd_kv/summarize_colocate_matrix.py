@@ -37,6 +37,7 @@ METRICS = (
     "actor/streamopd/reverse_page_size",
     "actor/streamopd/reverse_backward_calls",
     "actor/streamopd/reverse_microbatches",
+    "actor/streamopd/reverse_planned_batch_size",
     "actor/streamopd/reverse_max_parallel_trajectories",
     "actor/streamopd/training_seconds",
     "actor/streamopd/optimizer_finalized",
@@ -65,7 +66,7 @@ def write_markdown(path: Path, runs: dict[str, dict]) -> None:
     ]
     ordered = sorted(
         runs.values(),
-        key=lambda run: (run["total_trajectory_tokens"], run["mode"], run["micro_batch_size"]),
+        key=lambda run: (run["total_trajectory_tokens"], run["mode"], run["micro_batch_size"] or 0),
     )
     for run in ordered:
         stable = run["stable_step"]
@@ -75,7 +76,7 @@ def write_markdown(path: Path, runs: dict[str, dict]) -> None:
                 (
                     str(run["total_trajectory_tokens"]),
                     f"`{run['mode']}`",
-                    str(run["micro_batch_size"]),
+                    str(run["micro_batch_size"]) if run["micro_batch_size"] is not None else "-",
                     _format(stable.get("timing_s/step")),
                     _format(stable.get("perf/throughput")),
                     _format(stable.get("actor/perf/max_memory_allocated_gb")),
@@ -126,7 +127,7 @@ def main() -> None:
     args = parser.parse_args()
 
     runs: dict[str, dict] = {}
-    pattern = re.compile(r"(?P<mode>.+)_total(?P<tokens>\d+)_mb(?P<microbatch>\d+)\.log$")
+    pattern = re.compile(r"(?P<mode>.+)_total(?P<tokens>\d+)(?:_mb(?P<microbatch>\d+))?\.log$")
     # Load baseline directories first so the requested result directory wins
     # if a run with the same filename is present in both places.
     for directory in [*args.baseline_dir, args.result_dir]:
@@ -135,10 +136,14 @@ def main() -> None:
             if match is None:
                 continue
             steps = parse_steps(path)
+            mode = match.group("mode")
+            microbatch = match.group("microbatch")
             runs[path.stem] = {
-                "mode": match.group("mode"),
+                "mode": mode,
                 "total_trajectory_tokens": int(match.group("tokens")),
-                "micro_batch_size": int(match.group("microbatch")),
+                # Legacy baseline files carried an mb32 suffix even though
+                # sync paths never consumed the StreamOPD trainer microbatch.
+                "micro_batch_size": int(microbatch) if mode == "streamopd-colocate" and microbatch else None,
                 "status": "ok" if steps else "failed",
                 "steps": steps,
                 "stable_step": steps[-1] if steps else {},
@@ -150,15 +155,17 @@ def main() -> None:
             continue
         step = run["stable_step"].get("timing_s/step")
         for baseline_mode in ("verl-sync-opd", "verl-colocate-opd"):
-            baseline = next(
-                (
-                    candidate
-                    for candidate in runs.values()
-                    if candidate["mode"] == baseline_mode
-                    and candidate["total_trajectory_tokens"] == run["total_trajectory_tokens"]
-                    and candidate["status"] == "ok"
-                ),
-                None,
+            baseline_candidates = (
+                candidate
+                for candidate in runs.values()
+                if candidate["mode"] == baseline_mode
+                and candidate["total_trajectory_tokens"] == run["total_trajectory_tokens"]
+                and candidate["status"] == "ok"
+            )
+            baseline = min(
+                baseline_candidates,
+                key=lambda candidate: candidate["stable_step"].get("timing_s/step", float("inf")),
+                default=None,
             )
             baseline_step = baseline["stable_step"].get("timing_s/step") if baseline else None
             if step and baseline_step:

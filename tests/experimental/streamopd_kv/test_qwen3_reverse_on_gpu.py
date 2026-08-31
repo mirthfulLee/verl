@@ -154,15 +154,23 @@ def test_qwen3_wavefront_matches_sequential_reverse() -> None:
     targets = [tokens[:, 1:] for tokens in full_tokens]
 
     def make_loss_fn(target: torch.Tensor):
-        def loss_fn(logits: torch.Tensor, start: int, end: int) -> tuple[torch.Tensor, int]:
-            loss = F.cross_entropy(
-                logits.float().flatten(0, 1),
-                target[:, start:end].flatten(),
-                reduction="sum",
-            )
-            return loss, end - start
+        class CompactCrossEntropy:
+            valid_positions = torch.arange(target.shape[1], device="cpu") >= 8
 
-        return loss_fn
+            def compact(self, logits: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, int]:
+                loss = F.cross_entropy(
+                    logits.float().flatten(0, 1),
+                    target.index_select(1, positions).flatten(),
+                    reduction="sum",
+                )
+                return loss, positions.numel()
+
+            def __call__(self, logits: torch.Tensor, start: int, end: int) -> tuple[torch.Tensor, int]:
+                local_positions = self.valid_positions[start:end].nonzero(as_tuple=False).flatten()
+                positions = (start + local_positions).to(logits.device)
+                return self.compact(logits.index_select(1, local_positions.to(logits.device)), positions)
+
+        return CompactCrossEntropy()
 
     loss_fns = [make_loss_fn(target) for target in targets]
     traces = [capture_qwen3_kv_trace(model, sequence) for sequence in input_ids]
@@ -186,6 +194,7 @@ def test_qwen3_wavefront_matches_sequential_reverse() -> None:
     torch.testing.assert_close(wavefront.loss_sum, sequential_loss, rtol=2e-3, atol=2e-1)
     assert wavefront.chunks == 8
     assert wavefront.backward_calls == 5
+    assert wavefront.lm_head_tokens < wavefront.dense_lm_head_tokens
     cosine = F.cosine_similarity(wavefront_grad.flatten(), sequential_grad.flatten(), dim=0)
     assert cosine.item() > 0.995
     relative_error = torch.linalg.vector_norm(wavefront_grad - sequential_grad) / torch.linalg.vector_norm(

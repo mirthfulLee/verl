@@ -27,6 +27,7 @@ class CommittedChunkPublisher:
         prompt_ids: Sequence[int],
         chunk_size: int,
         submit: Callable[[CommittedTokenChunk], Awaitable[None]],
+        terminal_only_after_initial: bool = False,
     ) -> None:
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
@@ -34,6 +35,7 @@ class CommittedChunkPublisher:
         self.prompt_ids = tuple(int(token_id) for token_id in prompt_ids)
         self.chunk_size = chunk_size
         self.submit = submit
+        self.terminal_only_after_initial = terminal_only_after_initial
         self._accepted: tuple[int, ...] = ()
         self._emitted = 0
         self._terminal = False
@@ -47,7 +49,9 @@ class CommittedChunkPublisher:
         self._accepted = accepted
 
         terminal_sent = False
-        while len(self._accepted) - self._emitted >= self.chunk_size:
+        while len(self._accepted) - self._emitted >= self.chunk_size and (
+            not self.terminal_only_after_initial or self._emitted == 0
+        ):
             end = self._emitted + self.chunk_size
             chunk_is_terminal = terminal and end == len(self._accepted)
             await self._emit(end, terminal=chunk_is_terminal)

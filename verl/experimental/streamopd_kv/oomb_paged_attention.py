@@ -85,7 +85,7 @@ def _fwd_kernel(
     seqlen_q_rounded,
     seqlen_k,
     num_kv_heads,
-    num_kv_pages,
+    page_table_stride_pages,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -102,7 +102,7 @@ def _fwd_kernel(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     q_ptrs = query + off_b * stride_qb + off_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :]
     kv_offs = off_kv_h * stride_kvh + offs_n[:, None] * stride_kvn + offs_d[None, :]
-    page_table += off_b * num_kv_pages * 4
+    page_table += off_b * page_table_stride_pages * 4
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
@@ -167,7 +167,7 @@ def _bwd_kernel(
     seqlen_q_rounded,
     seqlen_k,
     num_kv_heads,
-    num_kv_pages,
+    page_table_stride_pages,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -184,7 +184,7 @@ def _bwd_kernel(
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     q_ptrs = query + off_b * stride_qb + off_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :]
     kv_offs = off_kv_h * stride_kvh + offs_n[:, None] * stride_kvn + offs_d[None, :]
-    page_table += off_b * num_kv_pages * 4
+    page_table += off_b * page_table_stride_pages * 4
     dout_ptrs = dout + off_b * stride_dob + off_h * stride_doh + offs_m[:, None] * stride_dom + offs_d[None, :]
     dquery_ptrs = dquery + off_b * stride_dqb + off_h * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :]
     lse_ptrs = lse + off_hb * seqlen_q_rounded + offs_m
@@ -260,6 +260,7 @@ class PagedKVManager:
         self.key_grad_pages: list[torch.Tensor] = []
         self.value_grad_pages: list[torch.Tensor] = []
         self._page_table: torch.Tensor | None = None
+        self._page_table_stride_pages = 0
         for start in range(0, key.shape[1], chunk_size):
             end = min(start + chunk_size, key.shape[1])
             self._append(key[:, start:end], value[:, start:end])
@@ -286,6 +287,7 @@ class PagedKVManager:
         self.last_update_pages.append(len(key_pages))
         self.num_kv += update_tokens
         self._page_table = None
+        self._page_table_stride_pages = 0
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -301,7 +303,14 @@ class PagedKVManager:
                 for page_idx in range(self.num_pages)
             ]
             self._page_table = torch.tensor(pointers, dtype=torch.int64, device=self.device)
+            self._page_table_stride_pages = self.num_pages
         return self._page_table
+
+    @property
+    def page_table_stride_pages(self) -> int:
+        if self._page_table is None:
+            _ = self.page_table
+        return self._page_table_stride_pages
 
     @property
     def num_pages(self) -> int:
@@ -327,7 +336,6 @@ class PagedKVManager:
         del self.value_pages[-update_pages:]
         del self.key_grad_pages[-update_pages:]
         del self.value_grad_pages[-update_pages:]
-        self._page_table = None
 
 
 def _flash_paged_forward(query: torch.Tensor, manager: PagedKVManager, scale: float | None):
@@ -370,7 +378,7 @@ def _flash_paged_forward(query: torch.Tensor, manager: PagedKVManager, scale: fl
         seqlen_q_rounded,
         manager.num_kv,
         manager.num_kv_heads,
-        manager.num_pages,
+        manager.page_table_stride_pages,
         BLOCK_M=block,
         BLOCK_N=block,
         BLOCK_HEADDIM=block_head_dim,
@@ -447,7 +455,7 @@ def _flash_paged_backward(
         seqlen_q_rounded,
         manager.num_kv,
         manager.num_kv_heads,
-        manager.num_pages,
+        manager.page_table_stride_pages,
         BLOCK_M=block,
         BLOCK_N=block,
         BLOCK_HEADDIM=block_head_dim,
@@ -490,10 +498,251 @@ class _FlashPagedAttention(torch.autograd.Function):
 flash_paged_attention = _FlashPagedAttention.apply
 
 
+class _ContiguousKVLayer:
+    """Batch-major KV/dKV storage for a wavefront layer."""
+
+    def __init__(self, traces: Sequence[LayerKVTrace]) -> None:
+        if not traces:
+            raise ValueError("contiguous OOMB storage requires at least one trajectory")
+        max_length = max(trace.length for trace in traces)
+        keys = []
+        values = []
+        for trace in traces:
+            key = trace.key.transpose(1, 2)
+            value = trace.value.transpose(1, 2)
+            if not key.is_cuda or key.dtype != torch.bfloat16:
+                raise TypeError("contiguous OOMB attention requires CUDA BF16 rollout KV")
+            if key.shape != value.shape or key.shape[0] != 1:
+                raise ValueError("contiguous OOMB wavefront traces must contain one aligned trajectory")
+            pad_tokens = max_length - key.shape[1]
+            if pad_tokens:
+                padding = (0, 0, 0, 0, 0, pad_tokens)
+                key = torch.nn.functional.pad(key, padding)
+                value = torch.nn.functional.pad(value, padding)
+            keys.append(key)
+            values.append(value)
+        self.key = torch.cat(keys, dim=0).contiguous()
+        self.value = torch.cat(values, dim=0).contiguous()
+        self.key_grad = torch.zeros_like(self.key)
+        self.value_grad = torch.zeros_like(self.value)
+        self.num_kv_heads = self.key.shape[2]
+        self.head_dim = self.key.shape[3]
+
+
+class _ContiguousKVBatchView:
+    """Active wavefront view with one batched gradient accumulation kernel."""
+
+    def __init__(self, layer: _ContiguousKVLayer, active: Sequence[int], start: int, end: int) -> None:
+        self.layer = layer
+        self.active = tuple(active)
+        self.start = start
+        self.end = end
+        self.batch_size = len(active)
+        self.num_kv_heads = layer.num_kv_heads
+        self.head_dim = layer.head_dim
+        self.group_size = 0
+        self._active_tensor: torch.Tensor | None = None
+        self._prefix_active = self.active == tuple(range(self.batch_size))
+
+    def _select(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._prefix_active:
+            return tensor[: self.batch_size, : self.end]
+        if self._active_tensor is None:
+            self._active_tensor = torch.tensor(self.active, dtype=torch.long, device=tensor.device)
+        return tensor.index_select(0, self._active_tensor)[:, : self.end]
+
+    def expanded_key_value(self, query_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if query_heads % self.num_kv_heads:
+            raise ValueError("query heads must be divisible by KV heads")
+        self.group_size = query_heads // self.num_kv_heads
+        key = self._select(self.layer.key).transpose(1, 2)
+        value = self._select(self.layer.value).transpose(1, 2)
+        return key.repeat_interleave(self.group_size, dim=1), value.repeat_interleave(self.group_size, dim=1)
+
+    def accumulate_expanded_gradients(self, key_grad: torch.Tensor, value_grad: torch.Tensor) -> None:
+        batch, _, tokens, head_dim = key_grad.shape
+        expected_heads = self.num_kv_heads * self.group_size
+        if batch != self.batch_size or key_grad.shape[1] != expected_heads or head_dim != self.head_dim:
+            raise RuntimeError("FlashAttention returned an invalid contiguous OOMB gradient shape")
+        key_grad = key_grad.view(batch, self.num_kv_heads, self.group_size, tokens, head_dim).sum(2)
+        value_grad = value_grad.view(batch, self.num_kv_heads, self.group_size, tokens, head_dim).sum(2)
+        key_grad = key_grad.transpose(1, 2)
+        value_grad = value_grad.transpose(1, 2)
+        if self._prefix_active:
+            self.layer.key_grad[:batch, :tokens].add_(key_grad)
+            self.layer.value_grad[:batch, :tokens].add_(value_grad)
+        else:
+            assert self._active_tensor is not None
+            self.layer.key_grad[:, :tokens].index_add_(0, self._active_tensor, key_grad)
+            self.layer.value_grad[:, :tokens].index_add_(0, self._active_tensor, value_grad)
+
+    @property
+    def grad(self) -> tuple[torch.Tensor, torch.Tensor]:
+        key_grad = self._select(self.layer.key_grad)[:, self.start : self.end]
+        value_grad = self._select(self.layer.value_grad)[:, self.start : self.end]
+        return key_grad, value_grad
+
+
+class _FlashContiguousAttention(torch.autograd.Function):
+    """Fail-closed CUDA FlashAttention VJP over OOMB's persistent KV/dKV."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        manager: _ContiguousKVBatchView,
+        scale: float | None,
+    ) -> torch.Tensor:
+        if query.dtype != torch.bfloat16 or not query.is_cuda or query.shape[-1] > 256:
+            raise TypeError("contiguous OOMB FlashAttention requires CUDA BF16 with head_dim <= 256")
+        expected = (manager.batch_size, manager.end - manager.start, manager.num_kv_heads, manager.head_dim)
+        if current_key.shape != expected or current_value.shape != expected:
+            raise ValueError(f"current recomputed KV shape does not match the OOMB wavefront: expected {expected}")
+        query = query.transpose(1, 2).contiguous()
+        key, value = manager.expanded_key_value(query.shape[1])
+        softmax_scale = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
+        try:
+            result = torch.ops.aten._scaled_dot_product_flash_attention(
+                query,
+                key,
+                value,
+                0.0,
+                True,
+                False,
+                scale=softmax_scale,
+            )
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError("the selected CUDA device does not support exact contiguous FlashAttention") from exc
+        output, lse, cum_q, cum_k, max_q, max_k, rng_state = result[:7]
+        ctx.save_for_backward(query, output, lse, rng_state)
+        ctx.manager = manager
+        ctx.cum_q = cum_q
+        ctx.cum_k = cum_k
+        ctx.max_q = max_q
+        ctx.max_k = max_k
+        ctx.softmax_scale = softmax_scale
+        return output.transpose(1, 2)
+
+    @staticmethod
+    def backward(ctx, output_grad: torch.Tensor):
+        query, output, lse, rng_state = ctx.saved_tensors
+        key, value = ctx.manager.expanded_key_value(query.shape[1])
+        query_grad, key_grad, value_grad = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+            output_grad.transpose(1, 2).contiguous(),
+            query,
+            key,
+            value,
+            output,
+            lse,
+            ctx.cum_q,
+            ctx.cum_k,
+            ctx.max_q,
+            ctx.max_k,
+            0.0,
+            True,
+            rng_state[0],
+            rng_state[1],
+            scale=ctx.softmax_scale,
+        )
+        ctx.manager.accumulate_expanded_gradients(key_grad, value_grad)
+        current_key_grad, current_value_grad = ctx.manager.grad
+        return query_grad.transpose(1, 2), current_key_grad, current_value_grad, None, None
+
+
+flash_contiguous_attention = _FlashContiguousAttention.apply
+
+
+class OOMBFlashWavefrontState:
+    """Wavefront reverse state backed by batched contiguous FlashAttention."""
+
+    def __init__(self, trajectories: Sequence[Sequence[LayerKVTrace]]) -> None:
+        if not trajectories or not trajectories[0]:
+            raise ValueError("FlashAttention wavefront state requires trajectories with KV layers")
+        layer_counts = {len(layers) for layers in trajectories}
+        if len(layer_counts) != 1:
+            raise ValueError("wavefront trajectories must have the same layer count")
+        self.num_layers = next(iter(layer_counts))
+        self.sequence_lengths = []
+        for layers in trajectories:
+            lengths = {layer.length for layer in layers}
+            if len(lengths) != 1:
+                raise ValueError("all layers in a wavefront trajectory must have the same length")
+            self.sequence_lengths.append(next(iter(lengths)))
+        self.layers = []
+        for layer_idx in range(self.num_layers):
+            self.layers.append(_ContiguousKVLayer([trajectory[layer_idx] for trajectory in trajectories]))
+            for trajectory in trajectories:
+                trajectory[layer_idx].key = trajectory[layer_idx].key[:, :, :0]
+                trajectory[layer_idx].value = trajectory[layer_idx].value[:, :, :0]
+        self.active: list[int] = []
+        self.start = 0
+        self.end = 0
+        self._visited: set[int] = set()
+        self._current: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def begin(self, active: Sequence[int], start: int, end: int) -> None:
+        if self._visited:
+            raise RuntimeError("the prior FlashAttention wavefront depth was not committed")
+        if not active or start < 0 or start >= end:
+            raise ValueError(f"invalid FlashAttention wavefront depth: active={list(active)}, [{start}, {end})")
+        if any(end > self.sequence_lengths[idx] for idx in active):
+            raise RuntimeError("active FlashAttention wavefront trajectory is shorter than the reverse depth")
+        self.active = list(active)
+        self.start, self.end = start, end
+        self._current.clear()
+
+    def attention(
+        self,
+        layer_idx: int,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        *,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        if layer_idx in self._visited:
+            raise RuntimeError(f"layer {layer_idx} was visited twice in one reverse depth")
+        if query.shape[0] != len(self.active):
+            raise RuntimeError("wavefront query batch does not match the active trajectories")
+        self._visited.add(layer_idx)
+        manager = _ContiguousKVBatchView(self.layers[layer_idx], self.active, self.start, self.end)
+        output = flash_contiguous_attention(
+            query.transpose(1, 2).contiguous(),
+            current_key.transpose(1, 2).contiguous(),
+            current_value.transpose(1, 2).contiguous(),
+            manager,
+            scale,
+        )
+        self._current[layer_idx] = (current_key, current_value)
+        return output.transpose(1, 2)
+
+    def gradient_injection(self) -> torch.Tensor:
+        if len(self._visited) != self.num_layers:
+            raise RuntimeError(f"expected {self.num_layers} visited layers, got {len(self._visited)}")
+        current_key, _ = next(iter(self._current.values()))
+        return torch.zeros((), device=current_key.device, dtype=current_key.dtype)
+
+    def commit_prefix_gradients(self, *, release_processed_suffix: bool = True) -> None:
+        if len(self._visited) != self.num_layers:
+            raise RuntimeError(f"expected {self.num_layers} visited layers, got {len(self._visited)}")
+        del release_processed_suffix
+        self.active = []
+        self._visited.clear()
+        self._current.clear()
+
+
 class PagedKVBatchView:
     """Batch view over independent, equally advanced trajectory managers."""
 
-    def __init__(self, managers: Sequence[PagedKVManager]) -> None:
+    def __init__(
+        self,
+        managers: Sequence[PagedKVManager],
+        *,
+        page_table: torch.Tensor | None = None,
+        page_table_stride_pages: int = 0,
+    ) -> None:
         if not managers:
             raise ValueError("OOMB paged batch view requires at least one trajectory")
         if any(manager.batch_size != 1 for manager in managers):
@@ -512,7 +761,13 @@ class PagedKVBatchView:
         for attribute in attributes:
             setattr(self, attribute, getattr(managers[0], attribute))
         self.last_update_tokens = [next(iter(update_tokens))]
-        self._page_table: torch.Tensor | None = None
+        if page_table is not None:
+            if page_table.device != self.device or page_table.dtype != torch.int64:
+                raise ValueError("cached OOMB page table has the wrong device or dtype")
+            if page_table_stride_pages < self.num_pages:
+                raise ValueError("cached OOMB page table is shorter than the active prefix")
+        self._page_table = page_table
+        self._page_table_stride_pages = page_table_stride_pages
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -528,7 +783,14 @@ class PagedKVBatchView:
                 for page_idx in range(self.num_pages)
             ]
             self._page_table = torch.tensor(pointers, dtype=torch.int64, device=self.device)
+            self._page_table_stride_pages = self.num_pages
         return self._page_table
+
+    @property
+    def page_table_stride_pages(self) -> int:
+        if self._page_table is None:
+            _ = self.page_table
+        return self._page_table_stride_pages
 
     @property
     def grad(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -577,6 +839,7 @@ class OOMBPagedWavefrontState:
         self.end = 0
         self._visited: set[int] = set()
         self._current: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._page_tables: dict[tuple[tuple[int, ...], int], tuple[torch.Tensor, int]] = {}
 
     def begin(self, active: Sequence[int], start: int, end: int) -> None:
         if self._visited:
@@ -609,9 +872,15 @@ class OOMBPagedWavefrontState:
         if query.shape[0] != len(self.active):
             raise RuntimeError("wavefront query batch does not match the active trajectories")
         self._visited.add(layer_idx)
+        cache_key = (tuple(self.active), layer_idx)
+        cached_table = self._page_tables.get(cache_key)
         manager = PagedKVBatchView(
-            [self.trajectory_managers[trajectory_idx][layer_idx] for trajectory_idx in self.active]
+            [self.trajectory_managers[trajectory_idx][layer_idx] for trajectory_idx in self.active],
+            page_table=cached_table[0] if cached_table is not None else None,
+            page_table_stride_pages=cached_table[1] if cached_table is not None else 0,
         )
+        if cached_table is None:
+            self._page_tables[cache_key] = (manager.page_table, manager.page_table_stride_pages)
         output = flash_paged_attention(
             query.transpose(1, 2).contiguous(),
             current_key.transpose(1, 2).contiguous(),
@@ -625,18 +894,8 @@ class OOMBPagedWavefrontState:
     def gradient_injection(self) -> torch.Tensor:
         if len(self._visited) != self.num_layers:
             raise RuntimeError(f"expected {self.num_layers} visited layers, got {len(self._visited)}")
-        injection = None
-        for layer_idx, (current_key, current_value) in self._current.items():
-            for row, trajectory_idx in enumerate(self.active):
-                key_grad, value_grad = self.trajectory_managers[trajectory_idx][layer_idx].grad
-                key_grad = key_grad.transpose(1, 2)
-                value_grad = value_grad.transpose(1, 2)
-                term = (current_key[row : row + 1] * key_grad.to(current_key.dtype)).sum()
-                term = term + (current_value[row : row + 1] * value_grad.to(current_value.dtype)).sum()
-                injection = term if injection is None else injection + term
-        if injection is None:
-            raise RuntimeError("wavefront reverse state has no current KV tensors")
-        return injection
+        current_key, _ = next(iter(self._current.values()))
+        return torch.zeros((), device=current_key.device, dtype=current_key.dtype)
 
     def commit_prefix_gradients(self, *, release_processed_suffix: bool = True) -> None:
         if len(self._visited) != self.num_layers:
@@ -708,17 +967,8 @@ class OOMBPagedReverseState:
     def gradient_injection(self) -> torch.Tensor:
         if len(self._visited) != len(self.layers):
             raise RuntimeError(f"expected {len(self.layers)} visited layers, got {len(self._visited)}")
-        injection = None
-        for layer_idx, (current_key, current_value) in self._current.items():
-            key_grad, value_grad = self.managers[layer_idx].grad
-            key_grad = key_grad.transpose(1, 2)
-            value_grad = value_grad.transpose(1, 2)
-            term = (current_key * key_grad.to(current_key.dtype)).sum()
-            term = term + (current_value * value_grad.to(current_value.dtype)).sum()
-            injection = term if injection is None else injection + term
-        if injection is None:
-            raise RuntimeError("reverse state has no current KV tensors")
-        return injection
+        current_key, _ = next(iter(self._current.values()))
+        return torch.zeros((), device=current_key.device, dtype=current_key.dtype)
 
     def commit_prefix_gradients(self, *, release_processed_suffix: bool = True) -> None:
         if len(self._visited) != len(self.layers):

@@ -25,6 +25,7 @@ TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.55}
 TEACHER_MAX_BATCHED_TOKENS=${TEACHER_MAX_BATCHED_TOKENS:-8192}
 OVERLAP_ROLLOUT_TRAINING=${OVERLAP_ROLLOUT_TRAINING:-False}
 ROLLOUT_MICRO_BATCH_SIZE=${ROLLOUT_MICRO_BATCH_SIZE:-32}
+TRAINER_MICRO_BATCH_SIZE=${TRAINER_MICRO_BATCH_SIZE:-$ROLLOUT_MICRO_BATCH_SIZE}
 COLOCATE_TEACHER_WITH_STUDENT=${COLOCATE_TEACHER_WITH_STUDENT:-False}
 TEACHER_PRIORITY_THRESHOLD=${TEACHER_PRIORITY_THRESHOLD:-0}
 SCHEDULER_POLL_INTERVAL_MS=${SCHEDULER_POLL_INTERVAL_MS:-10}
@@ -119,6 +120,7 @@ fi
   distillation.streamopd_kv.reverse_batch_max_tokens="$REVERSE_BATCH_MAX_TOKENS" \
   distillation.streamopd_kv.overlap_rollout_training="$OVERLAP_ROLLOUT_TRAINING" \
   distillation.streamopd_kv.rollout_micro_batch_size="$ROLLOUT_MICRO_BATCH_SIZE" \
+  distillation.streamopd_kv.micro_batch_size="$TRAINER_MICRO_BATCH_SIZE" \
   distillation.streamopd_kv.colocate_teacher_with_student="$COLOCATE_TEACHER_WITH_STUDENT" \
   distillation.streamopd_kv.teacher_priority_threshold="$TEACHER_PRIORITY_THRESHOLD" \
   distillation.streamopd_kv.scheduler_poll_interval_ms="$SCHEDULER_POLL_INTERVAL_MS" \

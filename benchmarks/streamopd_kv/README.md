@@ -72,38 +72,41 @@ is required to measure the current pinned-CPU/safetensors transport.
 
 ## Measured results
 
-### Two-pool OOMB matrix (global batch 128)
+### Optimized two-pool matrix (global batch 128)
 
 These one-step GPU0-3 measurements use Qwen3-1.7B/Qwen3-4B, BF16, direct top-k forward KL, deterministic rollout,
-and the same DAPO dataset. StreamOPD uses OOMB page size 64, reverse batch at most sixteen, and a 32768-token reverse
-batch cap. The 4-GPU colocate baseline uses the topology workaround described above.
+and the same DAPO data. `microbatch` is a StreamOPD Teacher/Trainer Pool setting only. The sync baselines use their
+native dynamic batching and are not constrained to 16/32; the old `mb32` suffix in baseline log names was only a
+wrapper label and is omitted below.
 
 | Total | Path | Microbatch | Step | Throughput | Actor peak | vs sync | vs colocate |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096 | `verl-sync-opd` | 32 | 219.97 s | 459.83 tok/s | 23.64 GiB | 1.000x | 0.850x |
-| 4096 | `verl-colocate-opd` | 32 | 186.97 s | 539.24 tok/s | 20.34 GiB | 1.176x | 1.000x |
-| 4096 | `streamopd-colocate` (wavefront) | 16 | 241.18 s | 419.83 tok/s | 55.19 GiB | 0.912x | 0.775x |
-| 4096 | `streamopd-colocate` (wavefront) | 32 | 237.36 s | 425.93 tok/s | 35.99 GiB | 0.927x | 0.788x |
-| 8192 | `verl-sync-opd` | 32 | 442.09 s | 485.86 tok/s | 54.36 GiB | 1.000x | 0.763x |
-| 8192 | `verl-colocate-opd` | 32 | 337.47 s | 627.29 tok/s | 41.42 GiB | 1.310x | 1.000x |
-| 8192 | `streamopd-colocate` (wavefront) | 16 | 572.42 s | 373.69 tok/s | 37.55 GiB | 0.772x | 0.590x |
-| 8192 | `streamopd-colocate` (wavefront) | 32 | 550.11 s | 383.10 tok/s | 37.98 GiB | 0.804x | 0.613x |
+| 4096 | `verl-sync-opd` | - | 219.97 s | 459.83 tok/s | 23.64 GiB | 1.000x | 0.850x |
+| 4096 | `verl-colocate-opd` | - | 186.97 s | 539.24 tok/s | 20.34 GiB | 1.176x | 1.000x |
+| 4096 | `streamopd-colocate` | 16 | 135.75 s | 741.46 tok/s | 49.88 GiB | 1.620x | 1.377x |
+| 4096 | `streamopd-colocate` | 32 | 134.43 s | 750.51 tok/s | 49.91 GiB | 1.636x | 1.391x |
+| 8192 | `verl-sync-opd` | - | 442.09 s | 485.86 tok/s | 54.36 GiB | 1.000x | 0.763x |
+| 8192 | `verl-colocate-opd` | - | 337.47 s | 627.29 tok/s | 41.42 GiB | 1.310x | 1.000x |
+| 8192 | `streamopd-colocate` | 16 | 296.86 s | 711.17 tok/s | 35.31 GiB | 1.489x | 1.137x |
+| 8192 | `streamopd-colocate` | 32 | 295.60 s | 702.18 tok/s | 35.34 GiB | 1.496x | 1.142x |
 
-The wavefront scheduler batches all trajectories that still have a given reverse depth (up to sixteen per reverse
-microbatch); the measured 4096 cases reached eight active trajectories per kernel call, while 8192 reached four.
-With the preflight allocator estimate, memory-rich 4096/mb16 keeps a 1024-token reverse chunk; a constrained
-4096/mb32 run selects 512. Compared with the earlier singleton reverse implementation, backward calls fell from 8 to 4 at
-4096/mb16 and from 28 to 14 at 4096/mb32. The current OOMB kernel is not yet faster end-to-end on this A100 run:
-teacher-priority serialization and batched kernel launch costs outweigh the reduced call count. Both 8192 wavefront
-cases complete without OOM; mb32 uses 1024 after the memory plan is evaluated.
+The optimized path replaces the batched paged backward hot spot with exact bottom-right-causal CUDA FlashAttention,
+keeps the OOMB reverse chain rule, computes only target LM-head rows, transfers policy weights as BF16 host buckets,
+and enables vLLM graph capture. The wavefront planner keeps the largest configured 1024-token reverse chunk, then
+selects the largest power-of-two trajectory width that fits a pre-policy analytical budget covering persistent KV,
+activations, vocabulary logits/gradients, and reserve space. It selects width 8 at 4096 and width 4 at 8192.
 
-The 4096/mb16 preflight reported 59.28 GiB reusable budget on each trainer rank and selected the maximum 1024-token
-chunk; this measurement happens during initialization, before the policy loop.
+The memory budget is sampled once before policy version zero; no allocator query, OOM retry, or kernel-shape change
+occurs in the policy loop. A forced 8192 width-8 run OOMed, validating the width-4 choice. Increasing teacher
+`max_num_batched_tokens` from 2048 to 4096 is a stable 8192 tuning and lowers mb16 to 291.06 s (1.519x vs sync),
+while 8192 teacher tokens make one teacher process consume 65.29 GiB and OOM, so it is not a default.
 
-All StreamOPD runs recorded nonzero KV tokens before EOS, exactly one optimizer finalization across their 8 (mb16)
-or 4 (mb32) accumulation units, and maximum policy staleness zero. Wavefront logs and machine-readable metrics are in
-`results/colocate_matrix_oomb_wavefront_b128/summary.json`; baseline logs are reused from
-`results/colocate_matrix_oomb_host_b128/`.
+Rollout uses independent continuous batching (`max_num_seqs` is tuned separately from microbatch). KV chunk files
+enter the Teacher/Trainer Pool-visible host cache during generation, before EOS; multiple in-progress or sealed MBs
+may be host-resident. Each trainer worker has a fail-closed single-MB GPU KV lease, and the next ready MB is loaded
+only after the current update releases it. All successful runs recorded pre-EOS KV chunks, one optimizer
+finalization, and zero policy staleness. Machine-readable results are in
+`results/optimized_flash_wavefront_b128/summary.json`.
 
 ### End-to-end V1 sync comparison (total trajectory length 4096)
 

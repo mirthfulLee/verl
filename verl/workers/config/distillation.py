@@ -229,11 +229,17 @@ class StreamOPDKVConfig(BaseConfig):
     enabled: bool = False
     token_chunk_size: int = 256
     reverse_chunk_size: int = 256
+    reverse_chunk_min_size: int = 64
+    reverse_page_size: int = 64
     reverse_batch_size: int = 16
-    reverse_batch_max_tokens: int = 8192
+    reverse_batch_max_tokens: int = 32768
     overlap_rollout_training: bool = False
     rollout_micro_batch_size: int = 32
     colocate_teacher_with_student: bool = False
+    teacher_priority_threshold: int = 0
+    scheduler_poll_interval_ms: int = 10
+    scheduler_timeout_seconds: float = 600.0
+    scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"
@@ -248,17 +254,30 @@ class StreamOPDKVConfig(BaseConfig):
         for name in (
             "token_chunk_size",
             "reverse_chunk_size",
+            "reverse_chunk_min_size",
+            "reverse_page_size",
             "reverse_batch_size",
             "reverse_batch_max_tokens",
             "rollout_micro_batch_size",
+            "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"streamopd_kv.{name} must be positive")
         if not self.kv_handoff_dir:
             raise ValueError("streamopd_kv.kv_handoff_dir must be non-empty")
+        if self.reverse_chunk_min_size > self.reverse_chunk_size:
+            raise ValueError("streamopd_kv.reverse_chunk_min_size must not exceed reverse_chunk_size")
+        if self.reverse_page_size < 16 or self.reverse_page_size & (self.reverse_page_size - 1):
+            raise ValueError("streamopd_kv.reverse_page_size must be a power of two and at least 16")
+        if self.reverse_chunk_size % self.reverse_page_size or self.reverse_chunk_min_size % self.reverse_page_size:
+            raise ValueError("StreamOPD reverse chunk sizes must be divisible by reverse_page_size")
         if self.validation_atol < 0:
             raise ValueError("streamopd_kv.validation_atol must be non-negative")
+        if self.teacher_priority_threshold < 0:
+            raise ValueError("streamopd_kv.teacher_priority_threshold must be non-negative")
+        if self.scheduler_timeout_seconds <= 0:
+            raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
         if self.enabled and self.rollout_backend != "vllm":
             raise NotImplementedError("StreamOPD-KV MVP supports rollout_backend='vllm' only")
         if self.enabled and not self.exact_dense_attention:

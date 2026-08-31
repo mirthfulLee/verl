@@ -513,9 +513,13 @@ class AgentLoopWorker:
                     )
                     if self.tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
                         raise ValueError("StreamOPD-KV requires identical student and teacher token-id vocabularies")
+                scheduler_name = str(streamopd_config.get("scheduler_actor_name", ""))
+                scheduler = ray.get_actor(scheduler_name) if scheduler_name else None
                 self._streamopd_teacher = StreamingTeacherCoordinator(
                     self._score_streamopd_teacher_prefix,
                     max_pending_chunks=int(streamopd_config.get("max_pending_teacher_chunks", 128)),
+                    scheduler=scheduler,
+                    scheduler_poll_interval_ms=int(streamopd_config.get("scheduler_poll_interval_ms", 10)),
                 )
                 self.llm_client.streamopd_callback = ray.get_runtime_context().current_actor
                 self.llm_client.streamopd_chunk_size = int(streamopd_config.get("token_chunk_size", 256))

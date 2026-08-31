@@ -32,19 +32,103 @@ def _reverse_backward_calls(lengths: list[int], chunk_size: int) -> int:
     return max(math.ceil(length / chunk_size) for length in lengths)
 
 
+def _dynamic_reverse_chunk_size(
+    max_chunk_size: int,
+    min_chunk_size: int,
+    microbatch_size: int,
+    *,
+    max_trace_length: int = 0,
+    target_trace_length: int = 0,
+    alignment: int = 1,
+    available_memory_bytes: int | None = None,
+    estimated_base_bytes: int = 0,
+    estimated_bytes_per_token: int = 0,
+) -> int:
+    if (
+        min_chunk_size < 1
+        or max_chunk_size < min_chunk_size
+        or microbatch_size < 1
+        or alignment < 1
+        or min_chunk_size % alignment
+        or max_chunk_size % alignment
+    ):
+        raise ValueError("invalid dynamic reverse chunk configuration")
+    # Start at the largest kernel-friendly chunk. The legacy token-pressure
+    # heuristic is retained only for callers without a device memory estimate.
+    if available_memory_bytes is None:
+        pressure = max(1, math.ceil(microbatch_size / 16))
+        if max_trace_length > 0 and target_trace_length > 0:
+            pressure = max(pressure, math.ceil(max_trace_length / target_trace_length))
+        chunk_size = max_chunk_size // pressure
+    else:
+        budget = max(0, int(available_memory_bytes * 0.75) - estimated_base_bytes)
+        if estimated_bytes_per_token > 0:
+            chunk_size = budget // estimated_bytes_per_token
+        else:
+            chunk_size = max_chunk_size
+        chunk_size = min(max_chunk_size, chunk_size)
+    chunk_size = max(min_chunk_size, chunk_size // alignment * alignment)
+    return min(max_chunk_size, chunk_size)
+
+
+def _reverse_memory_estimate(
+    model: torch.nn.Module,
+    *,
+    trajectory_count: int,
+    trace_length: int,
+    dtype: torch.dtype,
+) -> tuple[int, int]:
+    """Estimate fixed KV and per-current-token reverse working-set bytes."""
+
+    config = getattr(model, "config", None)
+    base_model = getattr(model, "model", None)
+    if config is None and base_model is not None:
+        config = getattr(base_model, "config", None)
+    hidden_size = int(getattr(config, "hidden_size", 0) or 0)
+    layers = len(getattr(base_model, "layers", ()))
+    kv_heads = int(getattr(config, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(config, "head_dim", 0) or 0)
+    if head_dim < 1 and hidden_size > 0:
+        query_heads = int(getattr(config, "num_attention_heads", 1) or 1)
+        head_dim = hidden_size // query_heads
+    dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+    # Account for the staged snapshot plus the contiguous OOMB page backing.
+    kv_bytes = trajectory_count * trace_length * layers * kv_heads * head_dim * dtype_bytes * 2 * 2
+    # Per-layer hidden, Q/K/V, MLP input, and output tensors are kept live by
+    # the reverse recomputation. The factor is deliberately conservative.
+    activation_bytes_per_token = trajectory_count * layers * hidden_size * dtype_bytes * 10
+    return kv_bytes, activation_bytes_per_token
+
+
+def _available_cuda_memory(device: str | torch.device) -> int:
+    """Return driver-free memory plus PyTorch's immediately reusable cache."""
+
+    device_module = get_torch_device()
+    free_driver, _ = device_module.mem_get_info(device)
+    reserved = device_module.memory_reserved(device)
+    allocated = device_module.memory_allocated(device)
+    return int(free_driver + max(0, reserved - allocated))
+
+
 def _partition_reverse_microbatches(
     lengths: list[int], *, max_batch_size: int, max_batch_tokens: int
 ) -> list[list[int]]:
+    if max_batch_size < 1 or max_batch_tokens < 1:
+        raise ValueError("reverse batch size and token limit must be positive")
     groups: list[list[int]] = []
     current: list[int] = []
-    current_tokens = 0
-    for idx, length in enumerate(lengths):
-        if current and (len(current) >= max_batch_size or current_tokens + length > max_batch_tokens):
+    current_max_length = 0
+    for idx in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
+        length = lengths[idx]
+        if length < 1:
+            raise ValueError(f"reverse trace length must be positive, got {length}")
+        next_max_length = max(current_max_length, length)
+        if current and (len(current) >= max_batch_size or next_max_length * (len(current) + 1) > max_batch_tokens):
             groups.append(current)
             current = []
-            current_tokens = 0
+            current_max_length = 0
         current.append(idx)
-        current_tokens += length
+        current_max_length = max(current_max_length, length)
     if current:
         groups.append(current)
     return groups
@@ -69,8 +153,12 @@ def _forward_kl_topk_sum(
 ) -> torch.Tensor:
     """Match verl's native FSDP ``forward_kl_topk`` numerical path."""
 
-    temperature_tensor = torch.as_tensor(max(temperature, 1e-8), dtype=logits.dtype, device=logits.device)
-    scaled_logits = logits / temperature_tensor
+    normalized_temperature = max(temperature, 1e-8)
+    if normalized_temperature == 1.0:
+        scaled_logits = logits
+    else:
+        temperature_tensor = torch.as_tensor(normalized_temperature, dtype=logits.dtype, device=logits.device)
+        scaled_logits = logits / temperature_tensor
     ids = teacher_ids.long().to(logits.device)
     teacher = teacher_logprobs.to(logits.device)
     if use_chunked_topk:
@@ -111,6 +199,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._accum_policy_version: int | None = None
         self._accum_next_step = 0
         self._accum_global_valid_tokens = 0.0
+        self._reverse_available_memory_bytes: int | None = None
 
     def _reset_accumulation(self, *, zero_grad: bool) -> None:
         if zero_grad:
@@ -118,6 +207,18 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._accum_policy_version = None
         self._accum_next_step = 0
         self._accum_global_valid_tokens = 0.0
+
+    def prepare_reverse_plan(self) -> dict[str, float]:
+        """Measure reverse headroom before the first policy version starts."""
+
+        if self._reverse_available_memory_bytes is None:
+            try:
+                self._reverse_available_memory_bytes = _available_cuda_memory(self.device_name)
+            except (AttributeError, RuntimeError):
+                self._reverse_available_memory_bytes = 0
+        return {
+            "available_memory_gib": (self._reverse_available_memory_bytes or 0) / (1024**3),
+        }
 
     @staticmethod
     def _sample_tensor(sample: TensorDict, name: str) -> torch.Tensor:
@@ -202,16 +303,57 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         trajectory_ids = [str(sample["streamopd_trajectory_id"]) for sample in samples]
         if len(set(trajectory_ids)) != len(trajectory_ids):
             raise RuntimeError("StreamOPD cohort contains duplicate trajectory identities")
-        chunk_size = int(self.streamopd_config.reverse_chunk_size)
+        streamed_tokens_before_eos = 0
+        streamed_chunks_before_eos = 0
+        model = self.engine.module
+        parameter_dtype = next(model.parameters()).dtype
+        forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
+        max_chunk_size = int(self.streamopd_config.reverse_chunk_size)
+        min_chunk_size = int(self.streamopd_config.reverse_chunk_min_size)
+        page_size = int(self.streamopd_config.reverse_page_size)
         trace_lengths = [self._sample_tensor(sample, "input_ids").numel() - 1 for sample in samples]
-        local_chunks = sum(math.ceil(length / chunk_size) for length in trace_lengths)
         reverse_microbatches = _partition_reverse_microbatches(
             trace_lengths,
             max_batch_size=int(self.streamopd_config.reverse_batch_size),
             max_batch_tokens=int(self.streamopd_config.reverse_batch_max_tokens),
         )
+        target_trace_length = min(8192, int(self.streamopd_config.reverse_batch_max_tokens))
+        # The allocator budget is populated by prepare_reverse_plan during
+        # trainer initialization. Keep this path free of CUDA memory queries.
+        available_memory_bytes = self._reverse_available_memory_bytes or None
+        reverse_chunk_sizes = []
+        for group in reverse_microbatches:
+            max_trace_length = max(trace_lengths[idx] for idx in group)
+            estimated_base_bytes = 0
+            estimated_bytes_per_token = 0
+            if available_memory_bytes is not None:
+                estimated_base_bytes, estimated_bytes_per_token = _reverse_memory_estimate(
+                    model,
+                    trajectory_count=len(group),
+                    trace_length=max_trace_length,
+                    dtype=forward_dtype,
+                )
+                estimated_base_bytes += 4 * 1024**3
+            reverse_chunk_sizes.append(
+                _dynamic_reverse_chunk_size(
+                    max_chunk_size,
+                    min_chunk_size,
+                    int(self.streamopd_config.rollout_micro_batch_size),
+                    max_trace_length=max_trace_length,
+                    target_trace_length=target_trace_length,
+                    alignment=page_size,
+                    available_memory_bytes=available_memory_bytes,
+                    estimated_base_bytes=estimated_base_bytes,
+                    estimated_bytes_per_token=estimated_bytes_per_token,
+                )
+            )
+        local_chunks = sum(
+            sum(math.ceil(trace_lengths[idx] / chunk_size) for idx in group)
+            for group, chunk_size in zip(reverse_microbatches, reverse_chunk_sizes, strict=True)
+        )
         local_backward_calls = sum(
-            _reverse_backward_calls([trace_lengths[idx] for idx in group], chunk_size) for group in reverse_microbatches
+            _reverse_backward_calls([trace_lengths[idx] for idx in group], chunk_size)
+            for group, chunk_size in zip(reverse_microbatches, reverse_chunk_sizes, strict=True)
         )
         synchronized_calls_tensor = torch.tensor(local_backward_calls, device=self.device_name, dtype=torch.int64)
         dist.all_reduce(synchronized_calls_tensor, op=dist.ReduceOp.MAX, group=self.engine.get_data_parallel_group())
@@ -239,10 +381,6 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 f"got version={local_policy_version}, step={accumulation_step}"
             )
 
-        model = self.engine.module
-        parameter_dtype = next(model.parameters()).dtype
-        forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
-
         def mixed_precision_context():
             if forward_dtype == torch.float32:
                 return nullcontext()
@@ -253,6 +391,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         total_loss = torch.zeros((), device=self.device_name)
         full_forward_validation_loss = torch.zeros((), device=self.device_name)
         processed_backward_calls = 0
+        max_parallel_trajectories = 0
         handoff_seconds = 0.0
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
@@ -267,7 +406,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
 
         try:
             model.eval()
-            for group in reverse_microbatches:
+            for group, chunk_size in zip(reverse_microbatches, reverse_chunk_sizes, strict=True):
                 snapshots = []
                 try:
                     sequences = []
@@ -294,6 +433,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                             device=self.device_name,
                         ).acquire(policy_version)
                         snapshots.append(snapshot)
+                        streamed_tokens_before_eos += snapshot.streamed_tokens_before_eos
+                        streamed_chunks_before_eos += snapshot.streamed_chunks_before_eos
                         if snapshot.layers[0][0].dtype != forward_dtype:
                             raise RuntimeError(
                                 "rollout KV dtype does not match the trainer forward dtype: "
@@ -321,14 +462,22 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                                 sample_loss, _ = loss_fn(logits, 0, sequence.shape[1])
                                 full_forward_validation_loss += sample_loss.float()
 
-                    trainer = Qwen3ReverseTrainer(model, chunk_size=chunk_size)
+                    trainer = Qwen3ReverseTrainer(model, chunk_size=chunk_size, page_size=page_size)
+
+                    def release_stage1_snapshots(stage1_snapshots=snapshots) -> None:
+                        for snapshot in stage1_snapshots:
+                            if snapshot.refcount:
+                                snapshot.release()
+
                     with mixed_precision_context():
                         result = trainer.backward_batched(
                             sequences,
                             trajectory_layers,
                             loss_fns,
                             backward_context=backward_context,
+                            stage1_release=release_stage1_snapshots,
                         )
+                    max_parallel_trajectories = max(max_parallel_trajectories, result.max_parallel_trajectories)
                     total_loss += result.loss_sum
                 finally:
                     for snapshot in snapshots:
@@ -380,7 +529,14 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/reverse_chunks": local_chunks,
             "streamopd/reverse_backward_calls": processed_backward_calls,
             "streamopd/reverse_microbatches": len(reverse_microbatches),
+            "streamopd/reverse_max_parallel_trajectories": max_parallel_trajectories,
+            "streamopd/reverse_chunk_size_min": min(reverse_chunk_sizes, default=0),
+            "streamopd/reverse_chunk_size_max": max(reverse_chunk_sizes, default=0),
+            "streamopd/reverse_page_size": page_size,
+            "streamopd/reverse_memory_budget_gib": (available_memory_bytes or 0) / (1024**3),
             "streamopd/handoff_seconds": handoff_seconds,
+            "streamopd/kv_streamed_tokens_before_eos": streamed_tokens_before_eos,
+            "streamopd/kv_streamed_chunks_before_eos": streamed_chunks_before_eos,
             "streamopd/training_seconds": elapsed,
             "streamopd/valid_tokens": local_valid_tokens,
             "streamopd/accumulation_step": accumulation_step,

@@ -241,7 +241,9 @@ class PPOTrainer(ABC):
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. define actor and rollout class
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        actor_role = next(
+            role for role in (Role.ActorRolloutRef, Role.ActorRollout, Role.Actor) if role in self.role_worker_mapping
+        )
         actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         actor_rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[actor_role],
@@ -350,10 +352,11 @@ class PPOTrainer(ABC):
                     teacher.world_size for teacher in self.distillation_config.teacher_models.values()
                 )
                 remaining = teacher_resource_pool.world_size - teacher_world_size
-                teacher_resource_pool = split_resource_pool(
-                    teacher_resource_pool,
-                    split_size=[teacher_world_size, remaining],
-                )[0]
+                if remaining:
+                    teacher_resource_pool = split_resource_pool(
+                        teacher_resource_pool,
+                        split_size=[teacher_world_size, remaining],
+                    )[0]
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
@@ -363,13 +366,17 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
+        dedicated_streamopd_rollout = self.trainer_mode == "streamopd_colocate"
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+            config=self.config,
+            worker_group=None if dedicated_streamopd_rollout else self.actor_rollout_wg,
+            rollout_resource_pool=None if dedicated_streamopd_rollout else actor_rollout_resource_pool,
         )
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
+        if not dedicated_streamopd_rollout:
+            checkpoint_engine_config.backend = "naive"
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
@@ -377,8 +384,11 @@ class PPOTrainer(ABC):
         )
         logger.info("checkpoint engine manager initialized")
 
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+        # Hybrid replicas must release memory before the colocated actor loads a
+        # checkpoint. A dedicated StreamOPD rollout lives on another pool and
+        # keeps its weight buffers resident for the initial distributed sync.
+        if not dedicated_streamopd_rollout:
+            self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
@@ -764,7 +774,12 @@ class PPOTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        if self.trainer_mode == "streamopd_colocate":
+            if need_reference_policy(config):
+                raise NotImplementedError("streamopd_colocate does not support a reference policy")
+            role = Role.Actor
+        else:
+            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 
@@ -1543,7 +1558,9 @@ class PPOTrainer(ABC):
         overlap_rollout_training = bool(
             OmegaConf.select(self.config, "distillation.streamopd_kv.overlap_rollout_training", default=False)
         )
-        if getattr(self, "streamopd_kv_enabled", False) and overlap_rollout_training:
+        if getattr(self, "streamopd_kv_enabled", False) and (
+            overlap_rollout_training or getattr(self, "trainer_mode", None) == "streamopd_colocate"
+        ):
             return 1
         return self.parameter_sync_step
 

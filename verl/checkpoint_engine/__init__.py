@@ -30,6 +30,10 @@ __all__ = [
     "CheckpointEngineWorker",
 ]
 
+from .host_checkpoint_engine import HostCheckpointEngine
+
+__all__ += ["HostCheckpointEngine"]
+
 # Every engine below is optional: it carries its own transport dependency, and
 # the CUDA / NPU engines are mutually exclusive by construction (hccl registers
 # the "nccl" backend name on Ascend). Failures are recorded so that asking for a

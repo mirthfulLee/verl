@@ -1,0 +1,104 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import asyncio
+
+import torch
+
+from verl.checkpoint_engine.base import split_weight_chunks
+from verl.checkpoint_engine.host_checkpoint_engine import HostCheckpointEngine, HostCheckpointMetadata
+
+
+def test_host_topology_assigns_one_sender_and_independent_receivers(tmp_path) -> None:
+    session = tmp_path / "verl-host-checkpoint-test"
+    metadata = [
+        HostCheckpointMetadata(str(session)),
+        HostCheckpointMetadata(None),
+        HostCheckpointMetadata(None),
+        HostCheckpointMetadata(None),
+    ]
+
+    actor, rollout = HostCheckpointEngine.build_topology(2, 2, metadata)
+
+    assert actor["role"] == ["sender", "participant"]
+    assert rollout["role"] == ["receiver", "receiver"]
+    assert actor["session_dir"] == [str(session), str(session)]
+    assert rollout["actor_world_size"] == [2, 2]
+
+
+def test_host_checkpoint_round_trip_to_multiple_receivers(tmp_path) -> None:
+    async def run_round_trip() -> None:
+        root = str(tmp_path)
+        sender = HostCheckpointEngine(bucket_size=32, is_master=True, directory=root)
+        receiver_a = HostCheckpointEngine(bucket_size=32, directory=root, poll_interval=0.001)
+        receiver_b = HostCheckpointEngine(bucket_size=32, directory=root, poll_interval=0.001)
+
+        sender_metadata = sender.prepare()
+        actor_kwargs, rollout_kwargs = HostCheckpointEngine.build_topology(
+            1,
+            2,
+            [sender_metadata, receiver_a.prepare(), receiver_b.prepare()],
+        )
+        sender.init_process_group(**{name: values[0] for name, values in actor_kwargs.items()})
+        receiver_a.init_process_group(**{name: values[0] for name, values in rollout_kwargs.items()})
+        receiver_b.init_process_group(**{name: values[1] for name, values in rollout_kwargs.items()})
+
+        expected = {
+            "small": torch.arange(5, dtype=torch.float32),
+            "large": torch.arange(20, dtype=torch.float32).reshape(4, 5),
+            "tail": torch.arange(3, dtype=torch.bfloat16),
+        }
+
+        async def collect(receiver: HostCheckpointEngine) -> dict[str, torch.Tensor]:
+            return {name: tensor.clone() async for name, tensor in receiver.receive_weights()}
+
+        received_a, received_b, metrics = await asyncio.gather(
+            collect(receiver_a),
+            collect(receiver_b),
+            sender.send_weights(iter(expected.items())),
+        )
+        for received in (received_a, received_b):
+            assert received.keys() == expected.keys()
+            for name, tensor in expected.items():
+                torch.testing.assert_close(received[name], tensor)
+        assert metrics["timing/checkpoint_host_seconds"] > 0
+        assert metrics["checkpoint/host_gib_per_second"] > 0
+
+        session_dir = sender.session_dir
+        receiver_a.finalize()
+        receiver_b.finalize()
+        sender.finalize()
+        assert session_dir is not None and not session_dir.exists()
+
+    asyncio.run(run_round_trip())
+
+
+def test_meta_only_weight_split_does_not_view_payload() -> None:
+    class MetadataOnlyWeight:
+        shape = torch.Size((8,))
+        dtype = torch.float32
+        nbytes = 32
+
+        def view(self, *_args):
+            raise AssertionError("meta-only splitting must not view the payload")
+
+    async def collect():
+        weights = iter((("weight", MetadataOnlyWeight()),))
+        return [item async for item in split_weight_chunks(weights, 16, meta_only=True)]
+
+    chunks = asyncio.run(collect())
+    assert [meta.chunk_size for meta, payload in chunks] == [16, 16]
+    assert all(payload is None for _, payload in chunks)

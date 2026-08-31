@@ -124,6 +124,8 @@ class SealedKVSnapshot:
     layers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     source: str = "unknown"
     handoff_seconds: float = 0.0
+    streamed_tokens_before_eos: int = 0
+    streamed_chunks_before_eos: int = 0
     _state: SnapshotState = field(default=SnapshotState.SEALED, init=False, repr=False)
     _refcount: int = field(default=0, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)

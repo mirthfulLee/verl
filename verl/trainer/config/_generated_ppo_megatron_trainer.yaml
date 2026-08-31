@@ -918,11 +918,17 @@ distillation:
     enabled: false
     token_chunk_size: 256
     reverse_chunk_size: 256
+    reverse_chunk_min_size: 64
+    reverse_page_size: 64
     reverse_batch_size: 16
-    reverse_batch_max_tokens: 8192
+    reverse_batch_max_tokens: 32768
     overlap_rollout_training: false
     rollout_micro_batch_size: 32
     colocate_teacher_with_student: false
+    teacher_priority_threshold: 0
+    scheduler_poll_interval_ms: 10
+    scheduler_timeout_seconds: 600.0
+    scheduler_actor_name: ''
     max_pending_teacher_chunks: 128
     kv_handoff_dir: /tmp/verl-streamopd-kv
     rollout_backend: vllm
@@ -1045,6 +1051,9 @@ trainer:
         switch_threshold_step_down: 0.03
         switch_threshold_release_steps: 2
         switch_cost_window_size: 3
+    streamopd_colocate:
+      micro_batch_size: 32
+      parameter_sync_step: 4
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

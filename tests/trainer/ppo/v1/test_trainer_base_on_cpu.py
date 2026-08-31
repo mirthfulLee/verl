@@ -217,6 +217,9 @@ def test_streamopd_overlap_keeps_one_optimizer_update_per_global_step():
     trainer.config.distillation.streamopd_kv.overlap_rollout_training = False
     assert trainer._optimizer_updates_per_global_step() == 4
 
+    trainer.trainer_mode = "streamopd_colocate"
+    assert trainer._optimizer_updates_per_global_step() == 1
+
 
 def test_streamopd_overlap_only_sleeps_rollout_before_final_trigger():
     trainer = PPOTrainerSync.__new__(PPOTrainerSync)

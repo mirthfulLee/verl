@@ -5,8 +5,28 @@ The matched end-to-end denominator is this repository's V1 Native OPD with `trai
 
 ## Environment
 
+The current two-pool matrix is launched with:
+
+```bash
+PATH="$PWD/.venv-cu128/bin:$PATH" CUDA_VISIBLE_DEVICES=0,1,2,3 COLOCATE_NCCL_P2P_LEVEL=NVL \
+  BATCH_SIZE=128 TOTAL_TRAINING_STEPS=1 VERL_USE_UV=0 \
+  bash benchmarks/streamopd_kv/run_colocate_matrix.sh
+```
+
+It evaluates total trajectory lengths 4096/8192 and StreamOPD rollout microbatches 16/32. `verl-sync-opd` uses a
+2-GPU student plus 2-GPU teacher layout; `verl-colocate-opd` enables `colocate_teacher_with_student` on four GPUs;
+`streamopd-colocate` uses a dedicated 2-GPU rollout pool and a 2-GPU teacher/trainer pool. The StreamOPD path uses
+the `/dev/shm` host checkpoint backend at the policy barrier. On the measured GPU0-3 topology, the four-rank
+colocate baseline additionally needs `NCCL_P2P_LEVEL=NVL` so cross-PXB traffic uses shared memory while each NVLink
+pair retains P2P. This is a host workaround, not an algorithm requirement.
+
+The pool names here are intentional. Legacy `sync` colocates the actor rollout and trainer in its global pool. The
+new `streamopd_colocate` trainer keeps rollout in its dedicated rollout pool and colocates only the frozen teacher
+with the sharded student trainer; the scheduler serializes those two users of the teacher/trainer pool. Do not use
+the legacy `sync` topology description when interpreting the StreamOPD-colocate measurements.
+
 This workspace was configured with `uv` in `.venv-cu128`. The measured environment uses Python 3.12.13,
-PyTorch 2.9.0+cu128, vLLM 0.11.2, and transformers 4.57.1; `uv pip check` passes for all 225 installed packages.
+PyTorch 2.9.1+cu128, vLLM 0.15.1, and transformers 4.57.6.
 The CUDA 12.8 environment is used because this host's 560.35.03 driver cannot load the repository's CUDA 13 lock.
 
 Activate it for Ray workers as well as the driver:
@@ -51,6 +71,39 @@ but the rollout KV remains in the student process, so serialization handoff cost
 is required to measure the current pinned-CPU/safetensors transport.
 
 ## Measured results
+
+### Two-pool OOMB matrix (global batch 128)
+
+These one-step GPU0-3 measurements use Qwen3-1.7B/Qwen3-4B, BF16, direct top-k forward KL, deterministic rollout,
+and the same DAPO dataset. StreamOPD uses OOMB page size 64, reverse batch at most sixteen, and a 32768-token reverse
+batch cap. The 4-GPU colocate baseline uses the topology workaround described above.
+
+| Total | Path | Microbatch | Step | Throughput | Actor peak | vs sync | vs colocate |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | `verl-sync-opd` | 32 | 219.97 s | 459.83 tok/s | 23.64 GiB | 1.000x | 0.850x |
+| 4096 | `verl-colocate-opd` | 32 | 186.97 s | 539.24 tok/s | 20.34 GiB | 1.176x | 1.000x |
+| 4096 | `streamopd-colocate` (wavefront) | 16 | 241.18 s | 419.83 tok/s | 55.19 GiB | 0.912x | 0.775x |
+| 4096 | `streamopd-colocate` (wavefront) | 32 | 237.36 s | 425.93 tok/s | 35.99 GiB | 0.927x | 0.788x |
+| 8192 | `verl-sync-opd` | 32 | 442.09 s | 485.86 tok/s | 54.36 GiB | 1.000x | 0.763x |
+| 8192 | `verl-colocate-opd` | 32 | 337.47 s | 627.29 tok/s | 41.42 GiB | 1.310x | 1.000x |
+| 8192 | `streamopd-colocate` (wavefront) | 16 | 572.42 s | 373.69 tok/s | 37.55 GiB | 0.772x | 0.590x |
+| 8192 | `streamopd-colocate` (wavefront) | 32 | 550.11 s | 383.10 tok/s | 37.98 GiB | 0.804x | 0.613x |
+
+The wavefront scheduler batches all trajectories that still have a given reverse depth (up to sixteen per reverse
+microbatch); the measured 4096 cases reached eight active trajectories per kernel call, while 8192 reached four.
+With the preflight allocator estimate, memory-rich 4096/mb16 keeps a 1024-token reverse chunk; a constrained
+4096/mb32 run selects 512. Compared with the earlier singleton reverse implementation, backward calls fell from 8 to 4 at
+4096/mb16 and from 28 to 14 at 4096/mb32. The current OOMB kernel is not yet faster end-to-end on this A100 run:
+teacher-priority serialization and batched kernel launch costs outweigh the reduced call count. Both 8192 wavefront
+cases complete without OOM; mb32 uses 1024 after the memory plan is evaluated.
+
+The 4096/mb16 preflight reported 59.28 GiB reusable budget on each trainer rank and selected the maximum 1024-token
+chunk; this measurement happens during initialization, before the policy loop.
+
+All StreamOPD runs recorded nonzero KV tokens before EOS, exactly one optimizer finalization across their 8 (mb16)
+or 4 (mb32) accumulation units, and maximum policy staleness zero. Wavefront logs and machine-readable metrics are in
+`results/colocate_matrix_oomb_wavefront_b128/summary.json`; baseline logs are reused from
+`results/colocate_matrix_oomb_host_b128/`.
 
 ### End-to-end V1 sync comparison (total trajectory length 4096)
 

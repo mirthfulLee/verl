@@ -267,18 +267,28 @@ class BatchedReverseChunkState:
         else:
             full_key, full_value = current_key, current_value
 
-        prefix_columns = torch.arange(max_prefix, device=query.device)
-        prefix_mask = prefix_columns.unsqueeze(0) < torch.tensor(self.starts, device=query.device).unsqueeze(1)
-        current_columns = torch.arange(max_chunk_length, device=query.device)
-        current_mask = current_columns.unsqueeze(0) <= current_columns.unsqueeze(1)
-        current_mask = current_mask.unsqueeze(0).expand(batch_size, -1, -1)
-        valid_current_keys = current_columns.unsqueeze(0) < torch.tensor(chunk_lengths, device=query.device).unsqueeze(
-            1
-        )
-        current_mask = current_mask & valid_current_keys.unsqueeze(1)
-        attention_mask = torch.cat(
-            (prefix_mask.unsqueeze(1).expand(-1, max_chunk_length, -1), current_mask), dim=-1
-        ).unsqueeze(1)
+        uniform_bounds = len(set(self.starts)) == 1 and len(set(chunk_lengths)) == 1
+        if uniform_bounds:
+            # A lower-right causal bias preserves the global token positions
+            # of suffix queries and lets SDPA select its optimized causal
+            # kernel.  Materialize a boolean mask only for genuinely ragged
+            # reverse waves.
+            attention_mask = (
+                None if max_prefix == 0 else causal_lower_right(max_chunk_length, max_prefix + max_chunk_length)
+            )
+        else:
+            prefix_columns = torch.arange(max_prefix, device=query.device)
+            prefix_mask = prefix_columns.unsqueeze(0) < torch.tensor(self.starts, device=query.device).unsqueeze(1)
+            current_columns = torch.arange(max_chunk_length, device=query.device)
+            current_mask = current_columns.unsqueeze(0) <= current_columns.unsqueeze(1)
+            current_mask = current_mask.unsqueeze(0).expand(batch_size, -1, -1)
+            valid_current_keys = current_columns.unsqueeze(0) < torch.tensor(
+                chunk_lengths, device=query.device
+            ).unsqueeze(1)
+            current_mask = current_mask & valid_current_keys.unsqueeze(1)
+            attention_mask = torch.cat(
+                (prefix_mask.unsqueeze(1).expand(-1, max_chunk_length, -1), current_mask), dim=-1
+            ).unsqueeze(1)
 
         if query.shape[1] % full_key.shape[1] != 0:
             raise ValueError("query heads must be divisible by KV heads")
@@ -289,6 +299,7 @@ class BatchedReverseChunkState:
             full_value,
             attn_mask=attention_mask,
             dropout_p=0.0,
+            is_causal=uniform_bounds and max_prefix == 0,
             scale=scale,
             enable_gqa=query.shape[1] != full_key.shape[1],
         )

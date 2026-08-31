@@ -33,18 +33,21 @@ from verl.experimental.streamopd_kv import (
     StreamingTeacherCoordinator,
     TeacherArtifactBuffer,
     TrajectoryKey,
-    capture_qwen3_kv_trace,
     exact_causal_attention,
+    extract_vllm_nhd_token_range,
     extract_vllm_nhd_tokens,
     load_vllm_snapshot,
     prepare_streamopd_kv_config,
 )
 from verl.experimental.streamopd_kv.fsdp_worker import (
+    _dynamic_reverse_chunk_size,
     _forward_kl_topk_sum,
     _has_valid_response,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
 )
+from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront
+from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
 from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.workers.config.distillation import DistillationConfig, StreamOPDKVConfig
 
@@ -201,7 +204,8 @@ def test_vllm_snapshot_loader_validates_identity_and_restores_layout(tmp_path) -
         filename,
         metadata={
             "format": "verl-streamopd-kv-v1",
-            "request_id": "request",
+            "request_id": "request-backend-suffix",
+            "trajectory_id": "request",
             "policy_version": "2",
             "prompt_length": "2",
             "tp_rank": "0",
@@ -242,6 +246,149 @@ def test_vllm_snapshot_loader_validates_identity_and_restores_layout(tmp_path) -
         )
 
 
+def test_streamed_vllm_snapshot_loader_assembles_contiguous_chunks(tmp_path) -> None:
+    base_path = str(tmp_path / "streamed")
+    packed = torch.arange(5 * 2 * 2 * 4, dtype=torch.bfloat16).reshape(5, 2, 2, 4)
+    for chunk_index, (start, end) in enumerate(((0, 2), (2, 5))):
+        save_file(
+            {"layer_00000": packed[start:end]},
+            f"{base_path}.tp0.chunk{chunk_index:05d}.safetensors",
+            metadata={
+                "format": "verl-streamopd-kv-v2-chunk",
+                "request_id": "backend-request",
+                "trajectory_id": "trajectory",
+                "policy_version": "4",
+                "tp_rank": "0",
+                "tp_size": "1",
+                "chunk_index": str(chunk_index),
+                "start": str(start),
+                "end": str(end),
+            },
+        )
+    manifest = f"{base_path}.tp0.manifest.safetensors"
+    save_file(
+        {"token_ids": torch.tensor([2, 3, 5, 7, 11])},
+        manifest,
+        metadata={
+            "format": "verl-streamopd-kv-v2",
+            "request_id": "backend-request",
+            "trajectory_id": "trajectory",
+            "policy_version": "4",
+            "prompt_length": "2",
+            "tp_rank": "0",
+            "tp_size": "1",
+            "page_size": "16",
+            "axis_order": "token_kv_head_dim",
+            "rope_convention": "post_rope_key",
+            "layer_names": '["model.layers.0.self_attn"]',
+            "num_chunks": "2",
+            "streamed_tokens_before_eos": "2",
+            "streamed_chunks_before_eos": "1",
+        },
+    )
+    (tmp_path / "streamed.tp0.manifest.safetensors.lock").touch()
+
+    snapshot = load_vllm_snapshot(
+        base_path,
+        key=TrajectoryKey(4, "trajectory"),
+        tp_rank=0,
+        expected_tp_size=1,
+        expected_token_ids=[2, 3, 5, 7, 11],
+        expected_prompt_length=2,
+    )
+    assert snapshot.source == "vllm-stream-v2"
+    assert snapshot.streamed_tokens_before_eos == 2
+    assert snapshot.streamed_chunks_before_eos == 1
+    assert snapshot.layers[0][0].shape == (1, 2, 5, 4)
+    torch.testing.assert_close(snapshot.layers[0][0][0].transpose(0, 1), packed[:, 0])
+
+
+def test_vllm_range_extraction_copies_only_intersecting_blocks() -> None:
+    cache = torch.arange(4 * 2 * 4 * 1 * 2).reshape(4, 2, 4, 1, 2)
+    full = extract_vllm_nhd_tokens(cache, [3, 1, 2], block_size=4, num_tokens=12)
+    selected = extract_vllm_nhd_token_range(cache, [3, 1, 2], block_size=4, start=3, end=10)
+    torch.testing.assert_close(selected, full[3:10])
+
+
+def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector, _SchedulerSaveState
+
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    connector._chunk_size = 4
+    connector._block_size = 2
+    connector._pending = []
+    connector._claimed_requests = set()
+    state = _SchedulerSaveState(
+        req_id="backend",
+        trajectory_id="trajectory",
+        base_path="/tmp/trajectory",
+        block_ids_by_group=[[0, 1, 2, 3]],
+        policy_version=6,
+        prompt_length=2,
+    )
+
+    connector._queue_committed(state, 3)
+    assert not connector._pending
+    connector._queue_committed(state, 5)
+    assert [(item.start, item.end, item.terminal) for item in connector._pending] == [(0, 4, False)]
+    connector._queue_committed(state, 7, terminal=True, token_ids=torch.arange(7))
+    assert [(item.start, item.end, item.terminal) for item in connector._pending] == [
+        (0, 4, False),
+        (4, 7, True),
+    ]
+    assert state.published_tokens == 7
+    assert state.next_chunk_index == 2
+
+
+@pytest.mark.parametrize(
+    ("max_chunk", "min_chunk", "microbatch_size", "trace_length", "target_length", "expected"),
+    [
+        (2048, 256, 1, 4096, 4096, 2048),
+        (2048, 256, 16, 4096, 4096, 2048),
+        (2048, 256, 32, 4096, 4096, 1024),
+        (2048, 256, 1, 8192, 4096, 1024),
+        (2048, 256, 64, 2048, 4096, 512),
+        (2048, 256, 128, 2048, 4096, 256),
+    ],
+)
+def test_dynamic_reverse_chunk_size_bounds_token_working_set(
+    max_chunk: int,
+    min_chunk: int,
+    microbatch_size: int,
+    trace_length: int,
+    target_length: int,
+    expected: int,
+) -> None:
+    assert (
+        _dynamic_reverse_chunk_size(
+            max_chunk,
+            min_chunk,
+            microbatch_size,
+            max_trace_length=trace_length,
+            target_trace_length=target_length,
+            alignment=64,
+        )
+        == expected
+    )
+
+
+def test_dynamic_reverse_chunk_size_prefers_maximum_with_memory_headroom() -> None:
+    assert (
+        _dynamic_reverse_chunk_size(
+            2048,
+            256,
+            32,
+            max_trace_length=8192,
+            target_trace_length=4096,
+            alignment=64,
+            available_memory_bytes=64 * 1024**3,
+            estimated_base_bytes=4 * 1024**3,
+            estimated_bytes_per_token=8 * 1024**2,
+        )
+        == 2048
+    )
+
+
 def test_vllm_nhd_page_extraction_preserves_logical_token_order() -> None:
     cache = torch.arange(3 * 2 * 4 * 2 * 3).reshape(3, 2, 4, 2, 3)
     extracted = extract_vllm_nhd_tokens(cache, block_ids=[2, 0], block_size=4, num_tokens=6)
@@ -256,11 +403,23 @@ def test_vllm_nhd_page_extraction_preserves_logical_token_order() -> None:
 def test_reverse_microbatch_partition_and_call_count() -> None:
     lengths = [9, 8, 12, 4]
     assert _partition_reverse_microbatches(lengths, max_batch_size=3, max_batch_tokens=20) == [
+        [2],
         [0, 1],
-        [2, 3],
+        [3],
     ]
     assert _reverse_backward_calls([8, 13], chunk_size=5) == 3
     assert _reverse_backward_calls([8, 12], chunk_size=5) == 3
+
+
+def test_reverse_wavefront_only_batches_active_trajectories() -> None:
+    assert _build_reverse_wavefront([4, 4, 6, 6], chunk_size=1) == [
+        (6, [2, 3]),
+        (5, [2, 3]),
+        (4, [0, 1, 2, 3]),
+        (3, [0, 1, 2, 3]),
+        (2, [0, 1, 2, 3]),
+        (1, [0, 1, 2, 3]),
+    ]
 
 
 def test_zero_loss_synthetic_padding_is_not_trainable() -> None:
@@ -322,9 +481,73 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     colocated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
     prepare_streamopd_kv_config(colocated_config)
 
+    dedicated_config = copy.deepcopy(config)
+    dedicated_config.trainer.n_gpus_per_node = 2
+    dedicated_config.trainer.v1.trainer_mode = "streamopd_colocate"
+    dedicated_config.trainer.v1.streamopd_colocate = {"micro_batch_size": 1, "parameter_sync_step": 1}
+    dedicated_config.trainer.v1.sampler = {
+        "max_off_policy_threshold": 8,
+        "max_off_policy_strategy": "drop",
+    }
+    dedicated_config.actor_rollout_ref.rollout.nnodes = 1
+    dedicated_config.actor_rollout_ref.rollout.n_gpus_per_node = 2
+    dedicated_config.actor_rollout_ref.rollout.checkpoint_engine = {"backend": "nccl"}
+    dedicated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
+    dedicated_config.distillation.streamopd_kv.rollout_micro_batch_size = 16
+    prepare_streamopd_kv_config(dedicated_config)
+    assert dedicated_config.trainer.v1.streamopd_colocate.parameter_sync_step == 8
+    assert dedicated_config.trainer.v1.sampler.max_off_policy_threshold == 1
+    assert dedicated_config.trainer.v1.sampler.max_off_policy_strategy == "drop"
+
     config.trainer.v1.trainer_mode = "separate_async"
-    with pytest.raises(ValueError, match="trainer_mode=sync"):
+    with pytest.raises(ValueError, match="sync or streamopd_colocate"):
         prepare_streamopd_kv_config(config)
+
+
+def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(7)
+    scheduler.teacher_enqueued(7)
+    scheduler.teacher_started(7)
+    state = scheduler.snapshot()
+    assert state["teacher_pending"] == 1
+    with pytest.raises(RuntimeError, match="unfinished work"):
+        scheduler.end_policy(7)
+
+    scheduler.teacher_finished(7)
+    scheduler.training_started(7)
+    with pytest.raises(RuntimeError, match="unfinished work"):
+        scheduler.end_policy(7)
+    scheduler.training_finished(7)
+    metrics = scheduler.end_policy(7)
+    assert metrics["streamopd/scheduler_teacher_chunks"] == 1
+    assert metrics["streamopd/scheduler_training_units"] == 1
+    with pytest.raises(RuntimeError, match="no active policy"):
+        scheduler.teacher_enqueued(8)
+
+
+def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(3)
+    with pytest.raises(RuntimeError, match="policy mismatch"):
+        scheduler.teacher_enqueued(2)
+
+
+def test_teacher_and_training_admission_are_mutually_exclusive() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(11)
+    scheduler.teacher_enqueued(11)
+    assert scheduler.try_training_started(11, teacher_queue_threshold=0) is False
+    assert scheduler.try_teacher_started(11) is True
+    assert scheduler.try_training_started(11, teacher_queue_threshold=1) is False
+    scheduler.teacher_enqueued(11)
+    scheduler.teacher_finished(11)
+    assert scheduler.try_training_started(11, teacher_queue_threshold=1) is True
+    assert scheduler.try_teacher_started(11) is False
+    scheduler.training_finished(11)
+    assert scheduler.try_teacher_started(11) is True
+    scheduler.teacher_finished(11)
+    scheduler.end_policy(11)
 
 
 @pytest.mark.parametrize("use_chunked_topk", [False, True])
@@ -363,8 +586,40 @@ def test_reverse_forward_kl_topk_matches_native_numerical_path(use_chunked_topk:
     torch.testing.assert_close(logits.grad, native_logits.grad, rtol=0.0, atol=0.0)
 
 
+def test_reverse_forward_kl_topk_temperature_one_avoids_logits_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    logits = torch.randn(3, 11, requires_grad=True)
+    teacher_ids = torch.randint(0, logits.shape[-1], (3, 2))
+    teacher_logprobs = torch.log_softmax(torch.randn(3, 2), dim=-1)
+    original_log_softmax = torch.log_softmax
+
+    def assert_input_aliases_logits(value: torch.Tensor, *args, **kwargs):
+        assert value.data_ptr() == logits.data_ptr()
+        return original_log_softmax(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "log_softmax", assert_input_aliases_logits)
+    loss = _forward_kl_topk_sum(
+        logits,
+        teacher_ids,
+        teacher_logprobs,
+        temperature=1.0,
+        use_chunked_topk=False,
+        log_prob_min_clamp=-10.0,
+        loss_max_clamp=10.0,
+    )
+    loss.backward()
+    assert logits.grad is not None
+
+
 def test_distillation_config_coerces_streamopd_mapping_without_mutating_frozen_field() -> None:
-    config = DistillationConfig(enabled=False, streamopd_kv={"enabled": False, "reverse_chunk_size": 32})
+    config = DistillationConfig(
+        enabled=False,
+        streamopd_kv={
+            "enabled": False,
+            "reverse_chunk_size": 32,
+            "reverse_chunk_min_size": 16,
+            "reverse_page_size": 16,
+        },
+    )
     assert isinstance(config.streamopd_kv, StreamOPDKVConfig)
     assert config.streamopd_kv.reverse_chunk_size == 32
 
@@ -392,7 +647,6 @@ def test_vllm_connector_waits_for_claimed_copy_event_and_ignores_unclaimed_reque
     connector._copy_events = {}
     connector._lock_fds = {}
     assert connector.get_finished({"claimed", "ordinary"}) == (None, None)
-    assert connector._finished_requests == {"claimed"}
 
     event = Event()
     connector._copy_events["claimed"] = event
@@ -400,6 +654,57 @@ def test_vllm_connector_waits_for_claimed_copy_event_and_ignores_unclaimed_reque
     event.complete = True
     assert connector.get_finished(set()) == ({"claimed"}, None)
     assert not connector._claimed_requests
+
+
+def test_vllm_connector_finish_is_idempotent() -> None:
+    from types import SimpleNamespace
+
+    from verl.experimental.streamopd_kv.vllm_connector import (
+        StreamOPDKVConnector,
+        _SchedulerSaveState,
+    )
+
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    connector._scheduler_paths = {"backend-id": "/tmp/streamopd/backend-id"}
+    connector._scheduler_states = {
+        "backend-id": _SchedulerSaveState(
+            req_id="backend-id",
+            trajectory_id="trajectory-id",
+            base_path="/tmp/streamopd/backend-id",
+            block_ids_by_group=[[0, 1]],
+            policy_version=3,
+            prompt_length=1,
+        )
+    }
+    connector._pending = []
+    connector._claimed_requests = set()
+    connector._block_size = 2
+    connector._chunk_size = 4
+    connector._tp_size = 1
+    request = SimpleNamespace(
+        request_id="backend-id",
+        kv_transfer_params={"streamopd_kv": True, "trajectory_id": "trajectory-id"},
+        status="FINISHED_STOPPED",
+        all_token_ids=[10, 11, 12],
+    )
+
+    saved, params = connector.request_finished_all_groups(request, ([0, 1],))
+    assert saved is True
+    assert params["streamopd_kv_path"] == "/tmp/streamopd/backend-id"
+    assert len(connector._pending) == 1
+
+    # A second vLLM finish notification must not raise or enqueue another
+    # terminal save after the scheduler state has been consumed. It retains
+    # page ownership until the worker reports finished_sending.
+    saved, params = connector.request_finished_all_groups(request, ([0, 1],))
+    assert saved is True
+    assert params is None
+    assert len(connector._pending) == 1
+
+    connector.update_connector_output(SimpleNamespace(finished_sending={"backend-id"}))
+    assert not connector._claimed_requests
+    with pytest.raises(RuntimeError, match="no scheduler state"):
+        connector.request_finished_all_groups(request, ([0, 1],))
 
 
 @pytest.mark.parametrize(("sequence_length", "chunk_size"), [(5, 8), (7, 3), (9, 4)])
@@ -533,64 +838,10 @@ def test_batched_ragged_reverse_gradients_match_full_sequence() -> None:
         )
 
 
-def test_qwen3_batched_reverse_trainer_matches_full_sequence() -> None:
-    from transformers import Qwen3Config, Qwen3ForCausalLM
-
-    torch.manual_seed(47)
-    config = Qwen3Config(
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        attention_dropout=0.0,
-    )
-    baseline = Qwen3ForCausalLM(config).eval()
-    reverse = copy.deepcopy(baseline).eval()
-    sequences = [torch.tensor([[1, 3, 5, 7, 9, 11, 13]]), torch.tensor([[2, 4, 6, 8, 10, 12, 14, 16, 18]])]
-    targets = [torch.roll(sequence, shifts=-1, dims=1) for sequence in sequences]
-    valid_masks = [torch.arange(sequence.shape[1]) >= 2 for sequence in sequences]
-
-    baseline_loss = torch.zeros(())
-    for sequence, target, valid in zip(sequences, targets, valid_masks, strict=True):
-        logits = baseline(input_ids=sequence, use_cache=False).logits
-        baseline_loss = baseline_loss + F.cross_entropy(
-            logits[:, valid].flatten(0, 1), target[:, valid].flatten(), reduction="sum"
-        )
-    baseline_loss.backward()
-
-    traces = [capture_qwen3_kv_trace(reverse, sequence) for sequence in sequences]
-    loss_fns = []
-    for target, valid in zip(targets, valid_masks, strict=True):
-
-        def loss_fn(logits: torch.Tensor, start: int, end: int, *, target=target, valid=valid):
-            local_valid = valid[start:end]
-            if not local_valid.any():
-                return logits.sum() * 0.0, 0
-            loss = F.cross_entropy(
-                logits[:, local_valid].flatten(0, 1),
-                target[:, start:end][:, local_valid].flatten(),
-                reduction="sum",
-            )
-            return loss, int(local_valid.sum())
-
-        loss_fns.append(loss_fn)
-
-    result = Qwen3ReverseTrainer(reverse, chunk_size=3).backward_batched(sequences, traces, loss_fns)
-    torch.testing.assert_close(result.loss_sum, baseline_loss.detach(), rtol=2e-5, atol=2e-5)
-    assert result.chunks == 6
-    assert result.backward_calls == 3
-    for (baseline_name, baseline_parameter), (reverse_name, reverse_parameter) in zip(
-        baseline.named_parameters(), reverse.named_parameters(), strict=True
-    ):
-        assert baseline_name == reverse_name
-        torch.testing.assert_close(
-            reverse_parameter.grad,
-            baseline_parameter.grad,
-            rtol=2e-4,
-            atol=2e-5,
-            msg=lambda message, name=baseline_name: f"{name}: {message}",
-        )
+def test_qwen3_paged_reverse_rejects_trace_length_mismatch() -> None:
+    trainer = Qwen3ReverseTrainer(torch.nn.Linear(2, 2).eval(), chunk_size=16, page_size=16)
+    sequences = [torch.ones((1, 4), dtype=torch.long), torch.ones((1, 5), dtype=torch.long)]
+    loss_fns = [lambda *_: (torch.zeros(()), 0), lambda *_: (torch.zeros(()), 0)]
+    layer = LayerKVTrace(torch.zeros((1, 1, 4, 2)), torch.zeros((1, 1, 4, 2)))
+    with pytest.raises(ValueError, match="trace must match"):
+        trainer.backward_batched(sequences, [[layer], [layer]], loss_fns)

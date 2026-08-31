@@ -18,6 +18,7 @@ Not recommended depending on vllm for this file.
 """
 
 import gc
+import inspect
 import logging
 import os
 from multiprocessing import shared_memory
@@ -46,9 +47,19 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
     func, args = handle
     list_args = list(args)
     if device_id is not None:
-        # the key is to change device id to the current device id
-        # in case two processes have different CUDA_VISIBLE_DEVICES
-        list_args[6] = device_id
+        # CUDA reductions carry the source-visible device as storage_device.
+        # CPU reductions do not, and reduction layouts vary across PyTorch
+        # versions, so locate the argument by name instead of a fixed index.
+        try:
+            parameter_names = tuple(inspect.signature(func).parameters)
+        except (TypeError, ValueError):
+            parameter_names = ()
+        if "storage_device" in parameter_names:
+            list_args[parameter_names.index("storage_device")] = device_id
+        elif getattr(func, "__name__", "") == "rebuild_cuda_tensor":
+            if len(list_args) <= 6:
+                raise RuntimeError("unsupported CUDA tensor reduction payload")
+            list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
 
@@ -220,7 +231,10 @@ class BucketedWeightSender:
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
         # TODO: support fallback to shared memory
-        handle = reduce_tensor(weight)
+        ipc_weight = weight
+        if weight.device.type != get_device_name():
+            ipc_weight = weight.to(device=f"{get_device_name()}:{get_device_id()}")
+        handle = reduce_tensor(ipc_weight)
         bucket_meta: dict[str, TensorMetadata] = {}
         bucket_meta[name] = {
             "name": name,

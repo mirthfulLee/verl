@@ -27,6 +27,7 @@ import torch
 import torch.distributed
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
@@ -957,6 +958,7 @@ class FSDPEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        rank = torch.distributed.get_rank()
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -1008,13 +1010,24 @@ class FSDPEngine(BaseEngine):
             per_tensor_param = params.items()
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
-                )
-                for name, param in params.items()
-            )
+
+            def materialize_full_params():
+                for name, param in params.items():
+                    if isinstance(param, DTensor):
+                        yield name, param.to(device, non_blocking=True).full_tensor()
+                    elif isinstance(param, ShardedTensor):
+                        full = torch.empty(param.size(), dtype=param.dtype, device=device) if rank == 0 else None
+                        param.gather(dst=0, out=full)
+                        # Non-root actors still drive the FSDP gathers and bucket
+                        # schedule, but never send checkpoint payloads.
+                        yield (
+                            name,
+                            full if full is not None else torch.empty(param.size(), dtype=param.dtype, device="meta"),
+                        )
+                    else:
+                        yield name, param
+
+            per_tensor_param = materialize_full_params()
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 
         if self._qat_enabled:

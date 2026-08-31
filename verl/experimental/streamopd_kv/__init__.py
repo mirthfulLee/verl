@@ -26,7 +26,12 @@ from .protocol import (
 )
 from .publisher import CommittedChunkPublisher
 from .qwen3 import Qwen3ReverseTrainer, ReverseTrainingResult, capture_qwen3_kv_trace, use_qwen3_reverse_attention
-from .snapshot_io import cleanup_vllm_snapshot, extract_vllm_nhd_tokens, load_vllm_snapshot
+from .snapshot_io import (
+    cleanup_vllm_snapshot,
+    extract_vllm_nhd_token_range,
+    extract_vllm_nhd_tokens,
+    load_vllm_snapshot,
+)
 from .streaming_teacher import StreamingTeacherCoordinator
 
 __all__ = [
@@ -48,6 +53,7 @@ __all__ = [
     "capture_qwen3_kv_trace",
     "cleanup_vllm_snapshot",
     "exact_causal_attention",
+    "extract_vllm_nhd_token_range",
     "extract_vllm_nhd_tokens",
     "load_vllm_snapshot",
     "prepare_streamopd_kv_config",

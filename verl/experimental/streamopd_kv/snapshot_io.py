@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import os
 import time
@@ -51,6 +52,132 @@ def extract_vllm_nhd_tokens(
     return logical.flatten(0, 1)[:num_tokens].contiguous()
 
 
+def extract_vllm_nhd_token_range(
+    kv_cache: torch.Tensor,
+    block_ids: Sequence[int],
+    block_size: int,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Gather only the logical KV blocks intersecting ``[start, end)``."""
+
+    capacity = len(block_ids) * block_size
+    if not 0 <= start < end <= capacity:
+        raise ValueError(f"invalid KV token range [{start}, {end}) for capacity {capacity}")
+    first_block = start // block_size
+    last_block = (end + block_size - 1) // block_size
+    selected_blocks = block_ids[first_block:last_block]
+    logical = extract_vllm_nhd_tokens(
+        kv_cache,
+        selected_blocks,
+        block_size,
+        len(selected_blocks) * block_size,
+    )
+    offset = start - first_block * block_size
+    return logical[offset : offset + end - start].contiguous()
+
+
+def _load_streamed_vllm_snapshot(
+    base_path: str,
+    *,
+    key: TrajectoryKey,
+    tp_rank: int,
+    expected_tp_size: int,
+    expected_token_ids: Sequence[int] | None,
+    expected_prompt_length: int | None,
+    device: torch.device | str,
+    started: float,
+) -> SealedKVSnapshot:
+    manifest = f"{base_path}.tp{tp_rank}.manifest.safetensors"
+    with open(manifest + ".lock") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_SH)
+        with safe_open(manifest, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            if metadata.get("format") != "verl-streamopd-kv-v2":
+                raise RuntimeError(f"unsupported streamed StreamOPD KV format in {manifest}")
+            if int(metadata["policy_version"]) != key.policy_version:
+                raise RuntimeError("rollout KV policy version does not match the training cohort")
+            if metadata["trajectory_id"] != key.trajectory_id:
+                raise RuntimeError("rollout KV request identity does not match the training trajectory")
+            if int(metadata["tp_rank"]) != tp_rank or int(metadata["tp_size"]) != expected_tp_size:
+                raise RuntimeError("rollout/trainer TP layout mismatch")
+            prompt_length = int(metadata["prompt_length"])
+            if expected_prompt_length is not None and prompt_length != expected_prompt_length:
+                raise RuntimeError("rollout KV prompt boundary does not match the training trajectory")
+            token_ids_tensor = handle.get_tensor("token_ids")
+            token_ids = tuple(int(value) for value in token_ids_tensor.tolist())
+            if expected_token_ids is not None and token_ids != tuple(expected_token_ids):
+                raise RuntimeError("rollout KV token identity does not match the training trajectory")
+            layer_names = json.loads(metadata["layer_names"])
+            num_chunks = int(metadata["num_chunks"])
+            page_size = int(metadata["page_size"])
+            axis_order = metadata["axis_order"]
+            rope_convention = metadata["rope_convention"]
+
+        layers: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        expected_start = 0
+        for chunk_index in range(num_chunks):
+            chunk_path = f"{base_path}.tp{tp_rank}.chunk{chunk_index:05d}.safetensors"
+            with safe_open(chunk_path, framework="pt", device=str(device)) as chunk:
+                chunk_metadata = chunk.metadata()
+                if chunk_metadata.get("format") != "verl-streamopd-kv-v2-chunk":
+                    raise RuntimeError(f"invalid StreamOPD KV chunk format in {chunk_path}")
+                if int(chunk_metadata["chunk_index"]) != chunk_index:
+                    raise RuntimeError("StreamOPD KV chunk index is not contiguous")
+                start = int(chunk_metadata["start"])
+                end = int(chunk_metadata["end"])
+                if start != expected_start or not start < end <= len(token_ids):
+                    raise RuntimeError(f"invalid streamed KV extent [{start}, {end}) at chunk {chunk_index}")
+                tensor_names = sorted(name for name in chunk.keys() if name.startswith("layer_"))
+                if len(tensor_names) != len(layer_names):
+                    raise RuntimeError("streamed KV layer count does not match the manifest")
+                if layers is None:
+                    layers = []
+                    for name in tensor_names:
+                        packed = chunk.get_tensor(name)
+                        if packed.ndim != 4 or packed.shape[1] != 2:
+                            raise RuntimeError(f"invalid packed KV shape for {name}: {tuple(packed.shape)}")
+                        shape = (1, packed.shape[2], len(token_ids), packed.shape[3])
+                        layers.append(
+                            (
+                                torch.empty(shape, dtype=packed.dtype, device=device),
+                                torch.empty(shape, dtype=packed.dtype, device=device),
+                            )
+                        )
+                assert layers is not None
+                for layer_idx, name in enumerate(tensor_names):
+                    packed = chunk.get_tensor(name)
+                    if packed.shape[0] != end - start:
+                        raise RuntimeError("streamed KV chunk tensor length does not match its extent")
+                    layers[layer_idx][0][:, :, start:end].copy_(packed[:, 0].transpose(0, 1).unsqueeze(0))
+                    layers[layer_idx][1][:, :, start:end].copy_(packed[:, 1].transpose(0, 1).unsqueeze(0))
+                expected_start = end
+        if layers is None or expected_start != len(token_ids):
+            raise RuntimeError("streamed KV chunks do not cover the sealed trajectory")
+        layout = KVLayout(
+            num_layers=len(layers),
+            num_kv_heads=layers[0][0].shape[1],
+            head_dim=layers[0][0].shape[-1],
+            dtype=str(layers[0][0].dtype).removeprefix("torch."),
+            page_size=page_size,
+            tp_size=expected_tp_size,
+            tp_rank=tp_rank,
+            axis_order=axis_order,
+            rope_convention=rope_convention,
+        )
+        return SealedKVSnapshot(
+            key=key,
+            token_ids=token_ids,
+            prompt_length=prompt_length,
+            layout=layout,
+            layers=tuple(layers),
+            source="vllm-stream-v2",
+            handoff_seconds=time.perf_counter() - started,
+            streamed_tokens_before_eos=int(metadata.get("streamed_tokens_before_eos", 0)),
+            streamed_chunks_before_eos=int(metadata.get("streamed_chunks_before_eos", 0)),
+        )
+
+
 def load_vllm_snapshot(
     base_path: str,
     *,
@@ -64,6 +191,18 @@ def load_vllm_snapshot(
     """Acquire one TP-aligned vLLM shard after its async handoff completes."""
 
     started = time.perf_counter()
+    manifest_lock = f"{base_path}.tp{tp_rank}.manifest.safetensors.lock"
+    if os.path.exists(manifest_lock):
+        return _load_streamed_vllm_snapshot(
+            base_path,
+            key=key,
+            tp_rank=tp_rank,
+            expected_tp_size=expected_tp_size,
+            expected_token_ids=expected_token_ids,
+            expected_prompt_length=expected_prompt_length,
+            device=device,
+            started=started,
+        )
     filename = f"{base_path}.tp{tp_rank}.safetensors"
     lock_path = filename + ".lock"
     with open(lock_path) as lock_file:
@@ -74,7 +213,8 @@ def load_vllm_snapshot(
                 raise RuntimeError(f"unsupported StreamOPD KV snapshot format in {filename}")
             if int(metadata["policy_version"]) != key.policy_version:
                 raise RuntimeError("rollout KV policy version does not match the training cohort")
-            if metadata["request_id"] != key.trajectory_id:
+            trajectory_id = metadata.get("trajectory_id", metadata["request_id"])
+            if trajectory_id != key.trajectory_id:
                 raise RuntimeError("rollout KV request identity does not match the training trajectory")
             if int(metadata["tp_rank"]) != tp_rank or int(metadata["tp_size"]) != expected_tp_size:
                 raise RuntimeError("rollout/trainer TP layout mismatch")
@@ -127,6 +267,8 @@ def load_vllm_snapshot(
 def cleanup_vllm_snapshot(base_path: str, tp_size: int) -> None:
     for rank in range(tp_size):
         filename = f"{base_path}.tp{rank}.safetensors"
-        for path in (filename, filename + ".lock"):
+        streamed = glob.glob(f"{base_path}.tp{rank}.chunk*.safetensors")
+        manifest = f"{base_path}.tp{rank}.manifest.safetensors"
+        for path in (filename, filename + ".lock", manifest, manifest + ".lock", *streamed):
             if os.path.exists(path):
                 os.remove(path)

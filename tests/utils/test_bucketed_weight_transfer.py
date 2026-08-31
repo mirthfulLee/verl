@@ -135,6 +135,20 @@ def _sender_fn(zmq_handle, weight_specs, seed, bucket_size_mb, use_shm):
     asyncio.run(sender.async_send_weights(iter(weights)))
 
 
+def _cpu_sender_fn(zmq_handle, weight_specs, seed, bucket_size_mb, use_shm):
+    """Sender process: emulate a host checkpoint backend yielding CPU weights."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    torch.manual_seed(seed)
+    weights = [(name, torch.randn(shape, dtype=torch.float32).to(dtype)) for name, shape, dtype in weight_specs]
+    sender = BucketedWeightSender(
+        zmq_handle=zmq_handle,
+        bucket_size_mb=bucket_size_mb,
+        use_shm=use_shm,
+    )
+    asyncio.run(sender.async_send_weights(iter(weights)))
+
+
 def _receiver_fn(zmq_handle, use_shm, result_queue):
     """Receiver process: receive weights, send back (name, dtype, shape, checksum)."""
     from verl.utils.device import get_device_name
@@ -158,7 +172,7 @@ def _receiver_fn(zmq_handle, use_shm, result_queue):
 # ---------------------------------------------------------------------------
 # Test helper
 # ---------------------------------------------------------------------------
-def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
+def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm, source_cpu=False):
     """Spawn sender + receiver processes, then validate received tensors."""
     zmq_handle = _unique_zmq_handle()
     seed = 42
@@ -166,7 +180,7 @@ def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
     result_queue = ctx.Queue()
 
     sender_p = ctx.Process(
-        target=_sender_fn,
+        target=_cpu_sender_fn if source_cpu else _sender_fn,
         args=(zmq_handle, weight_specs, seed, bucket_size_mb, use_shm),
     )
     receiver_p = ctx.Process(
@@ -187,7 +201,11 @@ def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
     summaries = result_queue.get(timeout=5)
 
     # Regenerate expected weights on device with the same seed
-    expected = _generate_weights(weight_specs, seed)
+    if source_cpu:
+        torch.manual_seed(seed)
+        expected = [(name, torch.randn(shape, dtype=torch.float32).to(dtype)) for name, shape, dtype in weight_specs]
+    else:
+        expected = _generate_weights(weight_specs, seed)
 
     assert len(summaries) == len(expected), f"Expected {len(expected)} weights, got {len(summaries)}"
 
@@ -201,6 +219,8 @@ def _transfer_and_validate(weight_specs, bucket_size_mb, use_shm):
         assert exp_tensor.dtype == recv_dtype, (
             f"Dtype mismatch for {exp_name}: expected {exp_tensor.dtype}, got {recv_dtype}"
         )
+        if source_cpu:
+            exp_tensor = exp_tensor.to(device=f"{get_device_name()}:0")
         exp_sum = exp_tensor.float().sum().item()
         assert exp_sum == recv_cksum, f"Data mismatch for {exp_name}"
 
@@ -289,3 +309,9 @@ class TestBucketedWeightTransferIPC:
         specs.append(("lm_head", (1024, 1024), torch.float32))  # 4MB
 
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
+
+    def test_large_weight_from_cpu_source(self):
+        specs = [("embedding", (1024, 1024), torch.float32)]
+        specs.append(("norm", (128,), torch.bfloat16))
+
+        _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False, source_cpu=True)

@@ -604,6 +604,10 @@ class vLLMHttpServer:
                     "streamopd_kv": True,
                     "policy_version": policy_version,
                     "prompt_length": len(prompt_ids),
+                    # vLLM may append an internal suffix in
+                    # InputProcessor.assign_request_id(). Preserve the protocol
+                    # identity separately from that backend request id.
+                    "trajectory_id": request_id,
                 }
             )
 
@@ -751,6 +755,10 @@ class vLLMHttpServer:
         response_kv_transfer_params = getattr(final_res, "kv_transfer_params", None)
         if response_kv_transfer_params is not None:
             extra_fields["kv_transfer_params"] = response_kv_transfer_params
+            if streamopd_publisher is not None:
+                extra_fields.update(
+                    {key: value for key, value in response_kv_transfer_params.items() if key.startswith("streamopd_")}
+                )
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:

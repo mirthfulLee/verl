@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""vLLM store-only connector for completed rollout KV snapshots."""
+"""vLLM store-only connector for incremental rollout KV snapshots."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ except ImportError:
 
 from verl.utils.device import get_torch_device
 
-from .snapshot_io import extract_vllm_nhd_tokens
+from .snapshot_io import extract_vllm_nhd_token_range
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -62,11 +62,31 @@ def _layer_sort_key(name: str) -> tuple[int, str]:
 @dataclass
 class _PendingSave:
     req_id: str
+    trajectory_id: str
     base_path: str
-    token_ids: torch.Tensor
     block_ids_by_group: tuple[list[int], ...]
     policy_version: int
     prompt_length: int
+    start: int
+    end: int
+    chunk_index: int
+    terminal: bool = False
+    token_ids: torch.Tensor | None = None
+    streamed_tokens_before_eos: int = 0
+    streamed_chunks_before_eos: int = 0
+
+
+@dataclass
+class _SchedulerSaveState:
+    req_id: str
+    trajectory_id: str
+    base_path: str
+    block_ids_by_group: list[list[int]]
+    policy_version: int
+    prompt_length: int
+    published_tokens: int = 0
+    next_chunk_index: int = 0
+    chunks: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -93,8 +113,12 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._storage_path = self._kv_transfer_config.get_from_extra_config(
             "streamopd_kv_handoff_dir", "/tmp/verl-streamopd-kv"
         )
+        self._chunk_size = int(self._kv_transfer_config.get_from_extra_config("streamopd_kv_chunk_size", 256))
+        if self._chunk_size < 1:
+            raise ValueError("streamopd_kv_chunk_size must be positive")
         self._scheduler_paths: dict[str, str] = {}
-        self._pending: dict[str, _PendingSave] = {}
+        self._scheduler_states: dict[str, _SchedulerSaveState] = {}
+        self._pending: list[_PendingSave] = []
 
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
@@ -109,13 +133,23 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._lock_fds: dict[str, int] = {}
         self._copy_events: dict[str, Any] = {}
+        self._manifest_futures: dict[str, Future] = {}
         self._futures: dict[str, Future] = {}
+        self._request_futures: dict[str, list[Future]] = {}
         self._finished_requests: set[str] = set()
         self._claimed_requests: set[str] = set()
 
     @staticmethod
     def _rank_path(base_path: str, tp_rank: int) -> str:
         return f"{base_path}.tp{tp_rank}.safetensors"
+
+    @staticmethod
+    def _manifest_path(base_path: str, tp_rank: int) -> str:
+        return f"{base_path}.tp{tp_rank}.manifest.safetensors"
+
+    @staticmethod
+    def _chunk_path(base_path: str, tp_rank: int, chunk_index: int) -> str:
+        return f"{base_path}.tp{tp_rank}.chunk{chunk_index:05d}.safetensors"
 
     def _get_copy_stream(self) -> Any:
         if self._copy_stream is None:
@@ -161,64 +195,109 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id, base_path in metadata.new_request_paths.items():
             if req_id in self._lock_fds:
                 continue
-            filename = self._rank_path(base_path, self._tp_rank)
+            filename = self._manifest_path(base_path, self._tp_rank)
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             fd = os.open(filename + ".lock", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
             fcntl.flock(fd, fcntl.LOCK_EX)
             self._lock_fds[req_id] = fd
 
     @staticmethod
-    def _write_snapshot(
+    def _write_chunk(
         tensors: dict[str, torch.Tensor],
         metadata: dict[str, str],
         event: Any,
         filename: str,
-        lock_fd: int | None,
+    ) -> None:
+        event.synchronize()
+        save_file(tensors, filename, metadata=metadata)
+
+    @staticmethod
+    def _seal_manifest(
+        prior_futures: list[Future],
+        token_ids: torch.Tensor,
+        metadata: dict[str, str],
+        filename: str,
+        lock_fd: int,
     ) -> None:
         try:
-            event.synchronize()
-            save_file(tensors, filename, metadata=metadata)
+            for future in prior_futures:
+                future.result()
+            save_file({"token_ids": token_ids}, filename, metadata=metadata)
         finally:
-            if lock_fd is not None:
-                os.close(lock_fd)
+            os.close(lock_fd)
 
-    def _write_done(self, req_id: str, future: Future) -> None:
-        self._futures.pop(req_id, None)
+    def _write_done(self, key: str, future: Future) -> None:
+        self._futures.pop(key, None)
+        if key.endswith(":manifest"):
+            req_id = key.removesuffix(":manifest")
+            self._request_futures.pop(req_id, None)
         if exception := future.exception():
-            logger.error("StreamOPD KV write failed for %s: %r", req_id, exception)
+            logger.error("StreamOPD KV write failed for %s: %r", key, exception)
 
     def _submit_save(self, pending: _PendingSave) -> None:
         # Scheduler and worker connectors are separate objects. Ownership is
         # claimed again on the worker when the save metadata arrives.
-        self._claimed_requests.add(pending.req_id)
+        if pending.end < pending.start:
+            raise RuntimeError("StreamOPD KV chunk has a negative extent")
+        if pending.terminal:
+            self._claimed_requests.add(pending.req_id)
         copy_stream = self._get_copy_stream()
         ready = self._device.Event()
         ready.record()
         copy_stream.wait_event(ready)
-        tensors: dict[str, torch.Tensor] = {"token_ids": pending.token_ids.clone()}
-        num_tokens = pending.token_ids.shape[0]
+        tensors: dict[str, torch.Tensor] = {}
         with self._device.stream(copy_stream):
-            for layer_idx, layer_name in enumerate(self._layer_names):
-                group_idx = self._layer_groups[layer_name]
-                extracted = extract_vllm_nhd_tokens(
-                    self._kv_caches[layer_name],
-                    pending.block_ids_by_group[group_idx],
-                    self._block_size,
-                    num_tokens,
-                )
-                if extracted.ndim != 4 or extracted.shape[1] != 2:
-                    raise RuntimeError(
-                        f"expected NHD KV [tokens, 2, heads, dim] for {layer_name}, got {tuple(extracted.shape)}"
+            if pending.end > pending.start:
+                for layer_idx, layer_name in enumerate(self._layer_names):
+                    group_idx = self._layer_groups[layer_name]
+                    extracted = extract_vllm_nhd_token_range(
+                        self._kv_caches[layer_name],
+                        pending.block_ids_by_group[group_idx],
+                        self._block_size,
+                        pending.start,
+                        pending.end,
                     )
-                host = torch.empty_like(extracted, device="cpu", pin_memory=True)
-                host.copy_(extracted, non_blocking=True)
-                tensors[f"layer_{layer_idx:05d}"] = host
+                    if extracted.ndim != 4 or extracted.shape[1] != 2:
+                        raise RuntimeError(
+                            f"expected NHD KV [tokens, 2, heads, dim] for {layer_name}, got {tuple(extracted.shape)}"
+                        )
+                    host = torch.empty_like(extracted, device="cpu", pin_memory=True)
+                    host.copy_(extracted, non_blocking=True)
+                    tensors[f"layer_{layer_idx:05d}"] = host
         copied = self._device.Event()
         copied.record(copy_stream)
-        filename = self._rank_path(pending.base_path, self._tp_rank)
-        metadata = {
-            "format": "verl-streamopd-kv-v1",
+        request_futures = self._request_futures.setdefault(pending.req_id, [])
+        has_chunk = pending.end > pending.start
+        if has_chunk:
+            chunk_filename = self._chunk_path(pending.base_path, self._tp_rank, pending.chunk_index)
+            chunk_metadata = {
+                "format": "verl-streamopd-kv-v2-chunk",
+                "request_id": pending.req_id,
+                "trajectory_id": pending.trajectory_id,
+                "policy_version": str(pending.policy_version),
+                "tp_rank": str(self._tp_rank),
+                "tp_size": str(self._tp_size),
+                "chunk_index": str(pending.chunk_index),
+                "start": str(pending.start),
+                "end": str(pending.end),
+            }
+            chunk_future = self._executor.submit(self._write_chunk, tensors, chunk_metadata, copied, chunk_filename)
+            future_key = f"{pending.req_id}:{pending.chunk_index}"
+            self._futures[future_key] = chunk_future
+            request_futures.append(chunk_future)
+            chunk_future.add_done_callback(partial(self._write_done, future_key))
+
+        if not pending.terminal:
+            return
+        if pending.token_ids is None or pending.token_ids.numel() != pending.end:
+            raise RuntimeError("terminal StreamOPD KV chunk must carry the complete token identity")
+        lock_fd = self._lock_fds.pop(pending.req_id, None)
+        if lock_fd is None:
+            raise RuntimeError(f"StreamOPD KV request {pending.req_id} has no manifest lock")
+        manifest_metadata = {
+            "format": "verl-streamopd-kv-v2",
             "request_id": pending.req_id,
+            "trajectory_id": pending.trajectory_id,
             "policy_version": str(pending.policy_version),
             "prompt_length": str(pending.prompt_length),
             "tp_rank": str(self._tp_rank),
@@ -227,16 +306,25 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
             "axis_order": "token_kv_head_dim",
             "rope_convention": "post_rope_key",
             "layer_names": json.dumps(self._layer_names),
+            "num_chunks": str(pending.chunk_index + int(has_chunk)),
+            "streamed_tokens_before_eos": str(pending.streamed_tokens_before_eos),
+            "streamed_chunks_before_eos": str(pending.streamed_chunks_before_eos),
         }
-        lock_fd = self._lock_fds.pop(pending.req_id, None)
-        if lock_fd is None:
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            lock_fd = os.open(filename + ".lock", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        future = self._executor.submit(self._write_snapshot, tensors, metadata, copied, filename, lock_fd)
+        manifest_filename = self._manifest_path(pending.base_path, self._tp_rank)
+        manifest_future = self._executor.submit(
+            self._seal_manifest,
+            list(request_futures),
+            pending.token_ids.clone(),
+            manifest_metadata,
+            manifest_filename,
+            lock_fd,
+        )
+        manifest_key = f"{pending.req_id}:manifest"
+        self._futures[manifest_key] = manifest_future
+        self._manifest_futures[pending.req_id] = manifest_future
+        request_futures.append(manifest_future)
+        manifest_future.add_done_callback(partial(self._write_done, manifest_key))
         self._copy_events[pending.req_id] = copied
-        self._futures[pending.req_id] = future
-        future.add_done_callback(partial(self._write_done, pending.req_id))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         if self.has_connector_metadata():
@@ -247,21 +335,46 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         newly_finished = finished_req_ids & self._claimed_requests
         self._finished_requests.update(newly_finished)
         done: set[str] = set()
+        manifest_futures = getattr(self, "_manifest_futures", {})
         for req_id in list(self._finished_requests):
-            event = self._copy_events.get(req_id)
+            # The D2H event only means that host tensors are ready; the
+            # scheduler must keep the request's KV pages pinned until the
+            # terminal manifest is durable.  Otherwise vLLM can free and reuse
+            # those pages while a background safetensors write is still in
+            # flight, and a later finish callback may observe a missing
+            # request.
+            manifest_future = manifest_futures.get(req_id)
             # The final cohort request has no later model step on which to poll
-            # the event. Synchronize only that request's D2H copy in the empty
-            # cleanup step; snapshot serialization remains asynchronous.
-            if req_id in newly_finished and event is not None and not event.query():
-                event.synchronize()
-            if event is not None and event.query():
-                self._copy_events.pop(req_id, None)
-                self._finished_requests.remove(req_id)
-                self._claimed_requests.discard(req_id)
-                done.add(req_id)
-                fd = self._lock_fds.pop(req_id, None)
-                if fd is not None:
-                    os.close(fd)
+            # the transfer.  Waiting on the manifest future here is bounded by
+            # the writer pool and keeps the scheduler-side ownership contract
+            # intact while allowing the tensor copies themselves to remain
+            # asynchronous.
+            if manifest_future is None:
+                # Keep compatibility with lightweight connector fixtures and
+                # with snapshots produced by older workers that only expose a
+                # CUDA completion event.
+                event = self._copy_events.get(req_id)
+                if event is None or not event.query():
+                    continue
+            elif not manifest_future.done():
+                if req_id not in newly_finished:
+                    continue
+                # There may be no model step after the last request in a
+                # cohort.  Complete only the terminal seal here so vLLM can
+                # reclaim its pages immediately; all preceding range copies
+                # and chunk writes were already launched during generation.
+                manifest_future.result()
+            if manifest_future is not None:
+                manifest_future.result()
+            self._copy_events.pop(req_id, None)
+            self._finished_requests.remove(req_id)
+            self._claimed_requests.discard(req_id)
+            done.add(req_id)
+            if manifest_future is not None:
+                manifest_futures.pop(req_id, None)
+            fd = self._lock_fds.pop(req_id, None)
+            if fd is not None:
+                os.close(fd)
         return done or None, None
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
@@ -271,9 +384,114 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         if num_external_tokens != 0:
             raise RuntimeError("StreamOPDKVConnector is store-only")
 
+    def update_connector_output(self, connector_output: Any) -> None:
+        # Scheduler-side ownership ends only after the worker has made the
+        # terminal manifest durable and reports finished_sending.
+        for req_id in connector_output.finished_sending or ():
+            self._claimed_requests.discard(req_id)
+
+    @staticmethod
+    def _update_block_ids(
+        state: _SchedulerSaveState,
+        new_block_ids: tuple[list[int], ...] | None,
+        *,
+        replace: bool,
+    ) -> None:
+        if new_block_ids is None:
+            return
+        if len(new_block_ids) != len(state.block_ids_by_group):
+            raise RuntimeError("StreamOPD KV cache group count changed during rollout")
+        for group_idx, block_ids in enumerate(new_block_ids):
+            if block_ids is None:
+                continue
+            if replace:
+                state.block_ids_by_group[group_idx] = list(block_ids)
+            else:
+                state.block_ids_by_group[group_idx].extend(block_ids)
+
+    def _queue_committed(
+        self,
+        state: _SchedulerSaveState,
+        committed_end: int,
+        *,
+        terminal: bool = False,
+        token_ids: torch.Tensor | None = None,
+    ) -> None:
+        if committed_end < state.published_tokens:
+            raise RuntimeError("StreamOPD computed-token progress moved behind published KV")
+        capacity = min(len(group) * self._block_size for group in state.block_ids_by_group)
+        if committed_end > capacity:
+            raise RuntimeError(f"StreamOPD KV progress {committed_end} exceeds allocated block capacity {capacity}")
+        while state.published_tokens + self._chunk_size <= committed_end and not (
+            terminal and state.published_tokens + self._chunk_size == committed_end
+        ):
+            start = state.published_tokens
+            end = start + self._chunk_size
+            self._pending.append(
+                _PendingSave(
+                    req_id=state.req_id,
+                    trajectory_id=state.trajectory_id,
+                    base_path=state.base_path,
+                    block_ids_by_group=tuple(list(group) for group in state.block_ids_by_group),
+                    policy_version=state.policy_version,
+                    prompt_length=state.prompt_length,
+                    start=start,
+                    end=end,
+                    chunk_index=state.next_chunk_index,
+                    terminal=False,
+                    token_ids=None,
+                )
+            )
+            state.chunks.append((start, end))
+            state.published_tokens = end
+            state.next_chunk_index += 1
+        if terminal and state.published_tokens < committed_end:
+            start = state.published_tokens
+            self._pending.append(
+                _PendingSave(
+                    req_id=state.req_id,
+                    trajectory_id=state.trajectory_id,
+                    base_path=state.base_path,
+                    block_ids_by_group=tuple(list(group) for group in state.block_ids_by_group),
+                    policy_version=state.policy_version,
+                    prompt_length=state.prompt_length,
+                    start=start,
+                    end=committed_end,
+                    chunk_index=state.next_chunk_index,
+                    terminal=True,
+                    token_ids=token_ids,
+                    streamed_tokens_before_eos=state.published_tokens,
+                    streamed_chunks_before_eos=state.next_chunk_index,
+                )
+            )
+            state.chunks.append((start, committed_end))
+            state.published_tokens = committed_end
+            state.next_chunk_index += 1
+        elif terminal and state.published_tokens == committed_end:
+            self._pending.append(
+                _PendingSave(
+                    req_id=state.req_id,
+                    trajectory_id=state.trajectory_id,
+                    base_path=state.base_path,
+                    block_ids_by_group=tuple(list(group) for group in state.block_ids_by_group),
+                    policy_version=state.policy_version,
+                    prompt_length=state.prompt_length,
+                    start=committed_end,
+                    end=committed_end,
+                    chunk_index=state.next_chunk_index,
+                    terminal=True,
+                    token_ids=token_ids,
+                    streamed_tokens_before_eos=state.published_tokens,
+                    streamed_chunks_before_eos=state.next_chunk_index,
+                )
+            )
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
-        metadata = StreamOPDKVConnectorMetadata(pending_saves=list(self._pending.values()))
-        self._pending.clear()
+        if scheduler_output.preempted_req_ids:
+            streamed = scheduler_output.preempted_req_ids & self._scheduler_states.keys()
+            if streamed:
+                raise RuntimeError(f"StreamOPD KV streaming does not support preemption: {sorted(streamed)}")
+        new_request_paths: dict[str, str] = {}
         for request in scheduler_output.scheduled_new_reqs:
             extra_args = request.sampling_params.extra_args if request.sampling_params else None
             params = (extra_args or {}).get("kv_transfer_params") or {}
@@ -282,7 +500,26 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
             safe_req_id = request.req_id.replace(os.sep, "_")
             base_path = os.path.join(self._storage_path, safe_req_id)
             self._scheduler_paths[request.req_id] = base_path
-            metadata.new_request_paths[request.req_id] = base_path
+            self._scheduler_states[request.req_id] = _SchedulerSaveState(
+                req_id=request.req_id,
+                trajectory_id=str(params["trajectory_id"]),
+                base_path=base_path,
+                block_ids_by_group=[list(group) for group in request.block_ids],
+                policy_version=int(params["policy_version"]),
+                prompt_length=int(params["prompt_length"]),
+            )
+            new_request_paths[request.req_id] = base_path
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_blocks, num_computed in zip(
+            cached.req_ids, cached.new_block_ids, cached.num_computed_tokens, strict=True
+        ):
+            state = self._scheduler_states.get(req_id)
+            if state is None:
+                continue
+            self._update_block_ids(state, new_blocks, replace=req_id in cached.resumed_req_ids)
+            self._queue_committed(state, int(num_computed))
+        metadata = StreamOPDKVConnectorMetadata(pending_saves=list(self._pending), new_request_paths=new_request_paths)
+        self._pending.clear()
         return metadata
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
@@ -294,30 +531,41 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         params = request.kv_transfer_params or {}
         if not params.get("streamopd_kv", False):
             self._scheduler_paths.pop(request.request_id, None)
+            self._scheduler_states.pop(request.request_id, None)
             return False, None
         if str(request.status) in {"FINISHED_ABORTED", "FINISHED_ERROR", "FINISHED_IGNORED"}:
             self._scheduler_paths.pop(request.request_id, None)
-            fd = self._lock_fds.pop(request.request_id, None)
-            if fd is not None:
-                os.close(fd)
+            self._scheduler_states.pop(request.request_id, None)
             return False, None
-        base_path = self._scheduler_paths.pop(request.request_id)
+        request_id = request.request_id
+        base_path = self._scheduler_paths.pop(request_id, None)
+        state = self._scheduler_states.pop(request_id, None)
+        if state is None:
+            if request_id in self._claimed_requests:
+                # A finish callback can be delivered twice by an
+                # asynchronously scheduled engine. Keep ownership delayed
+                # until update_connector_output observes finished_sending;
+                # returning False here would free the request before the
+                # worker completion reaches the scheduler.
+                logger.warning("coalescing duplicate StreamOPD KV finish callback for %s", request_id)
+                return True, None
+            raise RuntimeError(f"StreamOPD KV finish callback has no scheduler state for {request_id}")
+        if base_path is None:
+            base_path = state.base_path
+        state.block_ids_by_group = [list(group) for group in block_ids]
         token_ids = torch.tensor(list(request.all_token_ids)[:-1], dtype=torch.long)
-        pending = _PendingSave(
-            req_id=request.request_id,
-            base_path=base_path,
-            token_ids=token_ids,
-            block_ids_by_group=tuple(list(group) for group in block_ids),
-            policy_version=int(params["policy_version"]),
-            prompt_length=int(params["prompt_length"]),
-        )
-        self._pending[request.request_id] = pending
+        streamed_tokens_before_eos = state.published_tokens
+        streamed_chunks_before_eos = state.next_chunk_index
+        self._queue_committed(state, token_ids.numel(), terminal=True, token_ids=token_ids)
         self._claimed_requests.add(request.request_id)
         return True, {
             "streamopd_kv_path": base_path,
             "streamopd_kv_tp_size": self._tp_size,
-            "streamopd_kv_policy_version": pending.policy_version,
+            "streamopd_kv_policy_version": state.policy_version,
             "streamopd_kv_num_tokens": token_ids.numel(),
+            "streamopd_kv_chunks": state.next_chunk_index,
+            "streamopd_kv_streamed_tokens_before_eos": streamed_tokens_before_eos,
+            "streamopd_kv_streamed_chunks_before_eos": streamed_chunks_before_eos,
         }
 
     @classmethod

@@ -32,12 +32,32 @@ class _TeacherSession:
 class StreamingTeacherCoordinator:
     """Score increasing committed prefixes without delaying rollout to teacher completion."""
 
-    def __init__(self, score: TeacherScoreFn, max_pending_chunks: int) -> None:
+    def __init__(
+        self,
+        score: TeacherScoreFn,
+        max_pending_chunks: int,
+        scheduler=None,
+        scheduler_poll_interval_ms: int = 10,
+    ) -> None:
         if max_pending_chunks < 1:
             raise ValueError("max_pending_chunks must be positive")
         self._score = score
         self._slots = asyncio.Semaphore(max_pending_chunks)
         self._sessions: dict[TrajectoryKey, _TeacherSession] = {}
+        self._scheduler = scheduler
+        self._scheduler_poll_seconds = scheduler_poll_interval_ms / 1000.0
+        if self._scheduler_poll_seconds <= 0:
+            raise ValueError("scheduler_poll_interval_ms must be positive")
+
+    async def _schedule(self, method: str, policy_version: int) -> None:
+        if self._scheduler is not None:
+            await getattr(self._scheduler, method).remote(policy_version)
+
+    async def _acquire_teacher(self, policy_version: int) -> None:
+        if self._scheduler is None:
+            return
+        while not await self._scheduler.try_teacher_started.remote(policy_version):
+            await asyncio.sleep(self._scheduler_poll_seconds)
 
     async def submit(self, chunk: CommittedTokenChunk) -> None:
         session = self._sessions.get(chunk.key)
@@ -61,12 +81,20 @@ class StreamingTeacherCoordinator:
         sequence = list(session.prompt_ids) + list(session.response_ids)
         artifact_start = 0 if chunk.start == 0 else len(session.prompt_ids) + chunk.start
         session.terminal = chunk.terminal
-        await self._slots.acquire()
+        await self._schedule("teacher_enqueued", chunk.key.policy_version)
+        try:
+            await self._slots.acquire()
+        except BaseException:
+            await self._schedule("teacher_cancelled", chunk.key.policy_version)
+            raise
 
         async def score_chunk() -> None:
+            started = False
             try:
                 if prior is not None:
                     await prior
+                await self._acquire_teacher(chunk.key.policy_version)
+                started = True
                 if not chunk.token_ids and artifact_start:
                     return
                 request_id = f"streamopd-teacher-v{chunk.key.policy_version}-{chunk.key.trajectory_id}"
@@ -83,6 +111,10 @@ class StreamingTeacherCoordinator:
                 session.latest_ids = teacher_ids.detach().cpu()
                 session.latest_logprobs = teacher_logprobs.detach().cpu()
             finally:
+                if started:
+                    await self._schedule("teacher_finished", chunk.key.policy_version)
+                else:
+                    await self._schedule("teacher_cancelled", chunk.key.policy_version)
                 self._slots.release()
 
         session.tail = asyncio.create_task(score_chunk(), name=f"streamopd-teacher-{chunk.key.trajectory_id}")

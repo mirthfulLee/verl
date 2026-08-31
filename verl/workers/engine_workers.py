@@ -537,6 +537,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.set_loss_fn(loss_fn=loss_fn)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_streamopd_reverse_plan(self):
+        if self.actor is None or not hasattr(self.actor, "prepare_reverse_plan"):
+            return None
+        return self.actor.prepare_reverse_plan()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)

@@ -898,7 +898,7 @@ distillation:
     scheduler_actor_name: ''
     max_pending_teacher_chunks: 128
     teacher_prefill_max_active_trajectories: 16
-    teacher_prefill_max_active_kv_tokens: 65536
+    teacher_prefill_max_active_kv_tokens: 32768
     teacher_prefill_kv_page_size: 64
     kv_handoff_dir: /tmp/verl-streamopd-kv
     rollout_backend: vllm

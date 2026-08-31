@@ -31,9 +31,11 @@ The initial backend deliberately fails closed outside this envelope:
 2. `StreamingTeacherCoordinator` appends teacher work to a central queue. With vLLM 0.15.1+, each trajectory is a
    resumable `StreamingInput` session: the first request contains the prompt and first response fragment, and later
    requests contain only newly committed response tokens. vLLM retains the causal KV session and discards its dummy
-   sampled token when the next fragment arrives, so no completed-prefix forward is repeated. Teacher forward waits
-   while a reverse training unit is active; reverse training waits for the configured teacher backlog threshold. The
-   scheduler uses atomic admission, so teacher and trainer kernels never overlap on the shared GPU pool.
+   sampled token when the next fragment arrives, so no completed-prefix forward is repeated. Every committed range is
+   queued; if several ranges accumulate while trainer owns the pool, the teacher consumes their contiguous union in
+   one longest-fragment request, preserving token coverage while reducing short-request launch overhead. Teacher
+   forward waits while a reverse training unit is active; reverse training waits for the configured teacher backlog
+   threshold. The scheduler uses atomic admission, so teacher and trainer kernels never overlap on the shared GPU pool.
 3. The rollout vLLM engine uses continuous batching independently of the Teacher/Trainer microbatch.
    `StreamOPDKVConnector` observes computed-token progress on every scheduler step. Each complete token range is
    copied from the live NHD pages to pinned CPU memory and serialized into the Teacher/Trainer Pool-visible host
@@ -45,6 +47,9 @@ The initial backend deliberately fails closed outside this envelope:
    The leased rollout KV is the no-grad Stage-1 trace. During suffix-to-prefix recomputation, exact dense attention
    propagates dK/dV into earlier chunks and returns current-chunk gradients to the trainable K/V projections.
 5. `micro_batch_size` configures Teacher/Trainer work only; rollout continuous-batching limits remain independent.
+   In `streamopd_colocate`, a sealed EOS cohort can start reverse as soon as it reaches
+   `min(micro_batch_size, reverse_batch_size)` trajectories. The resulting units accumulate raw gradients across
+   the complete global batch before normalization, clipping, and the single optimizer step.
    Reverse chunk size is bounded between `reverse_chunk_min_size` and `reverse_chunk_size` and aligned to
    `reverse_page_size`. The A100 benchmark defaults to page size 64, maximum chunk 1024, and minimum chunk 256.
    Equal-rank trajectories are packed into wavefront batches while
@@ -52,8 +57,10 @@ The initial backend deliberately fails closed outside this envelope:
    Finished trajectories leave the batch at higher reverse depths, so shorter traces do not execute zero-loss
    suffix chunks.
    Each live teacher `StreamingInput` session reserves `prompt_length + response_length` KV tokens before its first
-   fragment and releases that reservation only after EOS. This keeps the number of resident teacher sessions bounded
-   even while rollout is still producing fragments. The worker starts from the largest configured chunk. Before policy version zero it samples reusable memory once,
+   fragment and releases that reservation only after EOS. The budget is global to the Teacher/Trainer pool; with two
+   teacher replicas, each replica receives approximately half after sticky-session load balancing. This keeps the
+   number of resident teacher sessions bounded even while rollout is still producing fragments. The worker starts from
+   the largest configured chunk. Before policy version zero it samples reusable memory once,
    then analytically accounts for persistent KV, activation/backward workspace, vocabulary logits/gradients, and
    reserve space. It first preserves the large chunk and reduces the power-of-two wavefront width as needed; only if
    that is insufficient does it reduce the chunk. The resulting plan is reused for every step, so there is no

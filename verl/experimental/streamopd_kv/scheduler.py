@@ -29,8 +29,16 @@ class StreamOPDTaskScheduler:
         self.teacher_session_kv_tokens = 0
         self.training_active = 0
         self.teacher_chunks = 0
+        self.teacher_notifications = 0
         self.training_units = 0
         self.max_teacher_pending = 0
+        self.max_teacher_active = 0
+        self.max_teacher_sessions = 0
+        self.max_teacher_session_kv_tokens = 0
+        self.teacher_busy_seconds = 0.0
+        self.training_busy_seconds = 0.0
+        self._teacher_busy_started_at = 0.0
+        self._training_busy_started_at = 0.0
         self.policy_started_at = 0.0
 
     def begin_policy(self, policy_version: int) -> None:
@@ -43,9 +51,21 @@ class StreamOPDTaskScheduler:
         self.teacher_active_kv_tokens = 0
         self.teacher_session_kv_tokens = 0
         self.teacher_chunks = 0
+        self.teacher_notifications = 0
         self.training_units = 0
         self.max_teacher_pending = 0
+        self.max_teacher_active = 0
+        self.max_teacher_sessions = 0
+        self.max_teacher_session_kv_tokens = 0
+        self.teacher_busy_seconds = 0.0
+        self.training_busy_seconds = 0.0
+        self._teacher_busy_started_at = 0.0
+        self._training_busy_started_at = 0.0
         self.policy_started_at = time.perf_counter()
+
+    def teacher_notified(self, policy_version: int) -> None:
+        self._check_version(policy_version)
+        self.teacher_notifications += 1
 
     def try_teacher_session_admitted(
         self,
@@ -65,6 +85,11 @@ class StreamOPDTaskScheduler:
             return False
         self.teacher_sessions[session_id] = kv_reservation_tokens
         self.teacher_session_kv_tokens += kv_reservation_tokens
+        self.max_teacher_sessions = max(self.max_teacher_sessions, len(self.teacher_sessions))
+        self.max_teacher_session_kv_tokens = max(
+            self.max_teacher_session_kv_tokens,
+            self.teacher_session_kv_tokens,
+        )
         return True
 
     def teacher_session_released(self, policy_version: int, session_id: str) -> None:
@@ -90,8 +115,11 @@ class StreamOPDTaskScheduler:
         if self.teacher_queued < 1:
             raise RuntimeError("teacher_started without a queued StreamOPD chunk")
         self.teacher_queued -= 1
+        if self.teacher_active == 0:
+            self._teacher_busy_started_at = time.perf_counter()
         self.teacher_active += 1
         self.teacher_active_kv_tokens += kv_tokens
+        self.max_teacher_active = max(self.max_teacher_active, self.teacher_active)
 
     def try_teacher_started(
         self,
@@ -116,6 +144,9 @@ class StreamOPDTaskScheduler:
             raise RuntimeError("teacher_finished without an active StreamOPD chunk")
         self.teacher_active -= 1
         self.teacher_active_kv_tokens -= kv_tokens
+        if self.teacher_active == 0:
+            self.teacher_busy_seconds += time.perf_counter() - self._teacher_busy_started_at
+            self._teacher_busy_started_at = 0.0
         if self.teacher_active_kv_tokens < 0:
             raise RuntimeError("teacher active KV accounting became negative")
 
@@ -134,6 +165,7 @@ class StreamOPDTaskScheduler:
             raise RuntimeError("StreamOPD permits only one controller-level reverse-training unit at a time")
         self.training_active = 1
         self.training_units += 1
+        self._training_busy_started_at = time.perf_counter()
 
     def try_training_started(self, policy_version: int, teacher_queue_threshold: int) -> bool:
         self._check_version(policy_version)
@@ -148,6 +180,8 @@ class StreamOPDTaskScheduler:
         self._check_version(policy_version)
         if not self.training_active:
             raise RuntimeError("training_finished without an active StreamOPD training unit")
+        self.training_busy_seconds += time.perf_counter() - self._training_busy_started_at
+        self._training_busy_started_at = 0.0
         self.training_active = 0
 
     def snapshot(self) -> dict[str, int | float | None]:
@@ -161,8 +195,14 @@ class StreamOPDTaskScheduler:
             "teacher_pending": self.teacher_pending,
             "training_active": self.training_active,
             "teacher_chunks": self.teacher_chunks,
+            "teacher_notifications": self.teacher_notifications,
             "training_units": self.training_units,
             "max_teacher_pending": self.max_teacher_pending,
+            "max_teacher_active": self.max_teacher_active,
+            "max_teacher_sessions": self.max_teacher_sessions,
+            "max_teacher_session_kv_tokens": self.max_teacher_session_kv_tokens,
+            "teacher_busy_seconds": self.teacher_busy_seconds,
+            "training_busy_seconds": self.training_busy_seconds,
         }
 
     def end_policy(self, policy_version: int) -> dict[str, float]:
@@ -175,8 +215,16 @@ class StreamOPDTaskScheduler:
             )
         metrics = {
             "streamopd/scheduler_teacher_chunks": float(self.teacher_chunks),
+            "streamopd/scheduler_teacher_notifications": float(self.teacher_notifications),
+            "streamopd/scheduler_teacher_coalesced_fragments": float(self.teacher_notifications - self.teacher_chunks),
             "streamopd/scheduler_training_units": float(self.training_units),
             "streamopd/scheduler_max_teacher_pending": float(self.max_teacher_pending),
+            "streamopd/scheduler_max_teacher_active": float(self.max_teacher_active),
+            "streamopd/scheduler_max_teacher_sessions": float(self.max_teacher_sessions),
+            "streamopd/scheduler_max_teacher_session_kv_tokens": float(self.max_teacher_session_kv_tokens),
+            "streamopd/scheduler_teacher_busy_seconds": self.teacher_busy_seconds,
+            "streamopd/scheduler_training_busy_seconds": self.training_busy_seconds,
+            "streamopd/scheduler_pool_busy_seconds": self.teacher_busy_seconds + self.training_busy_seconds,
             "streamopd/scheduler_policy_seconds": time.perf_counter() - self.policy_started_at,
         }
         self.policy_version = None

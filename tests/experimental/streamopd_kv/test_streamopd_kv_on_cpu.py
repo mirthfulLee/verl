@@ -751,14 +751,37 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     assert dedicated_config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert dedicated_config.trainer.v1.sampler.max_off_policy_strategy == "drop"
 
+    reverse_trigger_config = copy.deepcopy(config)
+    reverse_trigger_config.trainer.v1.trainer_mode = "streamopd_colocate"
+    reverse_trigger_config.trainer.v1.streamopd_colocate = {"micro_batch_size": 1, "parameter_sync_step": 1}
+    reverse_trigger_config.distillation.streamopd_kv.colocate_teacher_with_student = True
+    reverse_trigger_config.distillation.streamopd_kv.micro_batch_size = 32
+    reverse_trigger_config.distillation.streamopd_kv.reverse_batch_size = 16
+    reverse_trigger_config.trainer.n_gpus_per_node = 2
+    reverse_trigger_config.actor_rollout_ref.rollout.nnodes = 1
+    reverse_trigger_config.actor_rollout_ref.rollout.n_gpus_per_node = 2
+    reverse_trigger_config.actor_rollout_ref.rollout.checkpoint_engine = {"backend": "nccl"}
+    reverse_trigger_config.trainer.v1.sampler = {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"}
+    prepare_streamopd_kv_config(reverse_trigger_config)
+    assert reverse_trigger_config.trainer.v1.streamopd_colocate.parameter_sync_step == 4
+
     config.trainer.v1.trainer_mode = "separate_async"
     with pytest.raises(ValueError, match="sync or streamopd_colocate"):
         prepare_streamopd_kv_config(config)
 
 
+def test_streamopd_colocate_starts_with_reverse_capacity_cohort() -> None:
+    from verl.trainer.ppo.v1.trainer_streamopd_colocate import _streamopd_batch_sizes
+
+    assert _streamopd_batch_sizes(128, 32, 16) == [16, 32, 32, 32, 16]
+    assert _streamopd_batch_sizes(128, 16, 16) == [16] * 8
+    assert _streamopd_batch_sizes(128, 32, 64) == [32] * 4
+
+
 def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(7)
+    scheduler.teacher_notified(7)
     scheduler.teacher_enqueued(7)
     scheduler.teacher_started(7)
     state = scheduler.snapshot()
@@ -773,7 +796,10 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
     scheduler.training_finished(7)
     metrics = scheduler.end_policy(7)
     assert metrics["streamopd/scheduler_teacher_chunks"] == 1
+    assert metrics["streamopd/scheduler_teacher_notifications"] == 1
+    assert metrics["streamopd/scheduler_teacher_coalesced_fragments"] == 0
     assert metrics["streamopd/scheduler_training_units"] == 1
+    assert metrics["streamopd/scheduler_pool_busy_seconds"] >= 0
     with pytest.raises(RuntimeError, match="no active policy"):
         scheduler.teacher_enqueued(8)
 
@@ -834,6 +860,42 @@ def test_teacher_session_reservation_is_held_until_eos() -> None:
     scheduler.teacher_session_released(13, "b")
     scheduler.teacher_session_released(13, "c")
     scheduler.end_policy(13)
+
+
+@pytest.mark.asyncio
+async def test_teacher_client_holds_load_balancer_lease_until_stream_eos() -> None:
+    from verl.workers.rollout.llm_server import LLMServerClient
+
+    class RemoteMethod:
+        async def remote(self, **kwargs):
+            return {"terminal": kwargs["terminal"]}
+
+    class Server:
+        stream_teacher_chunk = RemoteMethod()
+
+    class Client(LLMServerClient):
+        def __init__(self):
+            super().__init__(config=object())
+            self.acquire_count = 0
+            self.releases = []
+            self.server = Server()
+
+        async def _acquire_server(self, request_id):
+            self.acquire_count += 1
+            return "teacher-0", self.server
+
+        def _release_server(self, server_id):
+            self.releases.append(server_id)
+
+    client = Client()
+    params = {"prompt_logprobs": 2}
+    await client.stream_teacher_chunk("trajectory", token_ids=[1, 2], sampling_params=params, terminal=False)
+    await client.stream_teacher_chunk("trajectory", token_ids=[3, 4], sampling_params=params, terminal=False)
+    assert client.acquire_count == 1
+    assert client.releases == []
+    await client.stream_teacher_chunk("trajectory", token_ids=[], sampling_params=params, terminal=True)
+    assert client.acquire_count == 1
+    assert client.releases == ["teacher-0"]
 
 
 @pytest.mark.parametrize("use_chunked_topk", [False, True])

@@ -521,7 +521,7 @@ class AgentLoopWorker:
                     scheduler=scheduler,
                     scheduler_poll_interval_ms=int(streamopd_config.get("scheduler_poll_interval_ms", 10)),
                     max_active_trajectories=int(streamopd_config.get("teacher_prefill_max_active_trajectories", 16)),
-                    max_active_kv_tokens=int(streamopd_config.get("teacher_prefill_max_active_kv_tokens", 65536)),
+                    max_active_kv_tokens=int(streamopd_config.get("teacher_prefill_max_active_kv_tokens", 32768)),
                     kv_page_size=int(streamopd_config.get("teacher_prefill_kv_page_size", 64)),
                     kv_reservation_tokens=int(self.rollout_config.prompt_length + self.rollout_config.response_length),
                 )

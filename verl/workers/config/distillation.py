@@ -247,7 +247,10 @@ class StreamOPDKVConfig(BaseConfig):
     scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
     teacher_prefill_max_active_trajectories: int = 16
-    teacher_prefill_max_active_kv_tokens: int = 65536
+    # Conservative global reservation for the shared Teacher/Trainer pool.
+    # Effective live-session count is this budget divided by the configured
+    # prompt+response trajectory length.
+    teacher_prefill_max_active_kv_tokens: int = 32768
     teacher_prefill_kv_page_size: int = 64
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"

@@ -119,8 +119,10 @@ while 8192 teacher tokens make one teacher process consume 65.29 GiB and OOM, so
 Rollout uses independent continuous batching (`max_num_seqs` is tuned separately from microbatch). In the normal
 streaming path every committed rollout/KV chunk is submitted to the stateful teacher immediately; the teacher chunk
 size should match the rollout/KV chunk size. Each trajectory keeps one resumable teacher session alive from its first
-fragment to EOS. Admission reserves the configured full trajectory KV footprint up front, while the host can cache
-additional in-progress or sealed microbatches. The terminal-only setting is an explicit ablation and is not the default.
+fragment to EOS. Admission reserves the configured full trajectory KV footprint up front. The conservative default
+global budget is 32768 tokens, so a 4096-token trajectory admits up to eight live sessions and an 8192-token trajectory
+admits up to four; the host can cache additional in-progress or sealed microbatches. The terminal-only setting is an
+explicit ablation and is not the default.
 KV chunk files enter the Teacher/Trainer Pool-visible host
 cache during generation, before EOS; multiple in-progress or sealed MBs may be host-resident. Each trainer worker has
 a fail-closed single-MB GPU KV lease, and the next ready MB is loaded only after the current update releases it. All successful runs recorded pre-EOS KV chunks, one optimizer
@@ -132,14 +134,24 @@ finalization, and zero policy staleness. Machine-readable results are in
 After switching teacher scoring from repeated full-prefix requests to resumable `StreamingInput`, a GPU0-3 one-step
 sample with Qwen3-1.7B/Qwen3-4B, BF16, total trajectory length 4096, and rollout batch 128 completed as follows:
 
-| Live teacher sessions | Teacher KV reservation | Step | Rollout | Reverse units | Teacher fragments | Throughput |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 32768 tokens | 107.65 s | 42.20 s | 4 | 256 | 936.69 tok/s |
+| Total | MB | Live teacher sessions | Teacher KV reservation | Step | Rollout | Teacher busy | Training busy | Teacher fragments | Throughput |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 16 | 8 | 32768 tokens | 107.48 s | 36.30 s | 13.77 s | 41.90 s | 147 | 936.62 tok/s |
+| 4096 | 32 | 8 | 32768 tokens | 115.29 s | 46.23 s | - | - | 153 | 876.78 tok/s |
+| 8192 | 32 | 4 | 32768 tokens | 316.57 s | 188.51 s | 56.89 s | 83.23 s | 146 | 675.86 tok/s |
 
 The corresponding recorded `verl-sync-opd` step is 284.65 s (355.64 tok/s), so this sample is 2.64x faster. A
 rollout batch 32 / live-session 8 sample completed in 65.19 s with 64 teacher fragments and two reverse units.
 These samples use `micro_batch_size=32` only for Teacher/Trainer scheduling; rollout continuous batching is configured
 independently.
+
+The 8192-token sample uses 4 live sessions because the 32768-token global reservation is divided by the configured
+8192-token trajectory footprint. Its measured teacher+training busy union is 140.12 s, below the 188.51 s rollout
+interval; the remaining step time is reverse tail work, host KV handoff, and the policy checkpoint barrier.
+
+`teacher.max_num_batched_tokens=4096` reduced a small B32/2048 step from 52.28 s to 48.73 s, but OOMed during
+reverse backward at B128/4096 because the teacher process grew to about 32.3 GiB while the trainer used about
+45.6 GiB. The generic default therefore remains 2048; no runtime OOM retry is used.
 
 ### End-to-end V1 sync comparison (total trajectory length 4096)
 

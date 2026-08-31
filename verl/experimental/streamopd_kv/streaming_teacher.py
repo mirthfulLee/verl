@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -31,6 +32,7 @@ class _TeacherSession:
     updated: asyncio.Event = field(default_factory=asyncio.Event)
     admitted: bool = False
     stream_closed: bool = False
+    pending: deque[tuple[int, bool]] = field(default_factory=deque)
 
 
 class _LocalTeacherAdmission:
@@ -148,6 +150,7 @@ class StreamingTeacherCoordinator:
             await self._local_admission.release(reservation)
 
     async def submit(self, chunk: CommittedTokenChunk) -> None:
+        await self._schedule("teacher_notified", chunk.key.policy_version)
         session = self._sessions.get(chunk.key)
         if session is None:
             if chunk.start != 0 or not chunk.prompt_ids:
@@ -166,19 +169,13 @@ class StreamingTeacherCoordinator:
 
         session.response_ids.extend(chunk.token_ids)
         session.terminal = chunk.terminal
+        session.pending.append((len(session.response_ids), chunk.terminal))
         session.updated.set()
         if session.tail is None:
             session.tail = asyncio.create_task(
                 self._run_session(chunk.key, session),
                 name=f"streamopd-teacher-{chunk.key.trajectory_id}",
             )
-
-    def _target_response_tokens(self, session: _TeacherSession) -> int:
-        available = len(session.response_ids)
-        if session.terminal:
-            return available
-        aligned_total = (len(session.prompt_ids) + available) // self._kv_page_size * self._kv_page_size
-        return max(0, aligned_total - len(session.prompt_ids))
 
     async def _run_session(self, key: TrajectoryKey, session: _TeacherSession) -> None:
         reservation = self._kv_reservation_tokens or self._max_active_kv_tokens
@@ -187,25 +184,14 @@ class StreamingTeacherCoordinator:
                 await session.updated.wait()
                 session.updated.clear()
                 while True:
-                    target_response_tokens = self._target_response_tokens(session)
-                    if target_response_tokens <= session.scored_response_tokens:
-                        if session.terminal and session.scored_response_tokens == len(session.response_ids):
-                            if not session.stream_closed:
-                                request_id = f"streamopd-teacher-v{key.policy_version}-{key.trajectory_id}"
-                                await self._score([], request_id, True)
-                                session.stream_closed = True
-                            return
+                    if not session.pending:
                         break
-                    scored_response_tokens = session.scored_response_tokens
-                    if scored_response_tokens == 0:
-                        fragment = list(session.prompt_ids) + list(session.response_ids[:target_response_tokens])
-                    else:
-                        fragment = list(session.response_ids[scored_response_tokens:target_response_tokens])
-                    terminal = session.terminal and target_response_tokens == len(session.response_ids)
-                    kv_tokens = len(session.prompt_ids) + target_response_tokens
-                    if kv_tokens > reservation:
+                    target_response_tokens, terminal = session.pending.popleft()
+                    requested_kv_tokens = len(session.prompt_ids) + target_response_tokens
+                    if requested_kv_tokens > reservation:
                         raise RuntimeError(
-                            f"teacher session {key} exceeded its {reservation}-token KV reservation: {kv_tokens}"
+                            f"teacher session {key} exceeded its {reservation}-token KV reservation: "
+                            f"{requested_kv_tokens}"
                         )
                     if not session.admitted:
                         await self._admit_session(key, reservation)
@@ -214,9 +200,31 @@ class StreamingTeacherCoordinator:
                     started = False
                     acquired = False
                     try:
-                        await self._acquire_teacher(key.policy_version, kv_tokens)
+                        # The live-session reservation is a stable upper bound,
+                        # so admission remains valid if the trajectory grows
+                        # while this task waits for trainer ownership to end.
+                        await self._acquire_teacher(key.policy_version, reservation)
                         acquired = True
                         started = True
+                        while session.pending:
+                            target_response_tokens, terminal = session.pending.popleft()
+                        if target_response_tokens < session.scored_response_tokens:
+                            raise RuntimeError(
+                                f"teacher session {key} received an already-scored chunk ending at "
+                                f"{target_response_tokens}"
+                            )
+                        if target_response_tokens == session.scored_response_tokens:
+                            if terminal and not session.stream_closed:
+                                request_id = f"streamopd-teacher-v{key.policy_version}-{key.trajectory_id}"
+                                await self._score([], request_id, True)
+                                session.stream_closed = True
+                                return
+                            continue
+                        scored_response_tokens = session.scored_response_tokens
+                        if scored_response_tokens == 0:
+                            fragment = list(session.prompt_ids) + list(session.response_ids[:target_response_tokens])
+                        else:
+                            fragment = list(session.response_ids[scored_response_tokens:target_response_tokens])
                         request_id = f"streamopd-teacher-v{key.policy_version}-{key.trajectory_id}"
                         teacher_ids, teacher_logprobs = await self._score(fragment, request_id, terminal)
                         expected_rows = len(fragment)
@@ -237,11 +245,12 @@ class StreamingTeacherCoordinator:
                         session.scored_response_tokens = target_response_tokens
                         if terminal:
                             session.stream_closed = True
+                            return
                     finally:
                         if acquired:
-                            await self._release_teacher(key.policy_version, kv_tokens, started=started)
+                            await self._release_teacher(key.policy_version, reservation, started=started)
                         elif self._scheduler is not None:
-                            await self._schedule("teacher_cancelled", key.policy_version, kv_tokens)
+                            await self._schedule("teacher_cancelled", key.policy_version, reservation)
         finally:
             if session.admitted:
                 await self._release_session(key, reservation)

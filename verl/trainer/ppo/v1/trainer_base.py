@@ -1815,10 +1815,11 @@ class PPOTrainer(ABC):
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
         if self.streamopd_kv_enabled:
+            accumulation_steps = getattr(self, "_streamopd_runtime_accumulation_steps", self.parameter_sync_step)
             extra_info.update(
                 {
                     "streamopd_accumulation_step": self.local_trigger_step,
-                    "streamopd_accumulation_steps": self.parameter_sync_step,
+                    "streamopd_accumulation_steps": accumulation_steps,
                 }
             )
         batch.extra_info.update(extra_info)

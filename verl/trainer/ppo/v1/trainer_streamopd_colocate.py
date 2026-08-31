@@ -15,13 +15,31 @@ import uuid
 
 import ray
 from omegaconf import DictConfig, open_dict
+from transfer_queue import KVBatchMeta
 
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
+from verl.trainer.ppo.v1.utils import MetricsAggregator
 from verl.utils.debug import marked_timer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _streamopd_batch_sizes(train_batch_size: int, micro_batch_size: int, reverse_batch_size: int) -> list[int]:
+    """Return accumulation units with an early reverse-capacity trigger."""
+    if train_batch_size < 1 or micro_batch_size < 1 or reverse_batch_size < 1:
+        raise ValueError("StreamOPD batch sizes must be positive")
+    if train_batch_size % micro_batch_size:
+        raise ValueError("StreamOPD global batch must be divisible by micro_batch_size")
+    first = min(micro_batch_size, reverse_batch_size)
+    sizes = [first]
+    remaining = train_batch_size - first
+    while remaining:
+        size = min(micro_batch_size, remaining)
+        sizes.append(size)
+        remaining -= size
+    return sizes
 
 
 @register_trainer("streamopd_colocate")
@@ -59,6 +77,36 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         self._policy_version = self.global_steps - 1
         ray.get(self._scheduler.begin_policy.remote(self._policy_version))
         return super().prepare_step()
+
+    def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        """Consume an early reverse cohort, then normal Teacher/Trainer microbatches."""
+        train_batch_size = int(self.config.data.train_batch_size)
+        stream_config = self.config.distillation.streamopd_kv
+        batch_sizes = _streamopd_batch_sizes(
+            train_batch_size,
+            int(stream_config.micro_batch_size),
+            int(stream_config.reverse_batch_size),
+        )
+        prepare_metrics = self.prepare_step()
+        metrics_aggregator = MetricsAggregator()
+        if prepare_metrics:
+            metrics_aggregator.add_step_metrics(prepare_metrics)
+        combined_keys: list = []
+        combined_tags: list = []
+        self._streamopd_runtime_accumulation_steps = len(batch_sizes)
+        try:
+            for trigger_idx, sample_batch_size in enumerate(batch_sizes):
+                self.local_trigger_step = trigger_idx
+                iter_metrics: dict = {}
+                batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+                sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+                metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
+                combined_keys.extend(batch.keys)
+                combined_tags.extend(batch.tags)
+            metrics.update(metrics_aggregator.get_aggregated_metrics())
+            return KVBatchMeta(partition_id="train", keys=combined_keys, tags=combined_tags)
+        finally:
+            del self._streamopd_runtime_accumulation_steps
 
     def on_sample_end(self):
         # Rollout owns a separate pool and remains resident while this

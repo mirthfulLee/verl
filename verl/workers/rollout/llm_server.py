@@ -217,6 +217,10 @@ class LLMServerClient:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        # A resumable teacher request owns one load-balancer lease for its
+        # whole KV lifetime. Counting only individual fragment RPCs can pack
+        # all resident sessions onto one replica after those RPCs return.
+        self._teacher_stream_servers: dict[str, tuple[str, ray.actor.ActorHandle]] = {}
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -245,16 +249,26 @@ class LLMServerClient:
         terminal: bool,
     ) -> dict[str, Any]:
         """Append tokens to one sticky vLLM StreamingInput teacher session."""
-        server_id, server = await self._acquire_server(request_id)
+        resident = self._teacher_stream_servers.get(request_id)
+        if resident is None:
+            resident = await self._acquire_server(request_id)
+            self._teacher_stream_servers[request_id] = resident
+        server_id, server = resident
         try:
-            return await server.stream_teacher_chunk.remote(
+            result = await server.stream_teacher_chunk.remote(
                 request_id=request_id,
                 token_ids=token_ids,
                 sampling_params=sampling_params,
                 terminal=terminal,
             )
-        finally:
+        except BaseException:
+            self._teacher_stream_servers.pop(request_id, None)
             self._release_server(server_id)
+            raise
+        if terminal:
+            self._teacher_stream_servers.pop(request_id, None)
+            self._release_server(server_id)
+        return result
 
     @rollout_trace_op
     async def generate(

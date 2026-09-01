@@ -220,7 +220,7 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 @dataclass
 class StreamOPDKVConfig(BaseConfig):
-    """Experimental two-pool strict OPD execution settings.
+    """Experimental placement-aware strict OPD execution settings.
 
     This flag is fail-closed. The initial backend supports text-only,
     single-teacher Qwen3 jobs with exact dense attention and vLLM KV export.
@@ -234,11 +234,22 @@ class StreamOPDKVConfig(BaseConfig):
     # Ablation: submit one complete prompt+response at EOS and defer all
     # reverse work until every trajectory in the global batch is scored.
     posthoc_ablation: bool = False
-    reverse_chunk_size: int = 256
-    reverse_chunk_min_size: int = 64
+    # Physical GPU allocation is user-controlled. ``teacher`` colocates the
+    # fixed-topology trainer with Teacher vLLM; ``dedicated`` gives each role
+    # its own pool. Rollout/union borrowing is not enabled until their stable
+    # trainer process groups are available.
+    trainer_placement: str = "teacher"
+    # ``teacher_then_train`` is the work-conserving scheduler baseline: keep
+    # streaming Teacher scoring, but delay all reverse units until Teacher
+    # drain. ``adaptive`` launches at one planned reverse width on dedicated
+    # resources and uses hysteresis plus Teacher turns on shared resources.
+    scheduler_policy: str = "adaptive"
+    # Zero values are resolved into static caps before worker startup.
+    reverse_chunk_size: int = 0
+    reverse_chunk_min_size: int = 0
     reverse_page_size: int = 64
-    reverse_batch_size: int = 16
-    reverse_batch_max_tokens: int = 32768
+    reverse_batch_size: int = 0
+    reverse_batch_max_tokens: int = 0
     # Persistent K/V/dK/dV rows planned and allocated before policy version 0.
     # A zero token limit is resolved from data.max_prompt/response_length.
     reverse_fixed_slots: bool = True
@@ -250,11 +261,13 @@ class StreamOPDKVConfig(BaseConfig):
     scheduler_timeout_seconds: float = 600.0
     scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
-    teacher_prefill_max_active_trajectories: int = 16
+    # Optional preflight caps. Zero lets the scheduler derive stable values
+    # from vLLM's profiled KV blocks and the reverse training-unit width.
+    teacher_prefill_max_active_trajectories: int = 0
     # Conservative global reservation for the shared Teacher/Trainer pool.
     # Effective live-session count is this budget divided by the configured
     # prompt+response trajectory length.
-    teacher_prefill_max_active_kv_tokens: int = 32768
+    teacher_prefill_max_active_kv_tokens: int = 0
     teacher_prefill_kv_page_size: int = 64
     # Host-side KV prefetch is overlapped with the current reverse unit.  The
     # GPU lease remains limited to one reverse microbatch; depth only controls
@@ -276,16 +289,10 @@ class StreamOPDKVConfig(BaseConfig):
         for name in (
             "token_chunk_size",
             "teacher_initial_chunk_size",
-            "reverse_chunk_size",
-            "reverse_chunk_min_size",
             "reverse_page_size",
-            "reverse_batch_size",
-            "reverse_batch_max_tokens",
             "micro_batch_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
-            "teacher_prefill_max_active_trajectories",
-            "teacher_prefill_max_active_kv_tokens",
             "teacher_prefill_kv_page_size",
             "kv_prefetch_depth",
             "kv_prefetch_workers",
@@ -294,13 +301,23 @@ class StreamOPDKVConfig(BaseConfig):
                 raise ValueError(f"streamopd_kv.{name} must be positive")
         if not self.kv_handoff_dir:
             raise ValueError("streamopd_kv.kv_handoff_dir must be non-empty")
-        if self.reverse_chunk_min_size > self.reverse_chunk_size:
+        for name in (
+            "reverse_chunk_size",
+            "reverse_chunk_min_size",
+            "reverse_batch_size",
+            "reverse_batch_max_tokens",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"streamopd_kv.{name} must be non-negative")
+        if self.reverse_chunk_size and self.reverse_chunk_min_size > self.reverse_chunk_size:
             raise ValueError("streamopd_kv.reverse_chunk_min_size must not exceed reverse_chunk_size")
         if self.reverse_page_size < 16 or self.reverse_page_size & (self.reverse_page_size - 1):
             raise ValueError("streamopd_kv.reverse_page_size must be a power of two and at least 16")
         if self.teacher_prefill_kv_page_size & (self.teacher_prefill_kv_page_size - 1):
             raise ValueError("streamopd_kv.teacher_prefill_kv_page_size must be a power of two")
-        if self.reverse_chunk_size % self.reverse_page_size or self.reverse_chunk_min_size % self.reverse_page_size:
+        if (self.reverse_chunk_size and self.reverse_chunk_size % self.reverse_page_size) or (
+            self.reverse_chunk_min_size and self.reverse_chunk_min_size % self.reverse_page_size
+        ):
             raise ValueError("StreamOPD reverse chunk sizes must be divisible by reverse_page_size")
         if self.reverse_slot_max_tokens < 0:
             raise ValueError("streamopd_kv.reverse_slot_max_tokens must be non-negative")
@@ -310,10 +327,18 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.validation_atol must be non-negative")
         if self.teacher_priority_threshold < 0:
             raise ValueError("streamopd_kv.teacher_priority_threshold must be non-negative")
+        if self.teacher_prefill_max_active_trajectories < 0:
+            raise ValueError("streamopd_kv.teacher_prefill_max_active_trajectories must be non-negative")
+        if self.teacher_prefill_max_active_kv_tokens < 0:
+            raise ValueError("streamopd_kv.teacher_prefill_max_active_kv_tokens must be non-negative")
         if self.scheduler_timeout_seconds <= 0:
             raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
         if self.posthoc_ablation and self.teacher_terminal_only_after_initial:
             raise ValueError("posthoc_ablation is incompatible with teacher_terminal_only_after_initial")
+        if self.trainer_placement not in {"teacher", "dedicated"}:
+            raise NotImplementedError("streamopd_kv.trainer_placement currently supports 'teacher' and 'dedicated'")
+        if self.scheduler_policy not in {"adaptive", "teacher_then_train"}:
+            raise ValueError("streamopd_kv.scheduler_policy must be 'adaptive' or 'teacher_then_train'")
         if self.enabled and self.rollout_backend != "vllm":
             raise NotImplementedError("StreamOPD-KV MVP supports rollout_backend='vllm' only")
         if self.enabled and not self.exact_dense_attention:

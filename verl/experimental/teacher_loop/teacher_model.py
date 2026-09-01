@@ -260,3 +260,25 @@ class MultiTeacherModelManager:
             key: max(int(stats[key]) for stats in worker_stats)
             for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
         }
+
+    @auto_await
+    async def collect_kv_cache_capacity_tokens(self) -> int:
+        """Return total resumable-request KV capacity across Teacher replicas."""
+
+        responses = await asyncio.gather(
+            *(
+                server.collective_rpc.remote("get_kv_cache_capacity")
+                for manager in self.teacher_model_managers.values()
+                for server in manager.server_handles
+            )
+        )
+        replica_capacities = []
+        for response in responses:
+            worker_capacities = [int(stats["capacity_tokens"]) for stats in (response or [])]
+            if not worker_capacities:
+                raise RuntimeError("Teacher vLLM workers returned no KV cache capacity")
+            # TP workers shard bytes, but expose the same logical token capacity.
+            replica_capacities.append(min(worker_capacities))
+        if not replica_capacities:
+            raise RuntimeError("StreamOPD Teacher has no vLLM replicas")
+        return sum(replica_capacities)

@@ -347,8 +347,14 @@ class PPOTrainer(ABC):
         if self.use_teacher_policy:
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            teacher_colocated = self.trainer_mode == "streamopd_colocate" or bool(
-                self.config.distillation.get("colocate_teacher_with_student", False)
+            streamopd_teacher_colocated = bool(
+                self.trainer_mode == "streamopd_colocate"
+                and self.config.distillation.streamopd_kv.get("trainer_placement", "teacher") == "teacher"
+            )
+            teacher_colocated = (
+                streamopd_teacher_colocated
+                if self.trainer_mode == "streamopd_colocate"
+                else bool(self.config.distillation.get("colocate_teacher_with_student", False))
             )
             if teacher_colocated:
                 teacher_world_size = sum(
@@ -578,7 +584,7 @@ class PPOTrainer(ABC):
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
-        if self.reward_loop_manager.reward_loop_worker_handles is None:
+        if not self.streamopd_kv_enabled and self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
@@ -828,7 +834,11 @@ class PPOTrainer(ABC):
                 if distillation_config.n_gpus_per_node >= config.trainer.n_gpus_per_node:
                     raise ValueError("colocated teacher GPU count must be smaller than the student pool GPU count")
 
-            if self.trainer_mode == "streamopd_colocate" or baseline_teacher_colocation:
+            streamopd_teacher_colocation = bool(
+                self.trainer_mode == "streamopd_colocate"
+                and distillation_config.streamopd_kv.get("trainer_placement", "teacher") == "teacher"
+            )
+            if streamopd_teacher_colocation or baseline_teacher_colocation:
                 self.mapping[Role.TeacherModel] = global_pool_id
             else:
                 teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
@@ -1891,6 +1901,14 @@ class PPOTrainer(ABC):
                 spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
 
         data = data.to_padded_tensor()
+        if "rm_scores" not in data:
+            if not self.streamopd_kv_enabled:
+                raise KeyError("rollout metrics require rm_scores outside direct StreamOPD")
+            # Direct StreamOPD does not consume task rewards, but the shared
+            # reporting schema still expects token-level scores. Keep the
+            # placeholder local to metrics instead of reintroducing reward RPCs
+            # on the trajectory critical path.
+            data["rm_scores"] = torch.zeros_like(data["responses"], dtype=torch.float32)
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]

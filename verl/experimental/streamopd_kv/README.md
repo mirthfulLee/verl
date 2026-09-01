@@ -1,25 +1,27 @@
 # StreamOPD
 
-StreamOPD is an experimental strict on-policy distillation path for verl V1. It uses two independent GPU pools:
+StreamOPD is an experimental strict on-policy distillation path for verl V1. Rollout always has an independent pool;
+Teacher and Trainer placement is user-selected:
 
 ```text
 Rollout Pool
   `- student rollout engine
 
-Teacher/Trainer Pool
-  |- frozen teacher inference engine
-  `- sharded student trainer
+Teacher Pool                     Trainer placement
+  `- frozen teacher engine       |- teacher: share Teacher GPUs
+                                 `- dedicated: separate Trainer GPUs
 ```
 
-The rollout engine remains resident and uses continuous batching. The Teacher/Trainer Pool keeps both models loaded
-and serializes teacher forward and reverse training, so their kernels never overlap in memory. The internal trainer
-registration is currently named `streamopd_colocate`; this is the only supported StreamOPD topology.
+The rollout engine remains resident and uses continuous batching. With `trainer_placement=teacher`, both models stay
+loaded and the scheduler serializes their kernels. With `trainer_placement=dedicated`, Teacher and Trainer may run
+concurrently on disjoint resources. The internal trainer registration remains `streamopd_colocate` for compatibility.
 
 ## Supported envelope
 
 The implementation fails closed outside the following configuration:
 
 - `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd_colocate`;
+- `trainer_placement=teacher` or `dedicated`; rollout/union borrowing is not yet supported;
 - text-only, single-turn Qwen3 with one frozen teacher;
 - vLLM rollout with TP=1, PP=1, `n=1`, and a non-quantized KV cache;
 - FSDP/FSDP2 student, one PPO epoch, and global `token-mean` aggregation;
@@ -40,9 +42,11 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
    sessions retain causal teacher KV across fragments. Contiguous queued fragments may be coalesced without changing
    token coverage. A session reservation is held until EOS; releasing it immediately permits another trajectory to
    use the bounded teacher KV capacity.
-3. The scheduler owns separate Teacher Chunk and Reverse Training queues. Teacher forward waits while a training unit
-   is active, and training starts only after active teacher kernels finish and pending teacher work is within the
-   configured priority threshold. There is no fixed Teacher cohort or cohort-boundary model sleep/wake path.
+3. The scheduler owns separate Teacher Chunk and Reverse Training queues plus explicit resource sets. Shared resources
+   are mutually exclusive; dedicated resources can overlap. `teacher_then_train` is the drain-first baseline.
+   `adaptive` launches immediately at one ready reverse width on dedicated GPUs. On shared GPUs it uses a two-width
+   admission threshold, one-unit reverse quanta, and a short Teacher grace window to avoid rapid switches and Teacher
+   starvation. Live Teacher sessions refill as earlier trajectories reach EOS; there is no model sleep/wake boundary.
 4. `StreamOPDKVConnector` copies completed rollout KV ranges from live vLLM pages into the host cache before EOS.
    Multiple generating or sealed microbatches may be host-resident, while each trainer worker may hold exactly one GPU
    KV lease. A bounded prefetch queue reads the next host snapshot while the current reverse unit executes. Within the
@@ -51,15 +55,18 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
 5. Once `EOS && student KV complete && teacher supervision complete`, the trainer uses rollout KV as OOMB Stage-1 and
    traverses chunks from suffix to prefix. Wavefront batches contain all trajectories active at the same reverse
    depth. Completed suffix chunks leave the wavefront, and dK/dV continues into earlier chunks.
-6. Before policy version zero, the trainer measures reusable memory once and chooses fixed `B_slot`, page-aligned
-   `T_slot`, and chunk size. It allocates persistent per-layer K/V/dK/dV backing and reuses the plan for all steps; the
-   hot path performs no allocator query, OOM retry, tensor growth, or kernel-shape adaptation.
+6. Before policy version zero, vLLM reports its profiled KV block capacity and the trainer measures reusable memory
+   once. Preflight derives a stable Teacher session budget, fixed `B_slot`, page-aligned `T_slot`, chunk size, and
+   accumulation count. Reverse candidates prefer the largest feasible chunk and then the largest batch at that chunk;
+   this avoids memory-feasible wide batches that force inefficient shallow tiles. The hot path performs no allocator
+   query, OOM retry, tensor growth, or kernel-shape adaptation.
 7. Raw gradients accumulate across the complete global batch. Parameters stay at `theta_k` until all rollout,
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
 
-`micro_batch_size` controls Teacher/Trainer work only. Rollout throughput is configured independently through vLLM
-continuous-batching limits such as `max_num_seqs`.
+Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`.
+`micro_batch_size` remains a compatibility field but no longer determines reverse units. Set reverse batch/chunk and
+Teacher admission caps to zero (the default) for automatic preflight planning; non-zero values are experimental caps.
 
 ## Fixed reverse slots
 
@@ -76,9 +83,10 @@ depth commits, the compute stream records a free event; the copy stream waits on
 range with next-group KV. Group activation waits for all required load events. Short-trajectory tail pages and unused
 rows can therefore load before the current group reaches their reverse depth.
 
-The configured token cap remains part of planning. For a 4096-token trajectory, the default 32768-token cap selects
-B8. Raising it to 65536 can fit B16, but may force a smaller chunk and increase backward depth; fitting in memory is
-not by itself a throughput win.
+Preflight enumerates power-of-two reverse widths under the fixed-slot, activation, LM-head, optimizer, and transfer
+reserve. It first maximizes the feasible chunk (up to the profiled 1024-token kernel tile), then batch width. A larger
+batch that forces a smaller chunk is not selected merely because it fits in memory. Non-zero token/batch/chunk caps
+remain available for controlled ablations.
 
 ## Post-hoc ablation
 

@@ -310,6 +310,19 @@ class vLLMColocateWorkerExtension:
             "max_reserved_bytes": int(device_module.max_memory_reserved(self.device)),
         }
 
+    def get_kv_cache_capacity(self) -> dict[str, int]:
+        """Return the profiled GPU KV capacity in scheduler-visible tokens."""
+
+        num_blocks = int(self.cache_config.num_gpu_blocks or 0)
+        block_size = int(self.cache_config.block_size or 0)
+        if num_blocks < 1 or block_size < 1:
+            raise RuntimeError("vLLM KV cache capacity is unavailable after engine initialization")
+        return {
+            "num_gpu_blocks": num_blocks,
+            "block_size": block_size,
+            "capacity_tokens": num_blocks * block_size,
+        }
+
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver

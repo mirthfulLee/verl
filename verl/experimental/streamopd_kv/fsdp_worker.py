@@ -172,6 +172,7 @@ def _fixed_reverse_slot_plan(
     if max_rows < 1:
         raise ValueError("reverse_batch_max_tokens cannot fit one fixed trajectory slot")
     candidate = 1 << (max_rows.bit_length() - 1)
+    best_plan: ReverseSlotPlan | None = None
     while candidate:
         slot_bytes, bytes_per_token = _reverse_memory_estimate(
             model,
@@ -190,14 +191,23 @@ def _fixed_reverse_slot_plan(
                 chunk_size = proposed
                 break
         if chunk_size >= min_chunk_size:
-            return ReverseSlotPlan(
+            plan = ReverseSlotPlan(
                 batch_size=candidate,
                 token_capacity=token_capacity,
                 chunk_size=chunk_size,
                 slot_bytes=slot_bytes,
                 estimated_workspace_bytes=chunk_size * bytes_per_token,
             )
+            # A larger reverse tile reduces wavefront depth and kernel launch
+            # count. Once tile size ties, prefer more trajectories per launch.
+            if best_plan is None or (plan.chunk_size, plan.batch_size) > (
+                best_plan.chunk_size,
+                best_plan.batch_size,
+            ):
+                best_plan = plan
         candidate //= 2
+    if best_plan is not None:
+        return best_plan
     raise RuntimeError("preflight could not fit one fixed reverse slot with the minimum chunk size")
 
 

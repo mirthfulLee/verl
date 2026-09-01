@@ -851,11 +851,13 @@ distillation:
     teacher_first_chunk_includes_prompt: true
     teacher_terminal_only_after_initial: false
     posthoc_ablation: false
-    reverse_chunk_size: 256
-    reverse_chunk_min_size: 64
+    trainer_placement: teacher
+    scheduler_policy: adaptive
+    reverse_chunk_size: 0
+    reverse_chunk_min_size: 0
     reverse_page_size: 64
-    reverse_batch_size: 16
-    reverse_batch_max_tokens: 32768
+    reverse_batch_size: 0
+    reverse_batch_max_tokens: 0
     reverse_fixed_slots: true
     reverse_slot_max_tokens: 0
     reverse_slot_reserve_gib: 4.0
@@ -865,8 +867,8 @@ distillation:
     scheduler_timeout_seconds: 600.0
     scheduler_actor_name: ''
     max_pending_teacher_chunks: 128
-    teacher_prefill_max_active_trajectories: 16
-    teacher_prefill_max_active_kv_tokens: 32768
+    teacher_prefill_max_active_trajectories: 0
+    teacher_prefill_max_active_kv_tokens: 0
     teacher_prefill_kv_page_size: 64
     kv_prefetch_depth: 1
     kv_prefetch_workers: 4

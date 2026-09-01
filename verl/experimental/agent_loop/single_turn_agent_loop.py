@@ -38,6 +38,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
         priority = int(priority)
+        max_response_tokens = kwargs.get("max_response_tokens")
+        if max_response_tokens is not None:
+            max_response_tokens = int(max_response_tokens)
+            if max_response_tokens < 1:
+                raise ValueError("max_response_tokens must be positive")
+            sampling_params = dict(sampling_params)
+            sampling_params["max_tokens"] = min(max_response_tokens, self.response_length)
         messages = list(kwargs["raw_prompt"])
 
         # 1. extract multimodal inputs from messages

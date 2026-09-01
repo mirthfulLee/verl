@@ -894,7 +894,7 @@ def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
         dtype=torch.bfloat16,
         available_memory_bytes=memory,
     )
-    assert (wide.batch_size, wide.token_capacity, wide.chunk_size) == (16, 4096, 256)
+    assert (wide.batch_size, wide.token_capacity, wide.chunk_size) == (8, 4096, 1024)
 
     long = _fixed_reverse_slot_plan(
         model,
@@ -907,7 +907,7 @@ def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
         dtype=torch.bfloat16,
         available_memory_bytes=memory,
     )
-    assert (long.batch_size, long.token_capacity, long.chunk_size) == (8, 8192, 512)
+    assert (long.batch_size, long.token_capacity, long.chunk_size) == (4, 8192, 1024)
 
 
 def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
@@ -972,6 +972,7 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
                 },
             },
             "data": {"train_batch_size": 128},
+            "algorithm": {"filter_groups": {"enable": True, "metric": "acc"}},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -1009,16 +1010,27 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     connector = config.actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config
     assert connector.kv_connector == "StreamOPDKVConnector"
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
-    assert config.trainer.v1.streamopd_colocate.micro_batch_size == 16
-    assert config.trainer.v1.streamopd_colocate.parameter_sync_step == 8
+    assert config.trainer.v1.streamopd_colocate.micro_batch_size == 128
+    assert config.trainer.v1.streamopd_colocate.parameter_sync_step == 1
     assert config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
+    assert config.algorithm.filter_groups.enable is False
+    assert config.distillation.streamopd_kv.reverse_slot_max_tokens == 4096
+    assert config.distillation.streamopd_kv.reverse_batch_size == 128
+    assert config.distillation.streamopd_kv.reverse_batch_max_tokens == 128 * 4096
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 1024
+    assert config.distillation.streamopd_kv.reverse_chunk_min_size == 64
 
     reverse_trigger_config = copy.deepcopy(config)
     reverse_trigger_config.distillation.streamopd_kv.micro_batch_size = 32
     reverse_trigger_config.distillation.streamopd_kv.reverse_batch_size = 16
     prepare_streamopd_kv_config(reverse_trigger_config)
-    assert reverse_trigger_config.trainer.v1.streamopd_colocate.parameter_sync_step == 4
+    assert reverse_trigger_config.trainer.v1.streamopd_colocate.parameter_sync_step == 1
+
+    ragged_unit_config = copy.deepcopy(config)
+    ragged_unit_config.data.train_batch_size = 130
+    ragged_unit_config.distillation.streamopd_kv.micro_batch_size = 32
+    prepare_streamopd_kv_config(ragged_unit_config)
 
     stale_config = copy.deepcopy(config)
     stale_config.trainer.v1.trainer_mode = "sync"
@@ -1029,6 +1041,21 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     multi_sample_config.actor_rollout_ref.rollout.n = 2
     with pytest.raises(NotImplementedError, match="rollout.n=1"):
         prepare_streamopd_kv_config(multi_sample_config)
+
+    mismatched_shared = copy.deepcopy(config)
+    mismatched_shared.distillation.n_gpus_per_node = 3
+    with pytest.raises(ValueError, match="cover every Teacher GPU"):
+        prepare_streamopd_kv_config(mismatched_shared)
+
+    dedicated = copy.deepcopy(config)
+    dedicated.distillation.streamopd_kv.trainer_placement = "dedicated"
+    dedicated.distillation.n_gpus_per_node = 3
+    prepare_streamopd_kv_config(dedicated)
+
+    baseline_placement_flag = copy.deepcopy(config)
+    baseline_placement_flag.distillation.colocate_teacher_with_student = True
+    with pytest.raises(ValueError, match="sync-baseline option"):
+        prepare_streamopd_kv_config(baseline_placement_flag)
 
 
 def test_prepare_config_does_not_mutate_sync_baseline() -> None:
@@ -1082,10 +1109,63 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
 
 
 def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches() -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd_colocate import _streamopd_batch_sizes
+    from verl.trainer.ppo.v1.trainer_streamopd_colocate import (
+        _plan_teacher_admission,
+        _planned_local_reverse_width,
+        _streamopd_batch_sizes,
+    )
 
     assert _streamopd_batch_sizes(32, 16, 16) == [16, 16]
     assert _streamopd_batch_sizes(128, 32, 16) == [16, 32, 32, 32, 16]
+    assert _streamopd_batch_sizes(128, 32, 16, planned_unit_size=16) == [16] * 8
+    assert _streamopd_batch_sizes(130, 0, 0, planned_unit_size=16) == [16] * 8 + [2]
+    assert (
+        _planned_local_reverse_width(
+            [{"slot_batch_size": 8.0}, [{"slot_batch_size": 4.0}]],
+            fallback=16,
+        )
+        == 4
+    )
+    assert _plan_teacher_admission(
+        expected_trajectories=32,
+        trajectory_tokens=1000,
+        vllm_capacity_tokens=40000,
+        page_size=64,
+        max_batched_tokens=2048,
+        initial_chunk_tokens=384,
+        train_launch_width=8,
+    ) == {
+        "active_trajectories": 8,
+        "active_kv_tokens": 8192,
+        "vllm_capacity_tokens": 40000,
+        "safe_capacity_tokens": 29952,
+        "trajectory_tokens": 1024,
+        "prefill_wave": 5,
+    }
+    capped = _plan_teacher_admission(
+        expected_trajectories=32,
+        trajectory_tokens=4096,
+        vllm_capacity_tokens=20000,
+        page_size=64,
+        max_batched_tokens=2048,
+        initial_chunk_tokens=1024,
+        train_launch_width=8,
+        trajectory_cap=16,
+        token_cap=12000,
+    )
+    assert capped["active_trajectories"] == 2
+    assert capped["active_kv_tokens"] == 8192
+    with pytest.raises(ValueError, match="cannot fit one trajectory"):
+        _plan_teacher_admission(
+            expected_trajectories=8,
+            trajectory_tokens=4096,
+            vllm_capacity_tokens=20000,
+            page_size=64,
+            max_batched_tokens=2048,
+            initial_chunk_tokens=1024,
+            train_launch_width=4,
+            token_cap=2048,
+        )
 
 
 def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
@@ -1123,6 +1203,96 @@ def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
     scheduler.training_finished(14)
     scheduler.teacher_cancelled(14)
     scheduler.end_policy(14)
+
+
+def test_adaptive_shared_scheduler_uses_hysteresis_and_teacher_quanta() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(20, expected_trajectories=12, scheduler_policy="adaptive", train_launch_width=4)
+    scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
+    scheduler.teacher_enqueued(20)
+    for _ in range(4):
+        scheduler.teacher_trajectory_completed(20)
+    assert scheduler.try_teacher_started(20) is True
+    scheduler.teacher_finished(20)
+    for _ in range(4):
+        scheduler.teacher_trajectory_completed(20)
+    scheduler.teacher_enqueued(20)
+    assert scheduler.try_teacher_started(20) is False
+    assert scheduler.try_training_started(20, teacher_queue_threshold=0) is True
+    scheduler.training_finished(20)
+    scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
+    # One Teacher chunk gets priority after every reverse unit.
+    assert scheduler.try_teacher_started(20) is True
+    scheduler.teacher_finished(20)
+    scheduler.training_waiting_cancelled(20)
+    assert scheduler.snapshot()["forced_teacher_turns"] == 1
+
+
+def test_adaptive_shared_scheduler_resumes_training_after_teacher_grace() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(24, scheduler_policy="adaptive", train_launch_width=4)
+    scheduler.training_waiting(24, teacher_queue_threshold=0, trajectory_count=4)
+    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is True
+    scheduler.training_finished(24)
+    scheduler.training_waiting(24, teacher_queue_threshold=0, trajectory_count=4)
+    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is False
+    scheduler.last_training_finished_at -= scheduler.teacher_turn_grace_seconds
+    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is True
+    scheduler.training_finished(24)
+
+
+def test_dedicated_teacher_and_trainer_resources_can_run_concurrently() -> None:
+    scheduler = StreamOPDTaskScheduler(teacher_resources=("teacher",), trainer_resources=("trainer",))
+    scheduler.begin_policy(21)
+    scheduler.teacher_enqueued(21)
+    assert scheduler.try_teacher_started(21) is True
+    scheduler.training_waiting(21, teacher_queue_threshold=0, trajectory_count=4)
+    assert scheduler.try_training_started(21, teacher_queue_threshold=0) is True
+    state = scheduler.snapshot()
+    assert state["teacher_active"] == 1
+    assert state["training_active"] == 1
+    assert state["resources_overlap"] is False
+    scheduler.training_finished(21)
+    scheduler.teacher_finished(21)
+    metrics = scheduler.end_policy(21)
+    assert metrics["streamopd/scheduler_resources_overlap"] == 0
+    assert metrics["streamopd/scheduler_concurrent_busy_seconds"] >= 0
+
+
+def test_teacher_then_train_policy_waits_for_streaming_teacher_drain() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(
+        22,
+        expected_trajectories=2,
+        scheduler_policy="teacher_then_train",
+        train_launch_width=2,
+    )
+    scheduler.training_waiting(22, teacher_queue_threshold=0, trajectory_count=2)
+    assert scheduler.try_training_started(22, teacher_queue_threshold=0) is False
+    for _ in range(2):
+        scheduler.teacher_trajectory_terminal_submitted(22)
+        scheduler.teacher_trajectory_completed(22)
+    assert scheduler.snapshot()["teacher_drained"] is True
+    assert scheduler.try_training_started(22, teacher_queue_threshold=0) is True
+    scheduler.training_finished(22)
+    scheduler.end_policy(22)
+
+
+def test_adaptive_scheduler_drains_a_single_teacher_tail_quantum() -> None:
+    scheduler = StreamOPDTaskScheduler(teacher_resources=("teacher",), trainer_resources=("trainer",))
+    scheduler.begin_policy(23, expected_trajectories=8, scheduler_policy="adaptive", train_launch_width=4)
+    for _ in range(8):
+        scheduler.teacher_trajectory_terminal_submitted(23)
+    for _ in range(4):
+        scheduler.teacher_trajectory_completed(23)
+    scheduler.training_waiting(23, teacher_queue_threshold=0, trajectory_count=4)
+    assert scheduler.snapshot()["teacher_drained"] is False
+    assert scheduler.try_training_started(23, teacher_queue_threshold=0) is False
+    for _ in range(4):
+        scheduler.teacher_trajectory_completed(23)
+    assert scheduler.try_training_started(23, teacher_queue_threshold=0) is True
+    scheduler.training_finished(23)
+    scheduler.end_policy(23)
 
 
 def test_teacher_admission_limits_active_trajectory_count_and_kv_tokens() -> None:
@@ -1319,11 +1489,23 @@ def test_posthoc_config_rejects_initial_streaming_ablation() -> None:
         )
 
 
-def test_dapo_adapter_wraps_plain_prompt_as_chat_messages() -> None:
+def test_dapo_adapter_wraps_plain_prompt_as_chat_messages(monkeypatch) -> None:
     from benchmarks.streamopd_kv.dapo_math_dataset import DAPOMathDataset
+    from verl.utils.dataset.rl_dataset import RLHFDataset
 
     dataset = DAPOMathDataset.__new__(DAPOMathDataset)
     assert dataset._build_messages({"prompt": "2 + 2?"}, "prompt") == [{"role": "user", "content": "2 + 2?"}]
+    monkeypatch.setattr(RLHFDataset, "__getitem__", lambda _self, item: {"item": item})
+    monkeypatch.setenv("STREAMOPD_RAGGED_RESPONSE_LENGTHS", "256,768")
+    assert dataset[100]["max_response_tokens"] == 256
+    assert dataset[7]["max_response_tokens"] == 768
+
+
+def test_streamopd_trainer_does_not_expose_unused_reward_handles() -> None:
+    from verl.trainer.ppo.v1.trainer_streamopd_colocate import PPOTrainerStreamOPDColocate
+
+    trainer = PPOTrainerStreamOPDColocate.__new__(PPOTrainerStreamOPDColocate)
+    assert trainer.get_reward_handles() is None
 
 
 def test_vllm_connector_waits_for_claimed_copy_event_and_ignores_unclaimed_request() -> None:

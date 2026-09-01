@@ -1,8 +1,8 @@
 # StreamOPD benchmark
 
-The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD uses a dedicated
-2-GPU rollout pool and a 2-GPU Teacher/Trainer Pool on GPU0-3. Teacher forward and student reverse training are
-serialized inside the shared Teacher/Trainer Pool.
+The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD always uses a
+standalone rollout pool. `trainer_placement=teacher` shares Teacher GPUs and serializes their kernels;
+`trainer_placement=dedicated` uses separate Teacher and Trainer pools and permits real concurrency.
 
 ## Environment
 
@@ -23,14 +23,38 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 BATCH_SIZE=128 TOTAL_TRAINING_STEPS=1 \
 ```
 
 The benchmark wrapper calls the current path `streamopd`; the internal trainer mode remains `streamopd_colocate`.
-StreamOPD microbatch values 16/32 configure only Teacher/Trainer scheduling. Rollout uses an independent
-`max_num_seqs`, and baseline modes do not consume the StreamOPD microbatch setting. The matrix exposes separate
+Rollout uses an independent `max_num_seqs`, and baseline modes do not consume StreamOPD compatibility fields. The
+reverse width/chunk and Teacher session budget default to startup preflight plans. The matrix exposes separate
 `BASELINE_ROLLOUT_MAX_NUM_SEQS`/`STREAMOPD_ROLLOUT_MAX_NUM_SEQS` and
 `BASELINE_AGENT_LOOP_WORKERS`/`STREAMOPD_AGENT_LOOP_WORKERS` overrides so StreamOPD tuning cannot silently change the
 baseline denominator.
 
 `verl-sync-opd` uses a 2-GPU student pool plus a separate 2-GPU teacher pool. `verl-colocate-opd` is a sync-baseline
 placement ablation configured by `distillation.colocate_teacher_with_student`; it does not enable any StreamOPD code.
+
+## Scheduler ablation
+
+`run_scheduler_ablation.sh` compares the same streaming rollout/Teacher implementation with only the scheduling
+policy changed. `teacher_then_train` waits for complete Teacher drain; `adaptive` admits reverse units from the ready
+queue. Both use the same GPU allocation, model processes, policy barrier, and preflight plan.
+
+The following A100-80GB measurements use one shared Teacher/Trainer GPU plus one rollout GPU, B32, and three policy
+steps. Stable means steps 2-3. Each batch contains 25% short and 75% long trajectories so early-ready work is
+deterministic.
+
+| Total cap | Reverse plan | Drain-first stable mean | Adaptive stable mean | Adaptive speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | B8 / C256 (controlled cap) | 19.82 s | 19.17 s | 1.034x |
+| 2048 | B4 / C512 (controlled cap) | 32.51 s | 26.94 s | 1.207x |
+
+For the 2K case, adaptive starts at 8/32 completed trajectories and uses one-unit reverse quanta with Teacher turns
+between them. It reduces the stable step by 17.13%. The 1K case is short enough that hysteresis mostly converges to
+drain-first behavior, but it no longer regresses as the eager-switch prototype did.
+
+Automatic reverse planning was also checked on B32/1K without batch/chunk caps. The initial memory-first rule chose
+B32/C256: 7.0 GiB fixed backing, 10.58-second actor update, and a 58.32-second first step. Joint chunk-first planning
+chooses B8/C1024: 1.75 GiB backing, 6.78-second actor update, and a 44.91-second first step. This is a 22.99% step
+reduction and demonstrates why memory feasibility alone is not the planner objective.
 
 ## Current 4K result
 

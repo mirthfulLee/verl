@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 import uuid
@@ -26,8 +27,20 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-def _streamopd_batch_sizes(train_batch_size: int, micro_batch_size: int, reverse_batch_size: int) -> list[int]:
+def _streamopd_batch_sizes(
+    train_batch_size: int,
+    micro_batch_size: int,
+    reverse_batch_size: int,
+    *,
+    planned_unit_size: int | None = None,
+) -> list[int]:
     """Return accumulation units with an early reverse-capacity trigger."""
+    if planned_unit_size is not None:
+        if train_batch_size < 1 or planned_unit_size < 1:
+            raise ValueError("planned StreamOPD training unit must be positive")
+        return [
+            min(planned_unit_size, train_batch_size - start) for start in range(0, train_batch_size, planned_unit_size)
+        ]
     if train_batch_size < 1 or micro_batch_size < 1 or reverse_batch_size < 1:
         raise ValueError("StreamOPD batch sizes must be positive")
     if train_batch_size % micro_batch_size:
@@ -42,27 +55,109 @@ def _streamopd_batch_sizes(train_batch_size: int, micro_batch_size: int, reverse
     return sizes
 
 
+def _planned_local_reverse_width(plan_result, fallback: int) -> int:
+    """Extract the conservative rank-local preflight width from a Ray result."""
+
+    widths: list[int] = []
+
+    def visit(value) -> None:
+        if isinstance(value, dict):
+            width = value.get("slot_batch_size")
+            if width is not None and int(width) > 0:
+                widths.append(int(width))
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list | tuple):
+            for nested in value:
+                visit(nested)
+
+    visit(plan_result)
+    return min(widths, default=fallback)
+
+
+def _plan_teacher_admission(
+    *,
+    expected_trajectories: int,
+    trajectory_tokens: int,
+    vllm_capacity_tokens: int,
+    page_size: int,
+    max_batched_tokens: int,
+    initial_chunk_tokens: int,
+    train_launch_width: int,
+    trajectory_cap: int = 0,
+    token_cap: int = 0,
+) -> dict[str, int]:
+    """Choose one stable Teacher cohort before policy version zero."""
+
+    values = (
+        expected_trajectories,
+        trajectory_tokens,
+        vllm_capacity_tokens,
+        page_size,
+        max_batched_tokens,
+        initial_chunk_tokens,
+        train_launch_width,
+    )
+    if any(value < 1 for value in values) or trajectory_cap < 0 or token_cap < 0:
+        raise ValueError("StreamOPD Teacher admission inputs must be positive and caps non-negative")
+    trajectory_tokens = math.ceil(trajectory_tokens / page_size) * page_size
+    if token_cap and token_cap < trajectory_tokens:
+        raise ValueError("StreamOPD Teacher token cap cannot fit one trajectory reservation")
+    # Leave room for vLLM scheduler metadata, output blocks, and page
+    # fragmentation. This derives a static plan from vLLM's profiled blocks;
+    # it is not an allocator query in the policy loop.
+    safe_capacity = max(trajectory_tokens, (vllm_capacity_tokens * 3 // 4 // page_size) * page_size)
+    if token_cap:
+        safe_capacity = min(safe_capacity, token_cap)
+    capacity_width = max(1, safe_capacity // trajectory_tokens)
+    prefill_wave = max(1, max_batched_tokens // min(initial_chunk_tokens, trajectory_tokens))
+    scheduler_width = 2 * prefill_wave
+    width = min(expected_trajectories, capacity_width, scheduler_width)
+    if trajectory_cap:
+        width = min(width, trajectory_cap)
+    if width >= train_launch_width:
+        width = max(train_launch_width, width // train_launch_width * train_launch_width)
+    return {
+        "active_trajectories": width,
+        "active_kv_tokens": width * trajectory_tokens,
+        "vllm_capacity_tokens": vllm_capacity_tokens,
+        "safe_capacity_tokens": safe_capacity,
+        "trajectory_tokens": trajectory_tokens,
+        "prefill_wave": prefill_wave,
+    }
+
+
 @register_trainer("streamopd_colocate")
 class PPOTrainerStreamOPDColocate(PPOTrainer):
-    """Strict two-pool StreamOPD trainer.
+    """Strict placement-aware StreamOPD trainer.
 
-    The actor worker is trainer-only. Rollout is a standalone pool, while the
-    frozen teacher and sharded actor trainer share the global pool. Raw
-    gradients accumulate across rollout microbatches and weights are published
-    only after the final policy-version barrier.
+    The actor worker is trainer-only and rollout is a standalone pool. The
+    frozen Teacher either shares Trainer GPUs or uses a dedicated pool. Raw
+    gradients accumulate across preflight-sized units and weights are
+    published only after the final policy-version barrier.
     """
 
     def __init__(self, config: DictConfig):
         super().__init__(config)
         self._scheduler = None
         self._policy_version: int | None = None
+        self._training_unit_size = 1
+        self._teacher_admission_plan: dict[str, int] = {}
 
     def _setup(self):
         scheduler_name = f"verl-streamopd-scheduler-{uuid.uuid4().hex}"
         with open_dict(self.config.distillation.streamopd_kv):
             self.config.distillation.streamopd_kv.scheduler_actor_name = scheduler_name
+        placement = str(self.config.distillation.streamopd_kv.trainer_placement)
+        teacher_resources = ("teacher_trainer",) if placement == "teacher" else ("teacher",)
+        trainer_resources = ("teacher_trainer",) if placement == "teacher" else ("trainer",)
         self._scheduler = (
-            ray.remote(StreamOPDTaskScheduler).options(name=scheduler_name, lifetime="non_detached").remote()
+            ray.remote(StreamOPDTaskScheduler)
+            .options(
+                name=scheduler_name,
+                lifetime="non_detached",
+            )
+            .remote(teacher_resources, trainer_resources)
         )
         super()._setup()
 
@@ -70,7 +165,42 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         # The standalone rollout pool starts asleep so the initial checkpoint
         # load cannot race with weight publication.
         if self.streamopd_kv_enabled:
-            self.actor_rollout_wg.prepare_streamopd_reverse_plan()
+            plan_result = self.actor_rollout_wg.prepare_streamopd_reverse_plan()
+            fallback = int(self.config.distillation.streamopd_kv.reverse_batch_size)
+            local_width = _planned_local_reverse_width(plan_result, fallback)
+            try:
+                dp_mapping = self.actor_rollout_wg._query_dispatch_info("actor")
+                dp_size = max(dp_mapping) + 1
+            except (AttributeError, ValueError):
+                dp_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+            self._training_unit_size = min(int(self.config.data.train_batch_size), local_width * dp_size)
+            self.parameter_sync_step = len(
+                _streamopd_batch_sizes(
+                    int(self.config.data.train_batch_size),
+                    1,
+                    1,
+                    planned_unit_size=self._training_unit_size,
+                )
+            )
+            stream_config = self.config.distillation.streamopd_kv
+            teacher_config = next(iter(self.config.distillation.teacher_models.values())).inference
+            self._teacher_admission_plan = _plan_teacher_admission(
+                expected_trajectories=int(self.config.data.train_batch_size),
+                trajectory_tokens=int(stream_config.reverse_slot_max_tokens),
+                vllm_capacity_tokens=int(self.teacher_model_manager.collect_kv_cache_capacity_tokens()),
+                page_size=int(stream_config.teacher_prefill_kv_page_size),
+                max_batched_tokens=int(teacher_config.max_num_batched_tokens or teacher_config.max_model_len),
+                initial_chunk_tokens=int(stream_config.teacher_initial_chunk_size),
+                train_launch_width=self._training_unit_size,
+                trajectory_cap=int(stream_config.teacher_prefill_max_active_trajectories),
+                token_cap=int(stream_config.teacher_prefill_max_active_kv_tokens),
+            )
+            with open_dict(stream_config):
+                stream_config.teacher_prefill_max_active_trajectories = self._teacher_admission_plan[
+                    "active_trajectories"
+                ]
+                stream_config.teacher_prefill_max_active_kv_tokens = self._teacher_admission_plan["active_kv_tokens"]
+            logger.info("StreamOPD Teacher admission preflight: %s", self._teacher_admission_plan)
             # Warm the cross-process metrics RPC before the first timed policy
             # step, then reset again at each policy boundary.
             self.actor_rollout_wg.reset_streamopd_memory_stats()
@@ -89,12 +219,17 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             self._scheduler.begin_policy.remote(
                 self._policy_version,
                 int(self.config.data.train_batch_size),
+                str(self.config.distillation.streamopd_kv.scheduler_policy),
+                self._training_unit_size,
             )
         )
         dispatch_started = time.perf_counter()
         metrics = super().prepare_step()
         metrics["streamopd/rollout_dispatch_seconds"] = time.perf_counter() - dispatch_started
         metrics["streamopd/memory_stats_reset_seconds"] = reset_seconds
+        metrics.update(
+            {f"streamopd/teacher_plan_{name}": float(value) for name, value in self._teacher_admission_plan.items()}
+        )
         return metrics
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
@@ -105,15 +240,19 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             train_batch_size,
             int(stream_config.micro_batch_size),
             int(stream_config.reverse_batch_size),
+            planned_unit_size=self._training_unit_size,
         )
         prepare_metrics = self.prepare_step()
         metrics_aggregator = MetricsAggregator()
         if prepare_metrics:
             metrics_aggregator.add_step_metrics(prepare_metrics)
-        if bool(stream_config.posthoc_ablation):
+        if bool(stream_config.posthoc_ablation) or str(stream_config.scheduler_policy) == "teacher_then_train":
             with marked_timer("gen", timing_raw, color="red"):
-                posthoc_wait = self._wait_for_posthoc_ready()
-            metrics_aggregator.add_step_metrics({"streamopd/posthoc_ready_wait_seconds": posthoc_wait})
+                teacher_drain_wait = self._wait_for_teacher_drain()
+            drain_metrics = {"streamopd/teacher_drain_wait_seconds": teacher_drain_wait}
+            if bool(stream_config.posthoc_ablation):
+                drain_metrics["streamopd/posthoc_ready_wait_seconds"] = teacher_drain_wait
+            metrics_aggregator.add_step_metrics(drain_metrics)
         combined_keys: list = []
         combined_tags: list = []
         self._streamopd_runtime_accumulation_steps = len(batch_sizes)
@@ -131,7 +270,7 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         finally:
             del self._streamopd_runtime_accumulation_steps
 
-    def _wait_for_posthoc_ready(self) -> float:
+    def _wait_for_teacher_drain(self) -> float:
         stream_config = self.config.distillation.streamopd_kv
         # This is a coarse global-batch barrier, not latency-sensitive queue
         # arbitration. Avoid flooding the Ray scheduler while rollout workers
@@ -141,10 +280,10 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         started = time.perf_counter()
         while True:
             state = ray.get(self._scheduler.snapshot.remote())
-            if bool(state["posthoc_ready"]):
+            if bool(state["teacher_drained"]):
                 return time.perf_counter() - started
             if time.perf_counter() - started > timeout:
-                raise TimeoutError(f"timed out waiting for post-hoc StreamOPD barrier: {state}")
+                raise TimeoutError(f"timed out waiting for StreamOPD Teacher drain: {state}")
             time.sleep(poll_seconds)
 
     def on_sample_end(self):
@@ -152,24 +291,37 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         # microbatch enters reverse training.
         return
 
+    def get_reward_handles(self):
+        # Direct StreamOPD is validated to use neither task rewards nor policy
+        # gradients. Passing reward workers into AgentLoop would add a
+        # per-trajectory RPC whose output is discarded by the reverse loss.
+        return None
+
     def _update_actor(self, batch, metrics: dict):
         if self._policy_version is None:
             raise RuntimeError("StreamOPD training started outside an active policy step")
-        wait_seconds = self._acquire_training()
+        trajectory_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+        wait_seconds = self._acquire_training(trajectory_count)
         metrics["streamopd/scheduler_wait_seconds"] = wait_seconds
         try:
             return super()._update_actor(batch, metrics)
         finally:
             ray.get(self._scheduler.training_finished.remote(self._policy_version))
 
-    def _acquire_training(self) -> float:
+    def _acquire_training(self, trajectory_count: int) -> float:
         stream_config = self.config.distillation.streamopd_kv
-        threshold = int(stream_config.teacher_priority_threshold)
+        threshold = 0
         poll_seconds = int(stream_config.scheduler_poll_interval_ms) / 1000.0
         timeout = float(stream_config.scheduler_timeout_seconds)
         started = time.perf_counter()
         registered = False
-        ray.get(self._scheduler.training_waiting.remote(self._policy_version, threshold))
+        ray.get(
+            self._scheduler.training_waiting.remote(
+                self._policy_version,
+                threshold,
+                trajectory_count,
+            )
+        )
         registered = True
         try:
             while True:

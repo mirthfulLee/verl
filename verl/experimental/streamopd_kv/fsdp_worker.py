@@ -367,6 +367,20 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._reverse_slot_pool = None
         self._gpu_kv_lease_active = False
         self._kv_prefetch_executor: ThreadPoolExecutor | None = None
+        self._preflight_batch_cap: int | None = None
+        self._preflight_additional_reserve_bytes = 0
+
+    def configure_reverse_preflight(self, *, batch_cap: int | None = None, additional_reserve_gib: float = 0.0) -> None:
+        """Install controller-derived constraints before fixed slots are allocated."""
+
+        if self._reverse_slot_pool is not None:
+            raise RuntimeError("cannot change StreamOPD reverse constraints after slot allocation")
+        if batch_cap is not None and batch_cap < 1:
+            raise ValueError("StreamOPD reverse preflight batch cap must be positive")
+        if additional_reserve_gib < 0:
+            raise ValueError("StreamOPD reverse preflight reserve must be non-negative")
+        self._preflight_batch_cap = batch_cap
+        self._preflight_additional_reserve_bytes = int(additional_reserve_gib * 1024**3)
 
     def _get_kv_prefetch_executor(self) -> ThreadPoolExecutor:
         if self._kv_prefetch_executor is None:
@@ -400,9 +414,12 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
             page_size = int(self.streamopd_config.reverse_page_size)
             token_capacity = math.ceil(int(self.streamopd_config.reverse_slot_max_tokens) / page_size) * page_size
+            configured_batch_size = int(self.streamopd_config.reverse_batch_size)
+            if self._preflight_batch_cap is not None:
+                configured_batch_size = min(configured_batch_size, self._preflight_batch_cap)
             self._reverse_slot_plan = _fixed_reverse_slot_plan(
                 model,
-                configured_batch_size=int(self.streamopd_config.reverse_batch_size),
+                configured_batch_size=configured_batch_size,
                 token_capacity=token_capacity,
                 max_batch_tokens=int(self.streamopd_config.reverse_batch_max_tokens),
                 max_chunk_size=int(self.streamopd_config.reverse_chunk_size),
@@ -410,7 +427,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 page_size=page_size,
                 dtype=forward_dtype,
                 available_memory_bytes=self._reverse_available_memory_bytes or None,
-                reserve_bytes=int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3),
+                reserve_bytes=(
+                    int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
+                    + self._preflight_additional_reserve_bytes
+                ),
             )
             from .oomb_paged_attention import OOMBFixedSlotPool
 

@@ -54,11 +54,17 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         )
     if trainer_placement == "teacher" and config.distillation.n_gpus_per_node > config.trainer.n_gpus_per_node:
         raise ValueError("a Teacher-shared StreamOPD trainer pool must cover every Teacher GPU")
+    if trainer_placement == "rollout" and rollout.n_gpus_per_node > config.trainer.n_gpus_per_node:
+        raise ValueError("a Rollout-shared StreamOPD trainer pool must cover every Rollout GPU")
+    if trainer_placement == "union" and (
+        config.distillation.n_gpus_per_node + rollout.n_gpus_per_node > config.trainer.n_gpus_per_node
+    ):
+        raise ValueError("a union StreamOPD trainer pool must cover disjoint Teacher and Rollout GPU subsets")
     if rollout.n_gpus_per_node < 1:
-        raise ValueError("StreamOPD requires a positive standalone rollout GPU count")
+        raise ValueError("StreamOPD requires a positive Rollout GPU count")
     checkpoint_backend = str(rollout.checkpoint_engine.backend)
     if checkpoint_backend == "naive":
-        raise ValueError("StreamOPD requires a cross-pool checkpoint engine such as host or nccl")
+        raise ValueError("StreamOPD requires a cross-process checkpoint engine such as host or nccl")
 
     train_batch_size = int(config.data.train_batch_size)
     if int(stream_config.get("reverse_slot_max_tokens", 0)) == 0:

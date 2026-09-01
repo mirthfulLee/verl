@@ -1,27 +1,26 @@
 # StreamOPD
 
-StreamOPD is an experimental strict on-policy distillation path for verl V1. Rollout always has an independent pool;
-Teacher and Trainer placement is user-selected:
+StreamOPD is an experimental strict on-policy distillation path for verl V1. Teacher and Rollout remain separate
+model processes; their physical GPU placement relative to Trainer is user-selected:
 
 ```text
-Rollout Pool
-  `- student rollout engine
-
-Teacher Pool                     Trainer placement
-  `- frozen teacher engine       |- teacher: share Teacher GPUs
-                                 `- dedicated: separate Trainer GPUs
+teacher    Trainer spans Teacher GPUs; Rollout is separate
+rollout    Trainer spans Rollout GPUs; Teacher is separate
+union      Trainer spans disjoint Teacher + Rollout subsets
+dedicated  Trainer, Teacher, and Rollout use disjoint GPUs
 ```
 
-The rollout engine remains resident and uses continuous batching. With `trainer_placement=teacher`, both models stay
-loaded and the scheduler serializes their kernels. With `trainer_placement=dedicated`, Teacher and Trainer may run
-concurrently on disjoint resources. The internal trainer registration remains `streamopd_colocate` for compatibility.
+The rollout engine remains resident and uses continuous batching. Shared roles are separate Ray processes in the same
+placement group; model loading is not repeated per unit. The scheduler serializes kernels on intersecting resource
+sets and allows work on disjoint sets to overlap. The internal trainer registration remains `streamopd_colocate` for
+compatibility.
 
 ## Supported envelope
 
 The implementation fails closed outside the following configuration:
 
 - `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd_colocate`;
-- `trainer_placement=teacher` or `dedicated`; rollout/union borrowing is not yet supported;
+- `trainer_placement=teacher`, `rollout`, `union`, or `dedicated` on one node;
 - text-only, single-turn Qwen3 with one frozen teacher;
 - vLLM rollout with TP=1, PP=1, `n=1`, and a non-quantized KV cache;
 - FSDP/FSDP2 student, one PPO epoch, and global `token-mean` aggregation;
@@ -46,7 +45,10 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
    are mutually exclusive; dedicated resources can overlap. `teacher_then_train` is the drain-first baseline.
    `adaptive` launches immediately at one ready reverse width on dedicated GPUs. On shared GPUs it uses a two-width
    admission threshold, one-unit reverse quanta, and a short Teacher grace window to avoid rapid switches and Teacher
-   starvation. Live Teacher sessions refill as earlier trajectories reach EOS; there is no model sleep/wake boundary.
+   starvation. A Rollout-shared Trainer waits for all Rollout EOS because the current KV connector is non-preemptible,
+   then overlaps reverse work with the dedicated Teacher tail. A union Trainer has no remaining disjoint critical-path
+   work after Rollout EOS, so adaptive safely collapses to drain-first. Live Teacher sessions refill as earlier
+   trajectories reach EOS; there is no per-unit model sleep/wake boundary.
 4. `StreamOPDKVConnector` copies completed rollout KV ranges from live vLLM pages into the host cache before EOS.
    Multiple generating or sealed microbatches may be host-resident, while each trainer worker may hold exactly one GPU
    KV lease. A bounded prefetch queue reads the next host snapshot while the current reverse unit executes. Within the
@@ -57,9 +59,10 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
    depth. Completed suffix chunks leave the wavefront, and dK/dV continues into earlier chunks.
 6. Before policy version zero, vLLM reports its profiled KV block capacity and the trainer measures reusable memory
    once. Preflight derives a stable Teacher session budget, fixed `B_slot`, page-aligned `T_slot`, chunk size, and
-   accumulation count. Reverse candidates prefer the largest feasible chunk and then the largest batch at that chunk;
-   this avoids memory-feasible wide batches that force inefficient shallow tiles. The hot path performs no allocator
-   query, OOM retry, tensor growth, or kernel-shape adaptation.
+   accumulation count. For Rollout-shared GPUs it also budgets complete non-preemptible Rollout KV, model weights,
+   runtime workspace, and checkpoint sender/receiver buffers; it caps reverse group tokens before allocating slots.
+   Reverse candidates prefer the largest feasible chunk and then the largest batch at that chunk. The hot path performs
+   no allocator query, OOM retry, tensor growth, or kernel-shape adaptation.
 7. Raw gradients accumulate across the complete global batch. Parameters stay at `theta_k` until all rollout,
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
@@ -91,8 +94,8 @@ remain available for controlled ablations.
 ## Post-hoc ablation
 
 Set `distillation.streamopd_kv.posthoc_ablation=true` to isolate the value of Teacher chunk streaming and early
-reverse training. This mode preserves the same two GPU pools, rollout KV connector, host KV cache, reverse kernels,
-microbatch sizes, and strict policy barrier. It changes only the Teacher/Trainer schedule:
+reverse training. This mode preserves the configured placement, rollout KV connector, host KV cache, reverse kernels,
+preflight plan, and strict policy barrier. It changes only the Teacher/Trainer schedule:
 
 1. each trajectory sends no Teacher request before EOS;
 2. as soon as that individual trajectory reaches EOS, it immediately submits one complete `prompt + response`

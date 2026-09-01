@@ -1,8 +1,8 @@
 # StreamOPD benchmark
 
-The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD always uses a
-standalone rollout pool. `trainer_placement=teacher` shares Teacher GPUs and serializes their kernels;
-`trainer_placement=dedicated` uses separate Teacher and Trainer pools and permits real concurrency.
+The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD exposes four physical
+placements: Trainer can share Teacher GPUs, share Rollout GPUs, span disjoint Teacher+Rollout subsets (`union`), or
+use dedicated GPUs. Teacher and Rollout remain separate resident model processes in every placement.
 
 ## Environment
 
@@ -55,6 +55,23 @@ Automatic reverse planning was also checked on B32/1K without batch/chunk caps. 
 B32/C256: 7.0 GiB fixed backing, 10.58-second actor update, and a 58.32-second first step. Joint chunk-first planning
 chooses B8/C1024: 1.75 GiB backing, 6.78-second actor update, and a 44.91-second first step. This is a 22.99% step
 reduction and demonstrates why memory feasibility alone is not the planner objective.
+
+Placement-aware scheduling was also measured with automatic startup plans:
+
+| Placement | Batch / cap | Distinct GPUs | Drain-first | Adaptive | Result |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `teacher` | B128 / 4096 | 3 | 122.51 s | 113.77 s | 1.077x |
+| `rollout` | B32 / 2048 | 2 | 26.22 s | 24.17 s | 1.085x |
+| `union` | B32 / 2048 | 2 | 22.46 s | topology fallback | drain-first |
+
+The B128/4K shared-Teacher run uses two Trainer/Teacher GPUs and one Rollout GPU. Adaptive starts at Teacher 32/128
+and Rollout 69/128, reducing the stable step by 7.13%. The Rollout-shared run starts only after Rollout 32/32 EOS,
+then overlaps reverse with a Teacher tail (1.69-2.12 seconds), reducing the stable mean by 7.81%.
+
+In `union`, Trainer needs both the Teacher and Rollout subsets. An interleaving probe was 0.24% slower than
+drain-first because no post-EOS compute can overlap; the scheduler now derives this from the resource topology and
+records `streamopd/scheduler_topology_fallback=1` while executing the drain-first policy. On Rollout-shared GPUs,
+preflight reserves full non-preemptible KV plus checkpoint buffers and caps the B32/2K reverse plan at B4/C1024.
 
 ## Current 4K result
 

@@ -543,10 +543,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.prepare_reverse_plan()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def configure_streamopd_reverse_preflight(self, batch_cap=None, additional_reserve_gib=0.0):
+        if self.actor is None or not hasattr(self.actor, "configure_reverse_preflight"):
+            return None
+        self.actor.configure_reverse_preflight(
+            batch_cap=batch_cap,
+            additional_reserve_gib=additional_reserve_gib,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset_streamopd_memory_stats(self):
         if self.actor is None:
             return None
         get_torch_device().reset_peak_memory_stats()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_streamopd_device_memory_stats(self):
+        device_module = get_torch_device()
+        free_bytes, total_bytes = device_module.mem_get_info()
+        return {
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "allocated_bytes": int(device_module.memory_allocated()),
+            "reserved_bytes": int(device_module.memory_reserved()),
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):

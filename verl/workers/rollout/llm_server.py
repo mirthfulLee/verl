@@ -537,6 +537,8 @@ class LLMServerManager:
         worker_group (RayWorkerGroup): Worker group for the server replicas. If not none, init hybrid server,
             else init standalone server with a new resource pool.
         rollout_resource_pool (RayResourcePool): Resource pool for the server replicas, only needed for TensorRT-LLM.
+        colocate_without_worker_group (bool): Launch separate rollout worker processes in ``rollout_resource_pool``
+            instead of creating a standalone placement group.
         start_rank (int): First ``replica_rank`` to assign.  Defaults to 0.
         load_balancer_cls: Optional subclass of
             :class:`GlobalRequestLoadBalancer` to use as the routing actor
@@ -551,6 +553,7 @@ class LLMServerManager:
         config: DictConfig,
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
+        colocate_without_worker_group: bool = False,
         start_rank: int = 0,
         load_balancer_cls: type | None = None,
     ):
@@ -559,9 +562,12 @@ class LLMServerManager:
         self.model_config = config.actor_rollout_ref.model
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
+        self.colocate_without_worker_group = colocate_without_worker_group
         self.start_rank = start_rank
         self._load_balancer_cls = load_balancer_cls or GlobalRequestLoadBalancer
 
+        if colocate_without_worker_group and rollout_resource_pool is None:
+            raise ValueError("colocate_without_worker_group requires rollout_resource_pool")
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
         # for recipe to change
@@ -611,11 +617,12 @@ class LLMServerManager:
                 * self.rollout_config.data_parallel_size
                 * self.rollout_config.pipeline_model_parallel_size
             )
-        world_size = (
-            self.worker_group.world_size
-            if self.worker_group
-            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
-        )
+        if self.worker_group:
+            world_size = self.worker_group.world_size
+        elif self.colocate_without_worker_group:
+            world_size = self.rollout_resource_pool.world_size
+        else:
+            world_size = self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         num_replicas = world_size // rollout_world_size
 
         self.rollout_replicas = [
@@ -637,6 +644,10 @@ class LLMServerManager:
                     server.init_hybrid_colocated(self.worker_group, self.rollout_resource_pool)
                     for server in self.rollout_replicas
                 ]
+            )
+        elif self.colocate_without_worker_group:
+            await asyncio.gather(
+                *[server.init_colocated(self.rollout_resource_pool) for server in self.rollout_replicas]
             )
         else:
             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])

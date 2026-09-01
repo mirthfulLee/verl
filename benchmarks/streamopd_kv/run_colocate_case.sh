@@ -85,7 +85,7 @@ case "$MODE" in
     export TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
     export CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-null}
     ;;
-  streamopd|streamopd-adaptive|streamopd-teacher-then-train|streamopd-dedicated|streamopd-dedicated-baseline|streamopd-posthoc|streamopd-posthoc-legacy|streamopd-posthoc-fixed|streamopd-posthoc-fixed-wide)
+  streamopd|streamopd-adaptive|streamopd-teacher-then-train|streamopd-rollout|streamopd-rollout-baseline|streamopd-union|streamopd-union-baseline|streamopd-dedicated|streamopd-dedicated-baseline|streamopd-posthoc|streamopd-posthoc-legacy|streamopd-posthoc-fixed|streamopd-posthoc-fixed-wide)
     export TRAINER_MODE=streamopd_colocate STREAMOPD_KV_ENABLED=True
     export STUDENT_GPUS=${STUDENT_GPUS:-2}
     export TEACHER_GPUS=${TEACHER_GPUS:-$STUDENT_GPUS}
@@ -111,8 +111,14 @@ case "$MODE" in
     if [[ $MODE == streamopd-posthoc* ]]; then
       POSTHOC_ABLATION=True
     fi
-    if [[ $MODE == streamopd-teacher-then-train || $MODE == streamopd-dedicated-baseline ]]; then
+    if [[ $MODE == streamopd-teacher-then-train || $MODE == streamopd-rollout-baseline || $MODE == streamopd-union-baseline || $MODE == streamopd-dedicated-baseline ]]; then
       STREAMOPD_SCHEDULER_POLICY=teacher_then_train
+    fi
+    if [[ $MODE == streamopd-rollout || $MODE == streamopd-rollout-baseline ]]; then
+      TRAINER_PLACEMENT=rollout
+    fi
+    if [[ $MODE == streamopd-union || $MODE == streamopd-union-baseline ]]; then
+      TRAINER_PLACEMENT=union
     fi
     if [[ $MODE == streamopd-dedicated || $MODE == streamopd-dedicated-baseline ]]; then
       TRAINER_PLACEMENT=dedicated

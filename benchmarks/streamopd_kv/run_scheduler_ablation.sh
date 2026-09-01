@@ -13,6 +13,12 @@ case "$TRAINER_PLACEMENT" in
   dedicated)
     modes=(streamopd-dedicated-baseline streamopd-dedicated)
     ;;
+  rollout)
+    modes=(streamopd-rollout-baseline streamopd-rollout)
+    ;;
+  union)
+    modes=(streamopd-union-baseline streamopd-union)
+    ;;
   *)
     echo "Unsupported TRAINER_PLACEMENT=$TRAINER_PLACEMENT" >&2
     exit 2

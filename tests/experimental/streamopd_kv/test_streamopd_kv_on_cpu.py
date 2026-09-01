@@ -541,6 +541,20 @@ def test_rollout_manager_aggregates_vllm_worker_memory_stats() -> None:
     }
 
 
+def test_vllm_worker_reports_profiled_kv_capacity() -> None:
+    from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
+
+    worker = SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks=17, block_size=32))
+    assert vLLMColocateWorkerExtension.get_kv_cache_capacity(worker) == {
+        "num_gpu_blocks": 17,
+        "block_size": 32,
+        "capacity_tokens": 544,
+    }
+    worker.cache_config.num_gpu_blocks = None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        vLLMColocateWorkerExtension.get_kv_cache_capacity(worker)
+
+
 def test_snapshot_lifecycle_teacher_coverage_and_version_barrier() -> None:
     key = TrajectoryKey(3, "trajectory")
     layout = KVLayout(num_layers=1, num_kv_heads=2, head_dim=4, dtype="float32", page_size=16)
@@ -917,6 +931,19 @@ def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
         worker.train_mini_batch(TensorDict({}, batch_size=[]))
 
 
+def test_reverse_preflight_constraints_are_installed_before_slot_allocation() -> None:
+    worker = StreamOPDKVTrainingWorker.__new__(StreamOPDKVTrainingWorker)
+    worker._reverse_slot_pool = None
+    worker._preflight_batch_cap = None
+    worker._preflight_additional_reserve_bytes = 0
+    worker.configure_reverse_preflight(batch_cap=4, additional_reserve_gib=1.25)
+    assert worker._preflight_batch_cap == 4
+    assert worker._preflight_additional_reserve_bytes == int(1.25 * 1024**3)
+    worker._reverse_slot_pool = object()
+    with pytest.raises(RuntimeError, match="after slot allocation"):
+        worker.configure_reverse_preflight(batch_cap=2)
+
+
 def test_vllm_nhd_page_extraction_preserves_logical_token_order() -> None:
     cache = torch.arange(3 * 2 * 4 * 2 * 3).reshape(3, 2, 4, 2, 3)
     extracted = extract_vllm_nhd_tokens(cache, block_ids=[2, 0], block_size=4, num_tokens=6)
@@ -1052,6 +1079,27 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     dedicated.distillation.n_gpus_per_node = 3
     prepare_streamopd_kv_config(dedicated)
 
+    rollout_shared = copy.deepcopy(config)
+    rollout_shared.distillation.streamopd_kv.trainer_placement = "rollout"
+    prepare_streamopd_kv_config(rollout_shared)
+
+    oversized_rollout = copy.deepcopy(rollout_shared)
+    oversized_rollout.actor_rollout_ref.rollout.n_gpus_per_node = 3
+    with pytest.raises(ValueError, match="cover every Rollout GPU"):
+        prepare_streamopd_kv_config(oversized_rollout)
+
+    union = copy.deepcopy(config)
+    union.trainer.n_gpus_per_node = 4
+    union.distillation.streamopd_kv.trainer_placement = "union"
+    prepare_streamopd_kv_config(union)
+
+    undersized_union = copy.deepcopy(union)
+    undersized_union.trainer.n_gpus_per_node = 3
+    undersized_union.distillation.n_gpus_per_node = 2
+    undersized_union.actor_rollout_ref.rollout.n_gpus_per_node = 2
+    with pytest.raises(ValueError, match="disjoint Teacher and Rollout"):
+        prepare_streamopd_kv_config(undersized_union)
+
     baseline_placement_flag = copy.deepcopy(config)
     baseline_placement_flag.distillation.colocate_teacher_with_student = True
     with pytest.raises(ValueError, match="sync-baseline option"):
@@ -1108,10 +1156,14 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
         scheduler.teacher_enqueued(8)
 
 
-def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches() -> None:
+def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(tmp_path) -> None:
     from verl.trainer.ppo.v1.trainer_streamopd_colocate import (
+        _checkpoint_weight_bytes,
+        _minimum_device_total_bytes,
+        _plan_shared_rollout_memory,
         _plan_teacher_admission,
         _planned_local_reverse_width,
+        _rollout_kv_bytes_per_token,
         _streamopd_batch_sizes,
     )
 
@@ -1166,6 +1218,37 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
             train_launch_width=4,
             token_cap=2048,
         )
+
+    assert _minimum_device_total_bytes([{"total_bytes": 80 * 1024**3}, [{"total_bytes": 79 * 1024**3}]]) == 79 * 1024**3
+    rollout_plan = _plan_shared_rollout_memory(
+        total_memory_bytes=80 * 1024**3,
+        weight_bytes=4 * 1024**3,
+        kv_bytes_per_token=128 * 1024,
+        max_num_seqs=32,
+        max_model_len=1024,
+        configured_utilization=0.65,
+    )
+    assert 0.18 <= rollout_plan["gpu_memory_utilization"] < 0.25
+    assert rollout_plan["kv_gib"] == 4.0
+    with pytest.raises(ValueError, match="cannot hold model"):
+        _plan_shared_rollout_memory(
+            total_memory_bytes=80 * 1024**3,
+            weight_bytes=4 * 1024**3,
+            kv_bytes_per_token=128 * 1024,
+            max_num_seqs=32,
+            max_model_len=1024,
+            configured_utilization=0.1,
+        )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors.index.json").write_text('{"metadata": {"total_size": 12345}}')
+    (model_dir / "config.json").write_text(
+        '{"num_hidden_layers": 4, "num_key_value_heads": 2, '
+        '"num_attention_heads": 8, "hidden_size": 512, "head_dim": 64}'
+    )
+    assert _checkpoint_weight_bytes(str(model_dir)) == 12345
+    assert _rollout_kv_bytes_per_token(str(model_dir), "bfloat16") == 4 * 2 * 64 * 2 * 2
 
 
 def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
@@ -1506,6 +1589,18 @@ def test_streamopd_trainer_does_not_expose_unused_reward_handles() -> None:
 
     trainer = PPOTrainerStreamOPDColocate.__new__(PPOTrainerStreamOPDColocate)
     assert trainer.get_reward_handles() is None
+
+
+def test_union_topology_falls_back_to_drain_first_policy() -> None:
+    from verl.trainer.ppo.v1.trainer_streamopd_colocate import PPOTrainerStreamOPDColocate
+
+    trainer = PPOTrainerStreamOPDColocate.__new__(PPOTrainerStreamOPDColocate)
+    trainer.config = OmegaConf.create(
+        {"distillation": {"streamopd_kv": {"trainer_placement": "union", "scheduler_policy": "adaptive"}}}
+    )
+    assert trainer._effective_scheduler_policy() == "teacher_then_train"
+    trainer.config.distillation.streamopd_kv.trainer_placement = "rollout"
+    assert trainer._effective_scheduler_policy() == "adaptive"
 
 
 def test_vllm_connector_waits_for_claimed_copy_event_and_ignores_unclaimed_request() -> None:

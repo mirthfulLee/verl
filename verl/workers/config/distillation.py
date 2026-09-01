@@ -235,9 +235,9 @@ class StreamOPDKVConfig(BaseConfig):
     # reverse work until every trajectory in the global batch is scored.
     posthoc_ablation: bool = False
     # Physical GPU allocation is user-controlled. ``teacher`` colocates the
-    # fixed-topology trainer with Teacher vLLM; ``dedicated`` gives each role
-    # its own pool. Rollout/union borrowing is not enabled until their stable
-    # trainer process groups are available.
+    # fixed-topology trainer with Teacher vLLM; ``rollout`` colocates separate
+    # rollout processes on Trainer GPUs; ``union`` spans disjoint Teacher and
+    # Rollout subsets; ``dedicated`` gives each role its own pool.
     trainer_placement: str = "teacher"
     # ``teacher_then_train`` is the work-conserving scheduler baseline: keep
     # streaming Teacher scoring, but delay all reverse units until Teacher
@@ -335,8 +335,10 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
         if self.posthoc_ablation and self.teacher_terminal_only_after_initial:
             raise ValueError("posthoc_ablation is incompatible with teacher_terminal_only_after_initial")
-        if self.trainer_placement not in {"teacher", "dedicated"}:
-            raise NotImplementedError("streamopd_kv.trainer_placement currently supports 'teacher' and 'dedicated'")
+        if self.trainer_placement not in {"teacher", "rollout", "union", "dedicated"}:
+            raise NotImplementedError(
+                "streamopd_kv.trainer_placement supports 'teacher', 'rollout', 'union', and 'dedicated'"
+            )
         if self.scheduler_policy not in {"adaptive", "teacher_then_train"}:
             raise ValueError("streamopd_kv.scheduler_policy must be 'adaptive' or 'teacher_then_train'")
         if self.enabled and self.rollout_backend != "vllm":

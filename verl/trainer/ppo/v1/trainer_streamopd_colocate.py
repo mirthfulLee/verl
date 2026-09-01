@@ -13,18 +13,108 @@ import math
 import os
 import time
 import uuid
+from pathlib import Path
 
 import ray
 from omegaconf import DictConfig, open_dict
 from transfer_queue import KVBatchMeta
 
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
+from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.trainer.ppo.v1.utils import MetricsAggregator
 from verl.utils.debug import marked_timer
+from verl.workers.rollout.llm_server import LLMServerManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _checkpoint_weight_bytes(model_path: str) -> int:
+    """Read the local safetensors payload size without loading model tensors."""
+
+    root = Path(model_path)
+    index = root / "model.safetensors.index.json"
+    if index.exists():
+        import json
+
+        payload = json.loads(index.read_text())
+        total_size = int(payload.get("metadata", {}).get("total_size", 0))
+        if total_size > 0:
+            return total_size
+    shards = list(root.glob("*.safetensors"))
+    if shards:
+        return sum(path.stat().st_size for path in shards)
+    raise ValueError(f"cannot determine safetensors weight size for shared Rollout model: {model_path}")
+
+
+def _rollout_kv_bytes_per_token(model_path: str, dtype: str) -> int:
+    """Return one TP=1 causal KV token's byte footprint from HF config."""
+
+    import json
+
+    config = json.loads((Path(model_path) / "config.json").read_text())
+    layers = int(config["num_hidden_layers"])
+    kv_heads = int(config.get("num_key_value_heads", config["num_attention_heads"]))
+    hidden_size = int(config["hidden_size"])
+    query_heads = int(config["num_attention_heads"])
+    head_dim = int(config.get("head_dim", hidden_size // query_heads))
+    dtype_bytes = 4 if str(dtype).lower() in {"float32", "fp32"} else 2
+    return layers * kv_heads * head_dim * 2 * dtype_bytes
+
+
+def _plan_shared_rollout_memory(
+    *,
+    total_memory_bytes: int,
+    weight_bytes: int,
+    kv_bytes_per_token: int,
+    max_num_seqs: int,
+    max_model_len: int,
+    configured_utilization: float,
+) -> dict[str, float]:
+    """Reserve enough vLLM memory to avoid preemption on Trainer-shared GPUs."""
+
+    if min(total_memory_bytes, weight_bytes, kv_bytes_per_token, max_num_seqs, max_model_len) < 1:
+        raise ValueError("shared Rollout memory planning inputs must be positive")
+    if not 0 < configured_utilization <= 1:
+        raise ValueError("Rollout gpu_memory_utilization must be in (0, 1]")
+    kv_bytes = kv_bytes_per_token * max_num_seqs * max_model_len
+    runtime_reserve = max(2 * 1024**3, weight_bytes * 3 // 20)
+    required_bytes = math.ceil((weight_bytes + kv_bytes + runtime_reserve) * 1.15)
+    required_utilization = max(0.18, math.ceil(required_bytes / total_memory_bytes * 1000) / 1000)
+    if required_utilization > configured_utilization:
+        raise ValueError(
+            "shared Rollout memory cap cannot hold model plus non-preemptible KV: "
+            f"required={required_utilization:.3f}, configured={configured_utilization:.3f}"
+        )
+    return {
+        "gpu_memory_utilization": required_utilization,
+        "weight_gib": weight_bytes / (1024**3),
+        "kv_gib": kv_bytes / (1024**3),
+        "runtime_reserve_gib": runtime_reserve / (1024**3),
+        "required_gib": required_bytes / (1024**3),
+        "max_num_seqs": float(max_num_seqs),
+        "max_model_len": float(max_model_len),
+    }
+
+
+def _minimum_device_total_bytes(value) -> int:
+    totals: list[int] = []
+
+    def visit(item) -> None:
+        if isinstance(item, dict):
+            if int(item.get("total_bytes", 0)) > 0:
+                totals.append(int(item["total_bytes"]))
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list | tuple):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    if not totals:
+        raise RuntimeError("StreamOPD Trainer workers returned no device memory capacity")
+    return min(totals)
 
 
 def _streamopd_batch_sizes(
@@ -131,10 +221,10 @@ def _plan_teacher_admission(
 class PPOTrainerStreamOPDColocate(PPOTrainer):
     """Strict placement-aware StreamOPD trainer.
 
-    The actor worker is trainer-only and rollout is a standalone pool. The
-    frozen Teacher either shares Trainer GPUs or uses a dedicated pool. Raw
-    gradients accumulate across preflight-sized units and weights are
-    published only after the final policy-version barrier.
+    The actor worker is trainer-only. Teacher and Rollout remain independent
+    model processes whose GPU resource sets may intersect Trainer. Raw
+    gradients accumulate across preflight-sized units and weights are published
+    only after the final policy-version barrier.
     """
 
     def __init__(self, config: DictConfig):
@@ -143,14 +233,36 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         self._policy_version: int | None = None
         self._training_unit_size = 1
         self._teacher_admission_plan: dict[str, int] = {}
+        self._rollout_memory_plan: dict[str, float] = {}
+        self._shared_reverse_batch_cap: int | None = None
+        self._shared_reverse_reserve_gib = 0.0
+
+    def _effective_scheduler_policy(self) -> str:
+        configured = str(self.config.distillation.streamopd_kv.scheduler_policy)
+        placement = str(self.config.distillation.streamopd_kv.trainer_placement)
+        # Union Trainer work cannot begin before Rollout EOS and then shares
+        # the remaining Teacher resource. No compute overlap is possible, so
+        # interleaving only adds switches to an otherwise serial tail.
+        if configured == "adaptive" and placement == "union":
+            return "teacher_then_train"
+        return configured
 
     def _setup(self):
         scheduler_name = f"verl-streamopd-scheduler-{uuid.uuid4().hex}"
         with open_dict(self.config.distillation.streamopd_kv):
             self.config.distillation.streamopd_kv.scheduler_actor_name = scheduler_name
         placement = str(self.config.distillation.streamopd_kv.trainer_placement)
-        teacher_resources = ("teacher_trainer",) if placement == "teacher" else ("teacher",)
-        trainer_resources = ("teacher_trainer",) if placement == "teacher" else ("trainer",)
+        if placement == "teacher":
+            teacher_resources = trainer_resources = ("teacher_trainer",)
+        elif placement == "union":
+            teacher_resources = ("teacher",)
+            trainer_resources = ("teacher", "rollout")
+        elif placement == "rollout":
+            teacher_resources = ("teacher",)
+            trainer_resources = ("rollout_trainer",)
+        else:
+            teacher_resources = ("teacher",)
+            trainer_resources = ("trainer",)
         self._scheduler = (
             ray.remote(StreamOPDTaskScheduler)
             .options(
@@ -161,10 +273,91 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         )
         super()._setup()
 
+    def _create_llm_server_manager(self, actor_rollout_resource_pool) -> LLMServerManager:
+        placement = str(self.config.distillation.streamopd_kv.trainer_placement)
+        if placement not in {"rollout", "union"}:
+            return super()._create_llm_server_manager(actor_rollout_resource_pool)
+
+        rollout = self.config.actor_rollout_ref.rollout
+        total_memory = _minimum_device_total_bytes(self.actor_rollout_wg.get_streamopd_device_memory_stats())
+        model_path = str(self.actor_model_config.local_path or self.actor_model_config.path)
+        rollout_world_size = int(rollout.n_gpus_per_node) * int(rollout.nnodes)
+        replica_world_size = (
+            int(rollout.tensor_model_parallel_size)
+            * int(rollout.data_parallel_size)
+            * int(rollout.pipeline_model_parallel_size)
+        )
+        if rollout_world_size < replica_world_size or rollout_world_size % replica_world_size:
+            raise ValueError("Rollout GPU allocation must contain a whole number of inference replicas")
+        num_replicas = rollout_world_size // replica_world_size
+        configured_max_num_seqs = int(rollout.max_num_seqs)
+        effective_max_num_seqs = min(
+            configured_max_num_seqs,
+            math.ceil(int(self.config.data.train_batch_size) / num_replicas),
+        )
+        max_model_len = int(
+            rollout.max_model_len or (self.config.data.max_prompt_length + self.config.data.max_response_length + 1)
+        )
+        self._rollout_memory_plan = _plan_shared_rollout_memory(
+            total_memory_bytes=total_memory,
+            weight_bytes=_checkpoint_weight_bytes(model_path),
+            kv_bytes_per_token=_rollout_kv_bytes_per_token(model_path, str(rollout.dtype)),
+            max_num_seqs=effective_max_num_seqs,
+            max_model_len=max_model_len,
+            configured_utilization=float(rollout.gpu_memory_utilization),
+        )
+        checkpoint_config = rollout.checkpoint_engine
+        original_bucket_mb = int(checkpoint_config.update_weights_bucket_megabytes)
+        shared_bucket_mb = min(original_bucket_mb, 128)
+        sync_reserve_gib = max(1.0, 2 * shared_bucket_mb / 1024)
+        self._rollout_memory_plan.update(
+            {
+                "checkpoint_bucket_mb": float(shared_bucket_mb),
+                "checkpoint_sync_reserve_gib": sync_reserve_gib,
+                "configured_max_num_seqs": float(configured_max_num_seqs),
+            }
+        )
+        with open_dict(rollout):
+            rollout.gpu_memory_utilization = self._rollout_memory_plan["gpu_memory_utilization"]
+            rollout.max_num_seqs = effective_max_num_seqs
+            checkpoint_config.update_weights_bucket_megabytes = shared_bucket_mb
+        stream_config = self.config.distillation.streamopd_kv
+        slot_tokens = int(stream_config.reverse_slot_max_tokens)
+        max_group_tokens = min(8192, int(stream_config.reverse_batch_max_tokens))
+        max_rows = max(1, max_group_tokens // slot_tokens)
+        self._shared_reverse_batch_cap = 1 << (max_rows.bit_length() - 1)
+        self._shared_reverse_reserve_gib = sync_reserve_gib
+        self._rollout_memory_plan["reverse_batch_cap"] = float(self._shared_reverse_batch_cap)
+
+        rollout_offset = int(self.config.distillation.n_gpus_per_node) if placement == "union" else 0
+        if rollout_offset or rollout_world_size < actor_rollout_resource_pool.world_size:
+            split_sizes = []
+            if rollout_offset:
+                split_sizes.append(rollout_offset)
+            split_sizes.append(rollout_world_size)
+            remainder = actor_rollout_resource_pool.world_size - rollout_offset - rollout_world_size
+            if remainder:
+                split_sizes.append(remainder)
+            pools = split_resource_pool(actor_rollout_resource_pool, split_size=split_sizes)
+            rollout_resource_pool = pools[1 if rollout_offset else 0]
+        else:
+            rollout_resource_pool = actor_rollout_resource_pool
+        logger.info("StreamOPD shared Rollout memory preflight: %s", self._rollout_memory_plan)
+        return LLMServerManager.create(
+            config=self.config,
+            worker_group=None,
+            rollout_resource_pool=rollout_resource_pool,
+            colocate_without_worker_group=True,
+        )
+
     def on_init_end(self):
-        # The standalone rollout pool starts asleep so the initial checkpoint
-        # load cannot race with weight publication.
+        # All shape and memory plans are frozen before the first policy version.
         if self.streamopd_kv_enabled:
+            if self._shared_reverse_batch_cap is not None:
+                self.actor_rollout_wg.configure_streamopd_reverse_preflight(
+                    batch_cap=self._shared_reverse_batch_cap,
+                    additional_reserve_gib=self._shared_reverse_reserve_gib,
+                )
             plan_result = self.actor_rollout_wg.prepare_streamopd_reverse_plan()
             fallback = int(self.config.distillation.streamopd_kv.reverse_batch_size)
             local_width = _planned_local_reverse_width(plan_result, fallback)
@@ -219,7 +412,7 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             self._scheduler.begin_policy.remote(
                 self._policy_version,
                 int(self.config.data.train_batch_size),
-                str(self.config.distillation.streamopd_kv.scheduler_policy),
+                self._effective_scheduler_policy(),
                 self._training_unit_size,
             )
         )
@@ -229,6 +422,12 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         metrics["streamopd/memory_stats_reset_seconds"] = reset_seconds
         metrics.update(
             {f"streamopd/teacher_plan_{name}": float(value) for name, value in self._teacher_admission_plan.items()}
+        )
+        metrics.update(
+            {f"streamopd/rollout_plan_{name}": float(value) for name, value in self._rollout_memory_plan.items()}
+        )
+        metrics["streamopd/scheduler_topology_fallback"] = float(
+            self._effective_scheduler_policy() != str(self.config.distillation.streamopd_kv.scheduler_policy)
         )
         return metrics
 
@@ -246,7 +445,7 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         metrics_aggregator = MetricsAggregator()
         if prepare_metrics:
             metrics_aggregator.add_step_metrics(prepare_metrics)
-        if bool(stream_config.posthoc_ablation) or str(stream_config.scheduler_policy) == "teacher_then_train":
+        if bool(stream_config.posthoc_ablation) or self._effective_scheduler_policy() == "teacher_then_train":
             with marked_timer("gen", timing_raw, color="red"):
                 teacher_drain_wait = self._wait_for_teacher_drain()
             drain_metrics = {"streamopd/teacher_drain_wait_seconds": teacher_drain_wait}
@@ -287,8 +486,7 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             time.sleep(poll_seconds)
 
     def on_sample_end(self):
-        # Rollout owns a separate pool and remains resident while this
-        # microbatch enters reverse training.
+        # Placement-aware admission happens immediately before actor update.
         return
 
     def get_reward_handles(self):
@@ -301,12 +499,28 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         if self._policy_version is None:
             raise RuntimeError("StreamOPD training started outside an active policy step")
         trajectory_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+        metrics["streamopd/rollout_pool_wait_seconds"] = self._wait_for_shared_rollout_idle()
         wait_seconds = self._acquire_training(trajectory_count)
         metrics["streamopd/scheduler_wait_seconds"] = wait_seconds
         try:
             return super()._update_actor(batch, metrics)
         finally:
             ray.get(self._scheduler.training_finished.remote(self._policy_version))
+
+    def _wait_for_shared_rollout_idle(self) -> float:
+        if str(self.config.distillation.streamopd_kv.trainer_placement) not in {"rollout", "union"}:
+            return 0.0
+        stream_config = self.config.distillation.streamopd_kv
+        poll_seconds = max(int(stream_config.scheduler_poll_interval_ms) / 1000.0, 0.01)
+        timeout = float(stream_config.scheduler_timeout_seconds)
+        started = time.perf_counter()
+        while True:
+            state = ray.get(self._scheduler.snapshot.remote())
+            if int(state["terminal_trajectories"]) == int(state["expected_trajectories"]):
+                return time.perf_counter() - started
+            if time.perf_counter() - started > timeout:
+                raise TimeoutError(f"timed out waiting for Trainer-shared Rollout pool to become idle: {state}")
+            time.sleep(poll_seconds)
 
     def _acquire_training(self, trajectory_count: int) -> float:
         stream_config = self.config.distillation.streamopd_kv
@@ -364,5 +578,7 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
 
     def _get_n_gpus_for_throughput(self) -> int:
         trainer_gpus = self.resource_pool_manager.get_n_gpus()
+        if str(self.config.distillation.streamopd_kv.trainer_placement) in {"rollout", "union"}:
+            return trainer_gpus
         rollout = self.config.actor_rollout_ref.rollout
         return trainer_gpus + rollout.n_gpus_per_node * rollout.nnodes

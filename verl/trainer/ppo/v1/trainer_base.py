@@ -349,7 +349,7 @@ class PPOTrainer(ABC):
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             streamopd_teacher_colocated = bool(
                 self.trainer_mode == "streamopd_colocate"
-                and self.config.distillation.streamopd_kv.get("trainer_placement", "teacher") == "teacher"
+                and self.config.distillation.streamopd_kv.get("trainer_placement", "teacher") in {"teacher", "union"}
             )
             teacher_colocated = (
                 streamopd_teacher_colocated
@@ -375,16 +375,11 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
-        dedicated_streamopd_rollout = self.trainer_mode == "streamopd_colocate"
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config,
-            worker_group=None if dedicated_streamopd_rollout else self.actor_rollout_wg,
-            rollout_resource_pool=None if dedicated_streamopd_rollout else actor_rollout_resource_pool,
-        )
+        self.llm_server_manager: LLMServerManager = self._create_llm_server_manager(actor_rollout_resource_pool)
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        if not dedicated_streamopd_rollout:
+        if self.trainer_mode != "streamopd_colocate":
             checkpoint_engine_config.backend = "naive"
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -396,11 +391,21 @@ class PPOTrainer(ABC):
         # Hybrid replicas must release memory before the colocated actor loads a
         # checkpoint. A dedicated StreamOPD rollout lives on another pool and
         # keeps its weight buffers resident for the initial distributed sync.
-        if not dedicated_streamopd_rollout:
+        if self.trainer_mode != "streamopd_colocate":
             self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
+
+    def _create_llm_server_manager(self, actor_rollout_resource_pool) -> LLMServerManager:
+        """Create rollout servers; placement-aware trainers may override this hook."""
+
+        dedicated_streamopd_rollout = self.trainer_mode == "streamopd_colocate"
+        return LLMServerManager.create(
+            config=self.config,
+            worker_group=None if dedicated_streamopd_rollout else self.actor_rollout_wg,
+            rollout_resource_pool=None if dedicated_streamopd_rollout else actor_rollout_resource_pool,
+        )
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
@@ -686,6 +691,7 @@ class PPOTrainer(ABC):
     def _init_tokenizer(self):
         """Initialize tokenizer and processor from the model config."""
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
+        self.actor_model_config = model_config
         self.tokenizer = model_config.tokenizer
         # Used for multimodal LLM, could be None
         self.processor = model_config.processor
@@ -836,7 +842,7 @@ class PPOTrainer(ABC):
 
             streamopd_teacher_colocation = bool(
                 self.trainer_mode == "streamopd_colocate"
-                and distillation_config.streamopd_kv.get("trainer_placement", "teacher") == "teacher"
+                and distillation_config.streamopd_kv.get("trainer_placement", "teacher") in {"teacher", "union"}
             )
             if streamopd_teacher_colocation or baseline_teacher_colocation:
                 self.mapping[Role.TeacherModel] = global_pool_id

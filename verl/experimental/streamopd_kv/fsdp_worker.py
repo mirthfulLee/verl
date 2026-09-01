@@ -511,7 +511,6 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
         finalize = accumulation_step == accumulation_steps - 1
-
         # Read sealed KV into host memory ahead of the reverse unit.  This
         # queue is intentionally bounded by reverse units rather than
         # trajectories: the trainer still owns at most one GPU KV lease, while
@@ -649,6 +648,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                             loss_fns,
                             backward_context=backward_context,
                             stage1_release=release_stage1_snapshots,
+                            release_stage1_kv_after_copy=bool(self.streamopd_config.release_stage1_kv_after_copy),
                         )
                     max_parallel_trajectories = max(max_parallel_trajectories, result.max_parallel_trajectories)
                     lm_head_tokens += result.lm_head_tokens

@@ -229,18 +229,14 @@ class StreamOPDKVConfig(BaseConfig):
     enabled: bool = False
     token_chunk_size: int = 256
     teacher_initial_chunk_size: int = 256
+    teacher_first_chunk_includes_prompt: bool = True
     teacher_terminal_only_after_initial: bool = False
     reverse_chunk_size: int = 256
     reverse_chunk_min_size: int = 64
     reverse_page_size: int = 64
     reverse_batch_size: int = 16
     reverse_batch_max_tokens: int = 32768
-    overlap_rollout_training: bool = False
     micro_batch_size: int = 32
-    # Legacy same-pool overlap setting. Dedicated streamopd_colocate uses the
-    # trainer/teacher micro_batch_size above.
-    rollout_micro_batch_size: int = 32
-    colocate_teacher_with_student: bool = False
     teacher_priority_threshold: int = 0
     scheduler_poll_interval_ms: int = 10
     scheduler_timeout_seconds: float = 600.0
@@ -258,6 +254,7 @@ class StreamOPDKVConfig(BaseConfig):
     kv_prefetch_depth: int = 1
     kv_prefetch_workers: int = 2
     kv_prefetch_pin_memory: bool = True
+    release_stage1_kv_after_copy: bool = True
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
     rollout_backend: str = "vllm"
     exact_dense_attention: bool = True
@@ -277,7 +274,6 @@ class StreamOPDKVConfig(BaseConfig):
             "reverse_batch_size",
             "reverse_batch_max_tokens",
             "micro_batch_size",
-            "rollout_micro_batch_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
             "teacher_prefill_max_active_trajectories",
@@ -352,6 +348,9 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    # Generic V1 sync-baseline placement option. StreamOPD has a dedicated
+    # rollout pool and always shares the trainer pool with its teacher.
+    colocate_teacher_with_student: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

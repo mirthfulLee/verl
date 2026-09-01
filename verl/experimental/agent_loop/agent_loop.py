@@ -535,6 +535,9 @@ class AgentLoopWorker:
                 self.llm_client.streamopd_terminal_only_after_initial = bool(
                     streamopd_config.get("teacher_terminal_only_after_initial", False)
                 )
+                self.llm_client.streamopd_first_chunk_includes_prompt = bool(
+                    streamopd_config.get("teacher_first_chunk_includes_prompt", True)
+                )
                 self.llm_client.streamopd_page_size = int(streamopd_config.get("teacher_prefill_kv_page_size", 64))
         else:
             self.streamopd_config = {}

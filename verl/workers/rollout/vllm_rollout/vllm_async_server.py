@@ -746,6 +746,7 @@ class vLLMHttpServer:
         streamopd_chunk_size: Optional[int] = None,
         streamopd_terminal_only_after_initial: bool = False,
         streamopd_page_size: int = 1,
+        streamopd_first_chunk_includes_prompt: bool = True,
         prompt_logprobs_start: int = 0,
         prompt_logprobs_as_tensors: bool = False,
     ) -> TokenOutput:
@@ -787,6 +788,7 @@ class vLLMHttpServer:
                 submit=submit_streamopd_chunk,
                 terminal_only_after_initial=streamopd_terminal_only_after_initial,
                 page_size=streamopd_page_size,
+                first_chunk_includes_prompt=streamopd_first_chunk_includes_prompt,
             )
             kv_transfer_params = dict(kv_transfer_params or {})
             kv_transfer_params.update(

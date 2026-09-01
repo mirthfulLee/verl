@@ -121,14 +121,14 @@ async def test_committed_chunk_publisher_emits_only_accepted_contiguous_tokens()
     async def submit(chunk) -> None:
         emitted.append(chunk)
 
-    publisher = CommittedChunkPublisher(TrajectoryKey(4, "req"), [1, 2], chunk_size=2, submit=submit)
+    publisher = CommittedChunkPublisher(TrajectoryKey(4, "req"), [1, 2], chunk_size=4, submit=submit)
     await publisher.observe([10])
     await publisher.observe([10, 11, 12])
     await publisher.observe([10, 11, 12, 13], terminal=True)
 
     assert [(chunk.start, chunk.token_ids, chunk.terminal) for chunk in emitted] == [
-        (0, (10, 11, 12), False),
-        (3, (13,), True),
+        (0, (10, 11), False),
+        (2, (12, 13), True),
     ]
     assert emitted[0].prompt_ids == (1, 2)
     assert emitted[1].prompt_ids == ()
@@ -151,9 +151,9 @@ async def test_committed_chunk_publisher_streams_every_complete_chunk_before_eos
     await publisher.observe([10, 11, 12, 13, 14, 15])
 
     assert [(chunk.start, chunk.end, chunk.terminal) for chunk in emitted] == [
-        (0, 2, False),
-        (2, 4, False),
-        (4, 6, False),
+        (0, 1, False),
+        (1, 3, False),
+        (3, 5, False),
     ]
 
 
@@ -167,19 +167,59 @@ async def test_committed_chunk_publisher_sends_longest_page_aligned_progress() -
     publisher = CommittedChunkPublisher(
         TrajectoryKey(4, "page-aligned"),
         [1],
-        chunk_size=2,
+        chunk_size=8,
         page_size=4,
         submit=submit,
     )
     await publisher.observe(list(range(7)))
-    await publisher.observe(list(range(10)))
-    await publisher.observe(list(range(11)), terminal=True)
+    await publisher.observe(list(range(12)))
+    await publisher.observe(list(range(13)), terminal=True)
 
     assert [(chunk.start, chunk.end, chunk.terminal) for chunk in emitted] == [
-        (0, 4, False),
-        (4, 8, False),
-        (8, 11, True),
+        (0, 8, False),
+        (8, 13, True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_committed_publisher_long_prompt_starts_after_one_aligned_page() -> None:
+    emitted = []
+
+    async def submit(chunk: CommittedTokenChunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(
+        TrajectoryKey(4, "long-prompt"),
+        list(range(12)),
+        chunk_size=8,
+        page_size=4,
+        submit=submit,
+    )
+    await publisher.observe([10, 11, 12])
+    assert emitted == []
+    await publisher.observe([10, 11, 12, 13])
+    assert [(chunk.start, chunk.end) for chunk in emitted] == [(0, 4)]
+
+
+@pytest.mark.asyncio
+async def test_committed_publisher_can_ablate_prompt_in_first_chunk_budget() -> None:
+    emitted = []
+
+    async def submit(chunk: CommittedTokenChunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(
+        TrajectoryKey(4, "response-only-budget"),
+        list(range(12)),
+        chunk_size=8,
+        page_size=4,
+        first_chunk_includes_prompt=False,
+        submit=submit,
+    )
+    await publisher.observe(list(range(4)))
+    assert emitted == []
+    await publisher.observe(list(range(8)))
+    assert [(chunk.start, chunk.end) for chunk in emitted] == [(0, 8)]
 
 
 @pytest.mark.asyncio
@@ -323,7 +363,7 @@ async def test_committed_publisher_can_emit_one_early_chunk_then_terminal_catch_
     publisher = CommittedChunkPublisher(
         TrajectoryKey(5, "terminal-catch-up"),
         [1, 2],
-        2,
+        4,
         submit,
         terminal_only_after_initial=True,
     )
@@ -707,14 +747,18 @@ def test_zero_loss_synthetic_padding_is_not_trainable() -> None:
     assert _has_valid_response(TensorDict({"response_mask": padding}, batch_size=[])) is False
 
 
-def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
+def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> None:
     config = OmegaConf.create(
         {
             "trainer": {
                 "use_v1": True,
-                "n_gpus_per_node": 4,
+                "n_gpus_per_node": 2,
                 "nnodes": 1,
-                "v1": {"trainer_mode": "sync", "sync": {}},
+                "v1": {
+                    "trainer_mode": "streamopd_colocate",
+                    "streamopd_colocate": {"micro_batch_size": 1, "parameter_sync_step": 1},
+                    "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
+                },
             },
             "data": {"train_batch_size": 128},
             "actor_rollout_ref": {
@@ -722,6 +766,9 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
                     "name": "vllm",
                     "tensor_model_parallel_size": 1,
                     "pipeline_model_parallel_size": 1,
+                    "nnodes": 1,
+                    "n_gpus_per_node": 2,
+                    "checkpoint_engine": {"backend": "nccl"},
                     "engine_kwargs": {},
                 },
                 "actor": {
@@ -734,7 +781,11 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
             "distillation": {
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
-                "streamopd_kv": {"enabled": True, "kv_handoff_dir": "/tmp/test-streamopd"},
+                "streamopd_kv": {
+                    "enabled": True,
+                    "kv_handoff_dir": "/tmp/test-streamopd",
+                    "micro_batch_size": 16,
+                },
                 "distillation_loss": {
                     "loss_mode": "forward_kl_topk",
                     "use_policy_gradient": False,
@@ -747,61 +798,45 @@ def test_prepare_config_installs_connector_and_rejects_stale_trainer() -> None:
     connector = config.actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config
     assert connector.kv_connector == "StreamOPDKVConnector"
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
-
-    overlap_config = copy.deepcopy(config)
-    overlap_config.distillation.streamopd_kv.overlap_rollout_training = True
-    overlap_config.distillation.streamopd_kv.rollout_micro_batch_size = 32
-    prepare_streamopd_kv_config(overlap_config)
-    assert overlap_config.trainer.v1.sync.parameter_sync_step == 4
-
-    colocated_config = copy.deepcopy(config)
-    colocated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
-    prepare_streamopd_kv_config(colocated_config)
-
-    dedicated_config = copy.deepcopy(config)
-    dedicated_config.trainer.n_gpus_per_node = 2
-    dedicated_config.trainer.v1.trainer_mode = "streamopd_colocate"
-    dedicated_config.trainer.v1.streamopd_colocate = {"micro_batch_size": 1, "parameter_sync_step": 1}
-    dedicated_config.trainer.v1.sampler = {
-        "max_off_policy_threshold": 8,
-        "max_off_policy_strategy": "drop",
-    }
-    dedicated_config.actor_rollout_ref.rollout.nnodes = 1
-    dedicated_config.actor_rollout_ref.rollout.n_gpus_per_node = 2
-    dedicated_config.actor_rollout_ref.rollout.checkpoint_engine = {"backend": "nccl"}
-    dedicated_config.distillation.streamopd_kv.colocate_teacher_with_student = True
-    dedicated_config.distillation.streamopd_kv.micro_batch_size = 16
-    prepare_streamopd_kv_config(dedicated_config)
-    assert dedicated_config.trainer.v1.streamopd_colocate.micro_batch_size == 16
-    assert dedicated_config.trainer.v1.streamopd_colocate.parameter_sync_step == 8
-    assert dedicated_config.trainer.v1.sampler.max_off_policy_threshold == 1
-    assert dedicated_config.trainer.v1.sampler.max_off_policy_strategy == "drop"
+    assert config.trainer.v1.streamopd_colocate.micro_batch_size == 16
+    assert config.trainer.v1.streamopd_colocate.parameter_sync_step == 8
+    assert config.trainer.v1.sampler.max_off_policy_threshold == 1
+    assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
 
     reverse_trigger_config = copy.deepcopy(config)
-    reverse_trigger_config.trainer.v1.trainer_mode = "streamopd_colocate"
-    reverse_trigger_config.trainer.v1.streamopd_colocate = {"micro_batch_size": 1, "parameter_sync_step": 1}
-    reverse_trigger_config.distillation.streamopd_kv.colocate_teacher_with_student = True
     reverse_trigger_config.distillation.streamopd_kv.micro_batch_size = 32
     reverse_trigger_config.distillation.streamopd_kv.reverse_batch_size = 16
-    reverse_trigger_config.trainer.n_gpus_per_node = 2
-    reverse_trigger_config.actor_rollout_ref.rollout.nnodes = 1
-    reverse_trigger_config.actor_rollout_ref.rollout.n_gpus_per_node = 2
-    reverse_trigger_config.actor_rollout_ref.rollout.checkpoint_engine = {"backend": "nccl"}
-    reverse_trigger_config.trainer.v1.sampler = {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"}
     prepare_streamopd_kv_config(reverse_trigger_config)
     assert reverse_trigger_config.trainer.v1.streamopd_colocate.parameter_sync_step == 4
 
-    config.trainer.v1.trainer_mode = "separate_async"
-    with pytest.raises(ValueError, match="sync or streamopd_colocate"):
-        prepare_streamopd_kv_config(config)
+    stale_config = copy.deepcopy(config)
+    stale_config.trainer.v1.trainer_mode = "sync"
+    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd_colocate"):
+        prepare_streamopd_kv_config(stale_config)
 
 
-def test_streamopd_colocate_starts_with_reverse_capacity_cohort() -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd_colocate import _streamopd_batch_sizes
+def test_prepare_config_does_not_mutate_sync_baseline() -> None:
+    config = OmegaConf.create(
+        {
+            "trainer": {"use_v1": True, "v1": {"trainer_mode": "sync", "sync": {}}},
+            "distillation": {
+                "colocate_teacher_with_student": True,
+                "streamopd_kv": {"enabled": False, "kv_handoff_dir": "/tmp/unused"},
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "engine_kwargs": {"vllm": {"enforce_eager": True}},
+                    "checkpoint_engine": {"backend": "naive"},
+                }
+            },
+        }
+    )
+    before = OmegaConf.to_container(config, resolve=False)
 
-    assert _streamopd_batch_sizes(128, 32, 16) == [16, 32, 32, 32, 16]
-    assert _streamopd_batch_sizes(128, 16, 16) == [16] * 8
-    assert _streamopd_batch_sizes(128, 32, 64) == [32] * 4
+    prepare_streamopd_kv_config(config)
+
+    assert OmegaConf.to_container(config, resolve=False) == before
+    assert "kv_transfer_config" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
 def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
@@ -828,6 +863,13 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
     assert metrics["streamopd/scheduler_pool_busy_seconds"] >= 0
     with pytest.raises(RuntimeError, match="no active policy"):
         scheduler.teacher_enqueued(8)
+
+
+def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches() -> None:
+    from verl.trainer.ppo.v1.trainer_streamopd_colocate import _streamopd_batch_sizes
+
+    assert _streamopd_batch_sizes(32, 16, 16) == [16, 16]
+    assert _streamopd_batch_sizes(128, 32, 16) == [16, 32, 32, 32, 16]
 
 
 def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
@@ -899,6 +941,19 @@ def test_teacher_session_reservation_is_held_until_eos() -> None:
     scheduler.teacher_session_released(13, "b")
     scheduler.teacher_session_released(13, "c")
     scheduler.end_policy(13)
+
+
+def test_teacher_session_slot_refills_after_eos() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(15)
+    assert scheduler.try_teacher_session_admitted(15, "a", 10, 2, 20) is True
+    assert scheduler.try_teacher_session_admitted(15, "b", 10, 2, 20) is True
+    assert scheduler.try_teacher_session_admitted(15, "c", 10, 2, 20) is False
+    scheduler.teacher_session_released(15, "a")
+    assert scheduler.try_teacher_session_admitted(15, "c", 10, 2, 20) is True
+    scheduler.teacher_session_released(15, "b")
+    scheduler.teacher_session_released(15, "c")
+    scheduler.end_policy(15)
 
 
 @pytest.mark.asyncio

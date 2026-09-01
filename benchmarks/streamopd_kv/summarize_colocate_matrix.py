@@ -52,6 +52,12 @@ METRICS = (
     "streamopd/scheduler_training_units",
     "streamopd/scheduler_max_training_waiters",
     "streamopd/scheduler_max_teacher_pending",
+    "streamopd/scheduler_max_teacher_active",
+    "streamopd/scheduler_max_teacher_sessions",
+    "streamopd/scheduler_max_teacher_session_kv_tokens",
+    "streamopd/scheduler_teacher_busy_seconds",
+    "streamopd/scheduler_training_busy_seconds",
+    "streamopd/scheduler_pool_busy_seconds",
     "streamopd/scheduler_policy_seconds",
     "training/off_policy/trajectory_staleness/max",
     "training/off_policy/trajectory_spans/max",
@@ -64,7 +70,7 @@ def _format(value: float | None, precision: int = 2) -> str:
 
 def write_markdown(path: Path, runs: dict[str, dict]) -> None:
     rows = [
-        "# StreamOPD-colocate benchmark",
+        "# StreamOPD benchmark",
         "",
         "| Total tokens | Mode | Microbatch | Step (s) | Tokens/s | Actor peak (GiB) | vs sync | vs colocate |",
         "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -148,7 +154,9 @@ def main() -> None:
                 "total_trajectory_tokens": int(match.group("tokens")),
                 # Legacy baseline files carried an mb32 suffix even though
                 # sync paths never consumed the StreamOPD trainer microbatch.
-                "micro_batch_size": int(microbatch) if mode == "streamopd-colocate" and microbatch else None,
+                "micro_batch_size": (
+                    int(microbatch) if mode in {"streamopd", "streamopd-colocate"} and microbatch else None
+                ),
                 "status": "ok" if steps else "failed",
                 "steps": steps,
                 "stable_step": steps[-1] if steps else {},

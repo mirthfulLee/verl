@@ -347,7 +347,10 @@ class PPOTrainer(ABC):
         if self.use_teacher_policy:
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            if self.config.distillation.streamopd_kv.colocate_teacher_with_student:
+            teacher_colocated = self.trainer_mode == "streamopd_colocate" or bool(
+                self.config.distillation.get("colocate_teacher_with_student", False)
+            )
+            if teacher_colocated:
                 teacher_world_size = sum(
                     teacher.world_size for teacher in self.distillation_config.teacher_models.values()
                 )
@@ -816,7 +819,16 @@ class PPOTrainer(ABC):
             if distillation_config.nnodes <= 0:
                 raise ValueError("config.distillation.nnodes must be greater than 0")
 
-            if distillation_config.streamopd_kv.get("colocate_teacher_with_student", False):
+            baseline_teacher_colocation = bool(distillation_config.get("colocate_teacher_with_student", False))
+            if baseline_teacher_colocation:
+                if self.trainer_mode != "sync":
+                    raise ValueError("distillation.colocate_teacher_with_student is supported by V1 sync only")
+                if config.trainer.nnodes != 1 or distillation_config.nnodes != 1:
+                    raise NotImplementedError("teacher/student baseline colocation currently supports one node only")
+                if distillation_config.n_gpus_per_node >= config.trainer.n_gpus_per_node:
+                    raise ValueError("colocated teacher GPU count must be smaller than the student pool GPU count")
+
+            if self.trainer_mode == "streamopd_colocate" or baseline_teacher_colocation:
                 self.mapping[Role.TeacherModel] = global_pool_id
             else:
                 teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
@@ -1555,12 +1567,7 @@ class PPOTrainer(ABC):
         return required_multiple
 
     def _optimizer_updates_per_global_step(self) -> int:
-        overlap_rollout_training = bool(
-            OmegaConf.select(self.config, "distillation.streamopd_kv.overlap_rollout_training", default=False)
-        )
-        if getattr(self, "streamopd_kv_enabled", False) and (
-            overlap_rollout_training or getattr(self, "trainer_mode", None) == "streamopd_colocate"
-        ):
+        if getattr(self, "streamopd_kv_enabled", False) and getattr(self, "trainer_mode", None) == "streamopd_colocate":
             return 1
         return self.parameter_sync_step
 

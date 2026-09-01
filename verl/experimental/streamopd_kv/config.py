@@ -16,20 +16,12 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
 
     stream_config = config.distillation.get("streamopd_kv", {})
     trainer_mode = config.trainer.v1.trainer_mode if config.trainer.use_v1 else None
-    dedicated_colocate = trainer_mode == "streamopd_colocate"
-    if stream_config.get("colocate_teacher_with_student", False):
-        if not config.trainer.use_v1 or trainer_mode not in ("sync", "streamopd_colocate"):
-            raise ValueError("teacher/student colocation requires verl V1 sync or streamopd_colocate trainer")
-        if config.trainer.nnodes != 1 or config.distillation.nnodes != 1:
-            raise NotImplementedError("StreamOPD teacher/student colocation currently supports one node only")
-        if not dedicated_colocate and config.distillation.n_gpus_per_node >= config.trainer.n_gpus_per_node:
-            raise ValueError("colocated teacher GPU count must be smaller than the student pool GPU count")
     if not stream_config.get("enabled", False):
-        if dedicated_colocate:
+        if trainer_mode == "streamopd_colocate":
             raise ValueError("trainer_mode=streamopd_colocate requires distillation.streamopd_kv.enabled=true")
         return
-    if not config.trainer.use_v1 or trainer_mode not in ("sync", "streamopd_colocate"):
-        raise ValueError("strict StreamOPD-KV requires verl V1 sync or streamopd_colocate trainer")
+    if not config.trainer.use_v1 or trainer_mode != "streamopd_colocate":
+        raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd_colocate")
     rollout = config.actor_rollout_ref.rollout
     if rollout.name != "vllm":
         raise NotImplementedError("StreamOPD-KV MVP supports the vLLM rollout backend only")
@@ -50,53 +42,31 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
             "StreamOPD-KV MVP requires direct distillation-only forward_kl_topk: "
             "loss_mode=forward_kl_topk, use_policy_gradient=false, use_task_rewards=false"
         )
+    if config.trainer.nnodes != 1 or rollout.nnodes != 1 or config.distillation.nnodes != 1:
+        raise NotImplementedError("StreamOPD currently supports one node only")
+    if config.trainer.n_gpus_per_node != config.distillation.n_gpus_per_node:
+        raise ValueError("StreamOPD requires teacher and trainer pools to use the same GPU count")
+    if rollout.n_gpus_per_node < 1:
+        raise ValueError("StreamOPD requires a positive standalone rollout GPU count")
+    checkpoint_backend = str(rollout.checkpoint_engine.backend)
+    if checkpoint_backend == "naive":
+        raise ValueError("StreamOPD requires a cross-pool checkpoint engine such as host or nccl")
 
-    if dedicated_colocate:
-        if not stream_config.get("colocate_teacher_with_student", False):
-            raise ValueError("streamopd_colocate requires colocate_teacher_with_student=true")
-        if config.trainer.nnodes != 1 or rollout.nnodes != 1 or config.distillation.nnodes != 1:
-            raise NotImplementedError("streamopd_colocate currently supports one node only")
-        if config.trainer.n_gpus_per_node != config.distillation.n_gpus_per_node:
-            raise ValueError("streamopd_colocate requires teacher and trainer pools to use the same GPU count")
-        if rollout.n_gpus_per_node < 1:
-            raise ValueError("streamopd_colocate requires a positive standalone rollout GPU count")
-        checkpoint_backend = str(rollout.checkpoint_engine.backend)
-        if checkpoint_backend == "naive":
-            raise ValueError("streamopd_colocate requires a cross-pool checkpoint engine such as host or nccl")
-
-        train_batch_size = int(config.data.train_batch_size)
-        micro_batch_size = int(stream_config.get("micro_batch_size", 0))
-        if micro_batch_size < 1 or train_batch_size % micro_batch_size:
-            raise ValueError(
-                "StreamOPD-colocate requires data.train_batch_size to be divisible by streamopd_kv.micro_batch_size"
-            )
-        accumulation_steps = train_batch_size // micro_batch_size
-        with open_dict(config.trainer.v1.streamopd_colocate):
-            config.trainer.v1.streamopd_colocate.micro_batch_size = micro_batch_size
-            config.trainer.v1.streamopd_colocate.parameter_sync_step = accumulation_steps
-        with open_dict(config.trainer.v1.sampler):
-            # ReplayBuffer measures the number of policy versions spanned by a
-            # trajectory. A strict single-version trajectory therefore has span 1.
-            config.trainer.v1.sampler.max_off_policy_threshold = 1
-            # Only one exact-size policy cohort is ever submitted. ``drop`` allows
-            # finished microbatches to train while the rest of that same cohort is
-            # still rolling out; the policy barrier prevents a stale cohort from
-            # ever being submitted.
-            config.trainer.v1.sampler.max_off_policy_strategy = "drop"
-
-    elif stream_config.get("overlap_rollout_training", False):
-        train_batch_size = int(config.data.train_batch_size)
-        rollout_micro_batch_size = int(stream_config.get("rollout_micro_batch_size", 0))
-        if rollout_micro_batch_size < 1 or train_batch_size % rollout_micro_batch_size:
-            raise ValueError(
-                "StreamOPD overlap requires data.train_batch_size to be divisible by "
-                "streamopd_kv.rollout_micro_batch_size"
-            )
-        accumulation_steps = train_batch_size // rollout_micro_batch_size
-        if accumulation_steps < 2:
-            raise ValueError("StreamOPD overlap requires at least two rollout microbatches")
-        with open_dict(config.trainer.v1.sync):
-            config.trainer.v1.sync.parameter_sync_step = accumulation_steps
+    train_batch_size = int(config.data.train_batch_size)
+    micro_batch_size = int(stream_config.get("micro_batch_size", 0))
+    if micro_batch_size < 1 or train_batch_size % micro_batch_size:
+        raise ValueError("StreamOPD requires data.train_batch_size to be divisible by streamopd_kv.micro_batch_size")
+    accumulation_steps = train_batch_size // micro_batch_size
+    with open_dict(config.trainer.v1.streamopd_colocate):
+        config.trainer.v1.streamopd_colocate.micro_batch_size = micro_batch_size
+        config.trainer.v1.streamopd_colocate.parameter_sync_step = accumulation_steps
+    with open_dict(config.trainer.v1.sampler):
+        # ReplayBuffer measures the number of policy versions spanned by a
+        # trajectory. A strict single-version trajectory therefore has span 1.
+        config.trainer.v1.sampler.max_off_policy_threshold = 1
+        # Finished microbatches can train while the rest of the fixed policy
+        # batch is still rolling out; the policy barrier rejects stale work.
+        config.trainer.v1.sampler.max_off_policy_strategy = "drop"
 
     engine_kwargs = rollout.get("engine_kwargs")
     if engine_kwargs is None:

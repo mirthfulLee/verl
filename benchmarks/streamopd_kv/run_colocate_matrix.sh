@@ -28,7 +28,7 @@ for total_tokens in $TOKEN_LENGTHS; do
     run_case "$baseline" "$total_tokens" 32
   done
   for microbatch in $MICROBATCH_SIZES; do
-    run_case streamopd-colocate "$total_tokens" "$microbatch"
+    run_case streamopd "$total_tokens" "$microbatch"
   done
 done
 

@@ -255,6 +255,7 @@ class Qwen3ReverseTrainer:
         release_processed_suffix: bool = True,
         backward_context: Callable[[int, int], AbstractContextManager] | None = None,
         stage1_release: Callable[[], None] | None = None,
+        release_stage1_kv_after_copy: bool = True,
     ) -> ReverseTrainingResult:
         """Run ragged trajectories in reverse-depth wavefront batches."""
 
@@ -291,9 +292,18 @@ class Qwen3ReverseTrainer:
         ]
         from .oomb_paged_attention import OOMBFlashWavefrontState
 
+        state = OOMBFlashWavefrontState(padded_trajectories)
+        # The contiguous state now owns the complete Stage-1 trace. Drop the
+        # caller's rollout-KV references before reverse kernels start; keeping
+        # them alive would duplicate the whole group for the duration of
+        # backward and prevents future suffix-slot reuse.
+        if release_stage1_kv_after_copy:
+            for trace in layers:
+                for layer in trace:
+                    layer.key = layer.key[:, :, :0]
+                    layer.value = layer.value[:, :, :0]
         if stage1_release is not None:
             stage1_release()
-        state = OOMBFlashWavefrontState(padded_trajectories)
 
         schedule = _build_reverse_wavefront(sequence_lengths, self.chunk_size)
         compact_masks = [

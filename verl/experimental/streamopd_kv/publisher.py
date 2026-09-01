@@ -19,8 +19,10 @@ class CommittedChunkPublisher:
     vLLM and SGLang expose cumulative accepted output IDs while streaming.
     Rejected speculative tokens never appear in that list.  A non-prefix update
     therefore indicates a backend contract violation and fails closed. In the
-    normal mode every complete chunk is submitted immediately; terminal-only
-    catch-up is retained as an explicit ablation for older workloads.
+    normal mode every complete teacher-input chunk is submitted immediately;
+    the first chunk budget includes the prompt, while later resumable chunks
+    contain only new response tokens. Terminal-only catch-up is retained as an
+    explicit ablation for older workloads.
     """
 
     def __init__(
@@ -31,6 +33,7 @@ class CommittedChunkPublisher:
         submit: Callable[[CommittedTokenChunk], Awaitable[None]],
         terminal_only_after_initial: bool = False,
         page_size: int = 1,
+        first_chunk_includes_prompt: bool = True,
     ) -> None:
         if chunk_size < 1 or page_size < 1:
             raise ValueError("chunk_size and page_size must be positive")
@@ -40,9 +43,23 @@ class CommittedChunkPublisher:
         self.submit = submit
         self.terminal_only_after_initial = terminal_only_after_initial
         self.page_size = page_size
+        self.first_chunk_includes_prompt = first_chunk_includes_prompt
         self._accepted: tuple[int, ...] = ()
         self._emitted = 0
         self._terminal = False
+
+    def _next_response_threshold(self) -> int:
+        """Return the response tokens needed for the next teacher prefill.
+
+        The first request contains both the prompt and response prefix, so
+        its configured input budget includes ``len(prompt_ids)``. Resumable
+        requests contain only new response tokens and therefore use the full
+        chunk size as their delta budget.
+        """
+
+        if self._emitted == 0 and self.first_chunk_includes_prompt:
+            return max(1, self.chunk_size - len(self.prompt_ids))
+        return self.chunk_size
 
     async def observe(self, accepted_token_ids: Sequence[int], *, terminal: bool = False) -> None:
         if self._terminal:
@@ -53,17 +70,19 @@ class CommittedChunkPublisher:
         self._accepted = accepted
 
         terminal_sent = False
-        while len(self._accepted) - self._emitted >= self.chunk_size and (
-            not self.terminal_only_after_initial or self._emitted == 0
-        ):
-            end = len(self._accepted)
-            if not terminal:
-                end = end // self.page_size * self.page_size
-            if end <= self._emitted:
+        while not self.terminal_only_after_initial or self._emitted == 0:
+            threshold = self._next_response_threshold()
+            available = len(self._accepted) - self._emitted
+            aligned_threshold = ((threshold + self.page_size - 1) // self.page_size) * self.page_size
+            required = threshold if terminal else aligned_threshold
+            if available < required:
                 break
+            end = len(self._accepted) if terminal else self._emitted + aligned_threshold
             chunk_is_terminal = terminal and end == len(self._accepted)
             await self._emit(end, terminal=chunk_is_terminal)
             terminal_sent = terminal_sent or chunk_is_terminal
+            if terminal:
+                break
 
         if terminal and self._emitted < len(self._accepted):
             await self._emit(len(self._accepted), terminal=True)

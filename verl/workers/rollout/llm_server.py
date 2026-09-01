@@ -308,6 +308,11 @@ class LLMServerClient:
                     "streamopd_terminal_only_after_initial",
                     False,
                 )
+                kwargs["streamopd_first_chunk_includes_prompt"] = getattr(
+                    self,
+                    "streamopd_first_chunk_includes_prompt",
+                    True,
+                )
                 kwargs["streamopd_page_size"] = getattr(self, "streamopd_page_size", 1)
             multimodal_kwargs = {}
             if audio_data is not None:

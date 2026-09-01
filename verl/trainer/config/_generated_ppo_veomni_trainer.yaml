@@ -842,21 +842,20 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  colocate_teacher_with_student: false
   streamopd_kv:
     _target_: verl.workers.config.StreamOPDKVConfig
     enabled: false
     token_chunk_size: 256
     teacher_initial_chunk_size: 256
+    teacher_first_chunk_includes_prompt: true
     teacher_terminal_only_after_initial: false
     reverse_chunk_size: 256
     reverse_chunk_min_size: 64
     reverse_page_size: 64
     reverse_batch_size: 16
     reverse_batch_max_tokens: 32768
-    overlap_rollout_training: false
     micro_batch_size: 32
-    rollout_micro_batch_size: 32
-    colocate_teacher_with_student: false
     teacher_priority_threshold: 0
     scheduler_poll_interval_ms: 10
     scheduler_timeout_seconds: 600.0
@@ -868,6 +867,7 @@ distillation:
     kv_prefetch_depth: 1
     kv_prefetch_workers: 2
     kv_prefetch_pin_memory: true
+    release_stage1_kv_after_copy: true
     kv_handoff_dir: /tmp/verl-streamopd-kv
     rollout_backend: vllm
     exact_dense_attention: true

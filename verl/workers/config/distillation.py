@@ -231,11 +231,19 @@ class StreamOPDKVConfig(BaseConfig):
     teacher_initial_chunk_size: int = 256
     teacher_first_chunk_includes_prompt: bool = True
     teacher_terminal_only_after_initial: bool = False
+    # Ablation: submit one complete prompt+response at EOS and defer all
+    # reverse work until every trajectory in the global batch is scored.
+    posthoc_ablation: bool = False
     reverse_chunk_size: int = 256
     reverse_chunk_min_size: int = 64
     reverse_page_size: int = 64
     reverse_batch_size: int = 16
     reverse_batch_max_tokens: int = 32768
+    # Persistent K/V/dK/dV rows planned and allocated before policy version 0.
+    # A zero token limit is resolved from data.max_prompt/response_length.
+    reverse_fixed_slots: bool = True
+    reverse_slot_max_tokens: int = 0
+    reverse_slot_reserve_gib: float = 4.0
     micro_batch_size: int = 32
     teacher_priority_threshold: int = 0
     scheduler_poll_interval_ms: int = 10
@@ -252,7 +260,7 @@ class StreamOPDKVConfig(BaseConfig):
     # GPU lease remains limited to one reverse microbatch; depth only controls
     # how many sealed host snapshots may be in flight.
     kv_prefetch_depth: int = 1
-    kv_prefetch_workers: int = 2
+    kv_prefetch_workers: int = 4
     kv_prefetch_pin_memory: bool = True
     release_stage1_kv_after_copy: bool = True
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
@@ -294,12 +302,18 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.teacher_prefill_kv_page_size must be a power of two")
         if self.reverse_chunk_size % self.reverse_page_size or self.reverse_chunk_min_size % self.reverse_page_size:
             raise ValueError("StreamOPD reverse chunk sizes must be divisible by reverse_page_size")
+        if self.reverse_slot_max_tokens < 0:
+            raise ValueError("streamopd_kv.reverse_slot_max_tokens must be non-negative")
+        if self.reverse_slot_reserve_gib < 0:
+            raise ValueError("streamopd_kv.reverse_slot_reserve_gib must be non-negative")
         if self.validation_atol < 0:
             raise ValueError("streamopd_kv.validation_atol must be non-negative")
         if self.teacher_priority_threshold < 0:
             raise ValueError("streamopd_kv.teacher_priority_threshold must be non-negative")
         if self.scheduler_timeout_seconds <= 0:
             raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
+        if self.posthoc_ablation and self.teacher_terminal_only_after_initial:
+            raise ValueError("posthoc_ablation is incompatible with teacher_terminal_only_after_initial")
         if self.enabled and self.rollout_backend != "vllm":
             raise NotImplementedError("StreamOPD-KV MVP supports rollout_backend='vllm' only")
         if self.enabled and not self.exact_dense_attention:

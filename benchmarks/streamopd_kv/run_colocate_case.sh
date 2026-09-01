@@ -37,8 +37,12 @@ export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=${TEACHER_PREFILL_MAX_ACTIVE_TRAJ
 export TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS=${TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS:-32768}
 export TEACHER_PREFILL_KV_PAGE_SIZE=${TEACHER_PREFILL_KV_PAGE_SIZE:-64}
 export TEACHER_FIRST_CHUNK_INCLUDES_PROMPT=${TEACHER_FIRST_CHUNK_INCLUDES_PROMPT:-True}
+export POSTHOC_ABLATION=${POSTHOC_ABLATION:-False}
+export REVERSE_FIXED_SLOTS=${REVERSE_FIXED_SLOTS:-True}
+export REVERSE_SLOT_MAX_TOKENS=${REVERSE_SLOT_MAX_TOKENS:-$TOTAL_TRAJECTORY_LENGTH}
+export REVERSE_SLOT_RESERVE_GIB=${REVERSE_SLOT_RESERVE_GIB:-4.0}
 export KV_PREFETCH_DEPTH=${KV_PREFETCH_DEPTH:-1}
-export KV_PREFETCH_WORKERS=${KV_PREFETCH_WORKERS:-2}
+export KV_PREFETCH_WORKERS=${KV_PREFETCH_WORKERS:-4}
 export KV_PREFETCH_PIN_MEMORY=${KV_PREFETCH_PIN_MEMORY:-True}
 export RELEASE_STAGE1_KV_AFTER_COPY=${RELEASE_STAGE1_KV_AFTER_COPY:-True}
 export TOKEN_CHUNK_SIZE=${TOKEN_CHUNK_SIZE:-$(((MAX_RESPONSE_LENGTH + 1) / 2))}
@@ -78,9 +82,12 @@ case "$MODE" in
     export TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
     export CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-null}
     ;;
-  streamopd)
+  streamopd|streamopd-posthoc|streamopd-posthoc-legacy|streamopd-posthoc-fixed|streamopd-posthoc-fixed-wide)
     export TRAINER_MODE=streamopd_colocate STREAMOPD_KV_ENABLED=True
-    export STUDENT_GPUS=2 TEACHER_GPUS=2 ROLLOUT_GPUS=2 ROLLOUT_NNODES=1
+    export STUDENT_GPUS=${STUDENT_GPUS:-2}
+    export TEACHER_GPUS=${TEACHER_GPUS:-$STUDENT_GPUS}
+    export ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
+    export ROLLOUT_NNODES=1
     export AGENT_LOOP_WORKERS="$STREAMOPD_AGENT_LOOP_WORKERS"
     export ROLLOUT_MAX_NUM_SEQS="$STREAMOPD_ROLLOUT_MAX_NUM_SEQS"
     export DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT=False CHECKPOINT_ENGINE_BACKEND=host
@@ -98,6 +105,17 @@ case "$MODE" in
     # the stateful teacher as soon as it arrives. Set this to True only for the
     # terminal-catch-up performance ablation.
     TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
+    if [[ $MODE == streamopd-posthoc* ]]; then
+      POSTHOC_ABLATION=True
+    fi
+    if [[ $MODE == streamopd-posthoc-legacy ]]; then
+      REVERSE_FIXED_SLOTS=False
+    elif [[ $MODE == streamopd-posthoc-fixed || $MODE == streamopd-posthoc-fixed-wide ]]; then
+      REVERSE_FIXED_SLOTS=True
+    fi
+    if [[ $MODE == streamopd-posthoc-fixed-wide ]]; then
+      REVERSE_BATCH_MAX_TOKENS=${REVERSE_BATCH_MAX_TOKENS:-65536}
+    fi
     CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-bfloat16}
     ;;
   *)
@@ -107,8 +125,8 @@ case "$MODE" in
 esac
 
 mkdir -p "$RESULT_DIR"
-if [[ $MODE == streamopd ]]; then
-  CASE_NAME="streamopd_total${TOTAL_TRAJECTORY_LENGTH}_mb${MICRO_BATCH_SIZE}"
+if [[ $MODE == streamopd* ]]; then
+  CASE_NAME="${MODE}_total${TOTAL_TRAJECTORY_LENGTH}_mb${MICRO_BATCH_SIZE}"
 else
   CASE_NAME="${MODE}_total${TOTAL_TRAJECTORY_LENGTH}"
 fi
@@ -128,6 +146,10 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   distillation.streamopd_kv.teacher_initial_chunk_size="$TEACHER_INITIAL_CHUNK_SIZE" \
   distillation.streamopd_kv.teacher_first_chunk_includes_prompt="$TEACHER_FIRST_CHUNK_INCLUDES_PROMPT" \
   distillation.streamopd_kv.teacher_terminal_only_after_initial="$TEACHER_TERMINAL_ONLY_AFTER_INITIAL" \
+  distillation.streamopd_kv.posthoc_ablation="$POSTHOC_ABLATION" \
+  distillation.streamopd_kv.reverse_fixed_slots="$REVERSE_FIXED_SLOTS" \
+  distillation.streamopd_kv.reverse_slot_max_tokens="$REVERSE_SLOT_MAX_TOKENS" \
+  distillation.streamopd_kv.reverse_slot_reserve_gib="$REVERSE_SLOT_RESERVE_GIB" \
   distillation.streamopd_kv.teacher_prefill_max_active_trajectories="$TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES" \
   distillation.streamopd_kv.teacher_prefill_max_active_kv_tokens="$TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS" \
   distillation.streamopd_kv.teacher_prefill_kv_page_size="$TEACHER_PREFILL_KV_PAGE_SIZE" \

@@ -169,6 +169,8 @@ class StreamingTeacherCoordinator:
 
         session.response_ids.extend(chunk.token_ids)
         session.terminal = chunk.terminal
+        if chunk.terminal:
+            await self._schedule("teacher_trajectory_terminal_submitted", chunk.key.policy_version)
         session.pending.append((len(session.response_ids), chunk.terminal))
         session.updated.set()
         if session.tail is None:
@@ -255,6 +257,8 @@ class StreamingTeacherCoordinator:
             if session.admitted:
                 await self._release_session(key, reservation)
                 session.admitted = False
+            if session.stream_closed:
+                await self._schedule("teacher_trajectory_completed", key.policy_version)
 
     async def result(self, key: TrajectoryKey, required_completion_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
         session = self._sessions.get(key)

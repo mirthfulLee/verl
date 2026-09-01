@@ -32,6 +32,7 @@ class CommittedChunkPublisher:
         chunk_size: int,
         submit: Callable[[CommittedTokenChunk], Awaitable[None]],
         terminal_only_after_initial: bool = False,
+        terminal_only: bool = False,
         page_size: int = 1,
         first_chunk_includes_prompt: bool = True,
     ) -> None:
@@ -42,6 +43,9 @@ class CommittedChunkPublisher:
         self.chunk_size = chunk_size
         self.submit = submit
         self.terminal_only_after_initial = terminal_only_after_initial
+        self.terminal_only = terminal_only
+        if terminal_only and terminal_only_after_initial:
+            raise ValueError("terminal_only and terminal_only_after_initial are mutually exclusive")
         self.page_size = page_size
         self.first_chunk_includes_prompt = first_chunk_includes_prompt
         self._accepted: tuple[int, ...] = ()
@@ -68,6 +72,22 @@ class CommittedChunkPublisher:
         if len(accepted) < len(self._accepted) or accepted[: len(self._accepted)] != self._accepted:
             raise RuntimeError("rollout backend retracted or replaced committed token ids")
         self._accepted = accepted
+
+        if self.terminal_only:
+            if terminal and self._accepted:
+                await self._emit(len(self._accepted), terminal=True)
+            elif terminal:
+                await self.submit(
+                    CommittedTokenChunk(
+                        key=self.key,
+                        start=0,
+                        token_ids=(),
+                        terminal=True,
+                        prompt_ids=self.prompt_ids,
+                    )
+                )
+            self._terminal = terminal
+            return
 
         terminal_sent = False
         while not self.terminal_only_after_initial or self._emitted == 0:

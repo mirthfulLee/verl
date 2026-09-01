@@ -233,3 +233,30 @@ class MultiTeacherModelManager:
                 for replica in manager.rollout_replicas
             )
         )
+
+    @auto_await
+    async def reset_device_memory_stats(self) -> None:
+        await asyncio.gather(
+            *(
+                server.collective_rpc.remote("reset_device_memory_stats")
+                for manager in self.teacher_model_managers.values()
+                for server in manager.server_handles
+            )
+        )
+
+    @auto_await
+    async def collect_device_memory_stats(self) -> dict[str, int]:
+        responses = await asyncio.gather(
+            *(
+                server.collective_rpc.remote("get_device_memory_stats")
+                for manager in self.teacher_model_managers.values()
+                for server in manager.server_handles
+            )
+        )
+        worker_stats = [stats for response in responses for stats in (response or [])]
+        if not worker_stats:
+            raise RuntimeError("Teacher vLLM workers returned no device memory statistics")
+        return {
+            key: max(int(stats[key]) for stats in worker_stats)
+            for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
+        }

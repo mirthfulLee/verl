@@ -543,6 +543,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.prepare_reverse_plan()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_streamopd_memory_stats(self):
+        if self.actor is None:
+            return None
+        get_torch_device().reset_peak_memory_stats()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)

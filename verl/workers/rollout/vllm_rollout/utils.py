@@ -28,7 +28,7 @@ import torch
 from packaging import version
 from vllm.outputs import RequestOutput
 
-from verl.utils.device import get_device_name, is_npu_available
+from verl.utils.device import get_device_name, get_torch_device, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches, is_fp8_model, load_quanted_weights
@@ -292,6 +292,23 @@ class vLLMColocateWorkerExtension:
         model_runner._get_prompt_logprobs_dict = MethodType(get_streaming_prompt_logprobs, model_runner)
         logger.info("Enabled vLLM 0.15.1 StreamingInput prompt-logprob compatibility patch")
         return True
+
+    def reset_device_memory_stats(self) -> None:
+        """Reset per-step allocator peaks inside the vLLM worker process."""
+
+        device_module = get_torch_device()
+        device_module.reset_peak_memory_stats(self.device)
+
+    def get_device_memory_stats(self) -> dict[str, int]:
+        """Return current and peak allocator bytes for this vLLM worker."""
+
+        device_module = get_torch_device()
+        return {
+            "allocated_bytes": int(device_module.memory_allocated(self.device)),
+            "reserved_bytes": int(device_module.memory_reserved(self.device)),
+            "max_allocated_bytes": int(device_module.max_memory_allocated(self.device)),
+            "max_reserved_bytes": int(device_module.max_memory_reserved(self.device)),
+        }
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""

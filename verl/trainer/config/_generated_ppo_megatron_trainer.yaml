@@ -921,11 +921,15 @@ distillation:
     teacher_initial_chunk_size: 256
     teacher_first_chunk_includes_prompt: true
     teacher_terminal_only_after_initial: false
+    posthoc_ablation: false
     reverse_chunk_size: 256
     reverse_chunk_min_size: 64
     reverse_page_size: 64
     reverse_batch_size: 16
     reverse_batch_max_tokens: 32768
+    reverse_fixed_slots: true
+    reverse_slot_max_tokens: 0
+    reverse_slot_reserve_gib: 4.0
     micro_batch_size: 32
     teacher_priority_threshold: 0
     scheduler_poll_interval_ms: 10
@@ -936,7 +940,7 @@ distillation:
     teacher_prefill_max_active_kv_tokens: 32768
     teacher_prefill_kv_page_size: 64
     kv_prefetch_depth: 1
-    kv_prefetch_workers: 2
+    kv_prefetch_workers: 4
     kv_prefetch_pin_memory: true
     release_stage1_kv_after_copy: true
     kv_handoff_dir: /tmp/verl-streamopd-kv

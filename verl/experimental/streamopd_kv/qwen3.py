@@ -249,59 +249,68 @@ class Qwen3ReverseTrainer:
     def backward_batched(
         self,
         input_ids: Sequence[torch.Tensor],
-        layers: Sequence[Sequence[LayerKVTrace]],
+        layers: Sequence[Sequence[LayerKVTrace]] | None,
         loss_fns: Sequence[Callable[[torch.Tensor, int, int], tuple[torch.Tensor, int]]],
         *,
         release_processed_suffix: bool = True,
         backward_context: Callable[[int, int], AbstractContextManager] | None = None,
         stage1_release: Callable[[], None] | None = None,
         release_stage1_kv_after_copy: bool = True,
+        fixed_state: Any | None = None,
+        on_depth_committed: Callable[[Sequence[int], int, int], None] | None = None,
     ) -> ReverseTrainingResult:
         """Run ragged trajectories in reverse-depth wavefront batches."""
 
-        if not input_ids or not (len(input_ids) == len(layers) == len(loss_fns)):
-            raise ValueError("input trajectories, KV traces, and loss functions must be non-empty and aligned")
+        if not input_ids or len(input_ids) != len(loss_fns):
+            raise ValueError("input trajectories and loss functions must be non-empty and aligned")
+        if fixed_state is None and (layers is None or len(input_ids) != len(layers)):
+            raise ValueError("input trajectories, KV traces, and loss functions must be aligned")
         if any(sequence.ndim != 2 or sequence.shape[0] != 1 for sequence in input_ids):
             raise ValueError("OOMB paged reverse batches require [1, sequence] inputs")
         sequence_lengths = [sequence.shape[1] for sequence in input_ids]
-        layer_counts = {len(trace) for trace in layers}
-        if len(layer_counts) != 1:
-            raise ValueError("OOMB paged reverse batches require the same layer count")
-        for sequence_length, trace in zip(sequence_lengths, layers, strict=True):
-            if any(layer.length != sequence_length for layer in trace):
-                raise ValueError("each OOMB trajectory KV trace must match its input length")
+        if layers is not None:
+            layer_counts = {len(trace) for trace in layers}
+            if len(layer_counts) != 1:
+                raise ValueError("OOMB paged reverse batches require the same layer count")
+            for sequence_length, trace in zip(sequence_lengths, layers, strict=True):
+                if any(layer.length != sequence_length for layer in trace):
+                    raise ValueError("each OOMB trajectory KV trace must match its input length")
 
         padded_lengths = [math.ceil(length / self.chunk_size) * self.chunk_size for length in sequence_lengths]
         padded_input_ids = [
             torch.nn.functional.pad(sequence, (0, padded_length - sequence.shape[1]))
             for sequence, padded_length in zip(input_ids, padded_lengths, strict=True)
         ]
-        padded_trajectories = [
-            [
-                LayerKVTrace(
-                    layer.key
-                    if padded_length == sequence_length
-                    else torch.nn.functional.pad(layer.key, (0, 0, 0, padded_length - sequence_length)),
-                    layer.value
-                    if padded_length == sequence_length
-                    else torch.nn.functional.pad(layer.value, (0, 0, 0, padded_length - sequence_length)),
-                )
-                for layer in trace
+        if fixed_state is None:
+            assert layers is not None
+            padded_trajectories = [
+                [
+                    LayerKVTrace(
+                        layer.key
+                        if padded_length == sequence_length
+                        else torch.nn.functional.pad(layer.key, (0, 0, 0, padded_length - sequence_length)),
+                        layer.value
+                        if padded_length == sequence_length
+                        else torch.nn.functional.pad(layer.value, (0, 0, 0, padded_length - sequence_length)),
+                    )
+                    for layer in trace
+                ]
+                for sequence_length, padded_length, trace in zip(sequence_lengths, padded_lengths, layers, strict=True)
             ]
-            for sequence_length, padded_length, trace in zip(sequence_lengths, padded_lengths, layers, strict=True)
-        ]
-        from .oomb_paged_attention import OOMBFlashWavefrontState
+            from .oomb_paged_attention import OOMBFlashWavefrontState
 
-        state = OOMBFlashWavefrontState(padded_trajectories)
-        # The contiguous state now owns the complete Stage-1 trace. Drop the
-        # caller's rollout-KV references before reverse kernels start; keeping
-        # them alive would duplicate the whole group for the duration of
-        # backward and prevents future suffix-slot reuse.
-        if release_stage1_kv_after_copy:
-            for trace in layers:
-                for layer in trace:
-                    layer.key = layer.key[:, :, :0]
-                    layer.value = layer.value[:, :, :0]
+            state = OOMBFlashWavefrontState(padded_trajectories)
+            # The contiguous state now owns the complete Stage-1 trace. Drop
+            # the caller's rollout-KV references before reverse kernels start.
+            if release_stage1_kv_after_copy:
+                for trace in layers:
+                    for layer in trace:
+                        layer.key = layer.key[:, :, :0]
+                        layer.value = layer.value[:, :, :0]
+        else:
+            state = fixed_state
+            if list(getattr(state, "sequence_lengths", ())) != padded_lengths:
+                raise ValueError("fixed reverse slot lengths do not match the padded wavefront")
         if stage1_release is not None:
             stage1_release()
 
@@ -370,6 +379,8 @@ class Qwen3ReverseTrainer:
                 with sync_context:
                     (chunk_loss + state.gradient_injection()).backward()
                 state.commit_prefix_gradients(release_processed_suffix=release_processed_suffix)
+                if on_depth_committed is not None:
+                    on_depth_committed(active, start, end)
                 loss_sum = loss_sum + chunk_loss.detach().float()
                 valid_tokens += chunk_valid_tokens
 

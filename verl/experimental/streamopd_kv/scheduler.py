@@ -27,6 +27,13 @@ class StreamOPDTaskScheduler:
         self.teacher_active_kv_tokens = 0
         self.teacher_sessions: dict[str, int] = {}
         self.teacher_session_kv_tokens = 0
+        self.expected_trajectories = 0
+        self.terminal_trajectories = 0
+        self.completed_teacher_trajectories = 0
+        self.all_rollouts_terminal_at = 0.0
+        self.all_teacher_completed_at = 0.0
+        self.first_teacher_started_at = 0.0
+        self.teacher_busy_before_all_rollouts_terminal = 0.0
         self.training_active = 0
         self.training_waiters: list[int] = []
         self.max_training_waiters = 0
@@ -43,7 +50,7 @@ class StreamOPDTaskScheduler:
         self._training_busy_started_at = 0.0
         self.policy_started_at = 0.0
 
-    def begin_policy(self, policy_version: int) -> None:
+    def begin_policy(self, policy_version: int, expected_trajectories: int = 0) -> None:
         if self.teacher_pending or self.training_active or self.teacher_sessions or self.training_waiters:
             raise RuntimeError(
                 "cannot begin a StreamOPD policy version while work is active: "
@@ -51,6 +58,15 @@ class StreamOPDTaskScheduler:
                 f"training_waiters={len(self.training_waiters)}"
             )
         self.policy_version = int(policy_version)
+        if expected_trajectories < 0:
+            raise ValueError("expected_trajectories must be non-negative")
+        self.expected_trajectories = int(expected_trajectories)
+        self.terminal_trajectories = 0
+        self.completed_teacher_trajectories = 0
+        self.all_rollouts_terminal_at = 0.0
+        self.all_teacher_completed_at = 0.0
+        self.first_teacher_started_at = 0.0
+        self.teacher_busy_before_all_rollouts_terminal = 0.0
         self.teacher_active_kv_tokens = 0
         self.teacher_session_kv_tokens = 0
         self.training_waiters = []
@@ -71,6 +87,27 @@ class StreamOPDTaskScheduler:
     def teacher_notified(self, policy_version: int) -> None:
         self._check_version(policy_version)
         self.teacher_notifications += 1
+
+    def teacher_trajectory_terminal_submitted(self, policy_version: int) -> None:
+        self._check_version(policy_version)
+        self.terminal_trajectories += 1
+        if self.expected_trajectories and self.terminal_trajectories > self.expected_trajectories:
+            raise RuntimeError("received more terminal Teacher trajectories than expected")
+        if self.terminal_trajectories == self.expected_trajectories:
+            self.all_rollouts_terminal_at = time.perf_counter()
+            self.teacher_busy_before_all_rollouts_terminal = self.teacher_busy_seconds
+            if self.teacher_active:
+                self.teacher_busy_before_all_rollouts_terminal += (
+                    self.all_rollouts_terminal_at - self._teacher_busy_started_at
+                )
+
+    def teacher_trajectory_completed(self, policy_version: int) -> None:
+        self._check_version(policy_version)
+        self.completed_teacher_trajectories += 1
+        if self.expected_trajectories and self.completed_teacher_trajectories > self.expected_trajectories:
+            raise RuntimeError("completed more Teacher trajectories than expected")
+        if self.completed_teacher_trajectories == self.expected_trajectories:
+            self.all_teacher_completed_at = time.perf_counter()
 
     def try_teacher_session_admitted(
         self,
@@ -122,6 +159,8 @@ class StreamOPDTaskScheduler:
         self.teacher_queued -= 1
         if self.teacher_active == 0:
             self._teacher_busy_started_at = time.perf_counter()
+            if not self.first_teacher_started_at:
+                self.first_teacher_started_at = self._teacher_busy_started_at
         self.teacher_active += 1
         self.teacher_active_kv_tokens += kv_tokens
         self.max_teacher_active = max(self.max_teacher_active, self.teacher_active)
@@ -215,6 +254,10 @@ class StreamOPDTaskScheduler:
             "teacher_active_kv_tokens": self.teacher_active_kv_tokens,
             "teacher_sessions": len(self.teacher_sessions),
             "teacher_session_kv_tokens": self.teacher_session_kv_tokens,
+            "expected_trajectories": self.expected_trajectories,
+            "terminal_trajectories": self.terminal_trajectories,
+            "completed_teacher_trajectories": self.completed_teacher_trajectories,
+            "posthoc_ready": self.posthoc_ready,
             "teacher_pending": self.teacher_pending,
             "training_active": self.training_active,
             "training_waiters": len(self.training_waiters),
@@ -238,6 +281,31 @@ class StreamOPDTaskScheduler:
                 f"teacher_pending={self.teacher_pending}, teacher_sessions={len(self.teacher_sessions)}, "
                 f"training_active={self.training_active}, training_waiters={len(self.training_waiters)}"
             )
+        if self.expected_trajectories and (
+            self.terminal_trajectories != self.expected_trajectories
+            or self.completed_teacher_trajectories != self.expected_trajectories
+        ):
+            raise RuntimeError(
+                "StreamOPD policy barrier reached with incomplete trajectories: "
+                f"terminal={self.terminal_trajectories}, completed={self.completed_teacher_trajectories}, "
+                f"expected={self.expected_trajectories}"
+            )
+        rollout_terminal_seconds = (
+            self.all_rollouts_terminal_at - self.policy_started_at if self.all_rollouts_terminal_at else 0.0
+        )
+        teacher_complete_seconds = (
+            self.all_teacher_completed_at - self.policy_started_at if self.all_teacher_completed_at else 0.0
+        )
+        teacher_drain_seconds = (
+            max(0.0, self.all_teacher_completed_at - self.all_rollouts_terminal_at)
+            if self.all_rollouts_terminal_at and self.all_teacher_completed_at
+            else 0.0
+        )
+        first_teacher_started_seconds = (
+            self.first_teacher_started_at - self.policy_started_at if self.first_teacher_started_at else 0.0
+        )
+        policy_seconds = time.perf_counter() - self.policy_started_at
+        pool_busy_seconds = self.teacher_busy_seconds + self.training_busy_seconds
         metrics = {
             "streamopd/scheduler_teacher_chunks": float(self.teacher_chunks),
             "streamopd/scheduler_teacher_notifications": float(self.teacher_notifications),
@@ -248,10 +316,24 @@ class StreamOPDTaskScheduler:
             "streamopd/scheduler_max_teacher_active": float(self.max_teacher_active),
             "streamopd/scheduler_max_teacher_sessions": float(self.max_teacher_sessions),
             "streamopd/scheduler_max_teacher_session_kv_tokens": float(self.max_teacher_session_kv_tokens),
+            "streamopd/scheduler_terminal_trajectories": float(self.terminal_trajectories),
+            "streamopd/scheduler_completed_teacher_trajectories": float(self.completed_teacher_trajectories),
+            "streamopd/scheduler_all_rollouts_terminal_seconds": rollout_terminal_seconds,
+            "streamopd/scheduler_all_teacher_complete_seconds": teacher_complete_seconds,
+            "streamopd/scheduler_teacher_drain_after_rollout_seconds": teacher_drain_seconds,
+            "streamopd/scheduler_first_teacher_started_seconds": first_teacher_started_seconds,
+            "streamopd/scheduler_teacher_busy_before_all_rollouts_terminal_seconds": (
+                self.teacher_busy_before_all_rollouts_terminal
+            ),
+            "streamopd/scheduler_teacher_busy_after_all_rollouts_terminal_seconds": max(
+                0.0, self.teacher_busy_seconds - self.teacher_busy_before_all_rollouts_terminal
+            ),
             "streamopd/scheduler_teacher_busy_seconds": self.teacher_busy_seconds,
             "streamopd/scheduler_training_busy_seconds": self.training_busy_seconds,
-            "streamopd/scheduler_pool_busy_seconds": self.teacher_busy_seconds + self.training_busy_seconds,
-            "streamopd/scheduler_policy_seconds": time.perf_counter() - self.policy_started_at,
+            "streamopd/scheduler_pool_busy_seconds": pool_busy_seconds,
+            "streamopd/scheduler_pool_idle_seconds": max(0.0, policy_seconds - pool_busy_seconds),
+            "streamopd/scheduler_pool_utilization": pool_busy_seconds / max(policy_seconds, 1e-9),
+            "streamopd/scheduler_policy_seconds": policy_seconds,
         }
         self.policy_version = None
         return metrics
@@ -259,6 +341,16 @@ class StreamOPDTaskScheduler:
     @property
     def teacher_pending(self) -> int:
         return self.teacher_queued + self.teacher_active
+
+    @property
+    def posthoc_ready(self) -> bool:
+        return bool(
+            self.expected_trajectories
+            and self.terminal_trajectories == self.expected_trajectories
+            and self.completed_teacher_trajectories == self.expected_trajectories
+            and not self.teacher_pending
+            and not self.teacher_sessions
+        )
 
     def _check_version(self, policy_version: int) -> None:
         if self.policy_version is None:

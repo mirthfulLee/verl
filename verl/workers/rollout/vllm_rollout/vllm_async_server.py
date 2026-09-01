@@ -285,7 +285,7 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
@@ -745,6 +745,7 @@ class vLLMHttpServer:
         streamopd_callback: Optional[ray.actor.ActorHandle] = None,
         streamopd_chunk_size: Optional[int] = None,
         streamopd_terminal_only_after_initial: bool = False,
+        streamopd_terminal_only: bool = False,
         streamopd_page_size: int = 1,
         streamopd_first_chunk_includes_prompt: bool = True,
         prompt_logprobs_start: int = 0,
@@ -787,6 +788,7 @@ class vLLMHttpServer:
                 chunk_size=streamopd_chunk_size,
                 submit=submit_streamopd_chunk,
                 terminal_only_after_initial=streamopd_terminal_only_after_initial,
+                terminal_only=streamopd_terminal_only,
                 page_size=streamopd_page_size,
                 first_chunk_includes_prompt=streamopd_first_chunk_includes_prompt,
             )

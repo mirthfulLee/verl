@@ -71,12 +71,31 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         # load cannot race with weight publication.
         if self.streamopd_kv_enabled:
             self.actor_rollout_wg.prepare_streamopd_reverse_plan()
+            # Warm the cross-process metrics RPC before the first timed policy
+            # step, then reset again at each policy boundary.
+            self.actor_rollout_wg.reset_streamopd_memory_stats()
+            self.teacher_model_manager.reset_device_memory_stats()
+            self.llm_server_manager.reset_device_memory_stats()
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def prepare_step(self) -> dict:
         self._policy_version = self.global_steps - 1
-        ray.get(self._scheduler.begin_policy.remote(self._policy_version))
-        return super().prepare_step()
+        reset_started = time.perf_counter()
+        self.actor_rollout_wg.reset_streamopd_memory_stats()
+        self.teacher_model_manager.reset_device_memory_stats()
+        self.llm_server_manager.reset_device_memory_stats()
+        reset_seconds = time.perf_counter() - reset_started
+        ray.get(
+            self._scheduler.begin_policy.remote(
+                self._policy_version,
+                int(self.config.data.train_batch_size),
+            )
+        )
+        dispatch_started = time.perf_counter()
+        metrics = super().prepare_step()
+        metrics["streamopd/rollout_dispatch_seconds"] = time.perf_counter() - dispatch_started
+        metrics["streamopd/memory_stats_reset_seconds"] = reset_seconds
+        return metrics
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         """Consume an early reverse cohort, then normal Teacher/Trainer microbatches."""
@@ -91,6 +110,10 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
         metrics_aggregator = MetricsAggregator()
         if prepare_metrics:
             metrics_aggregator.add_step_metrics(prepare_metrics)
+        if bool(stream_config.posthoc_ablation):
+            with marked_timer("gen", timing_raw, color="red"):
+                posthoc_wait = self._wait_for_posthoc_ready()
+            metrics_aggregator.add_step_metrics({"streamopd/posthoc_ready_wait_seconds": posthoc_wait})
         combined_keys: list = []
         combined_tags: list = []
         self._streamopd_runtime_accumulation_steps = len(batch_sizes)
@@ -107,6 +130,22 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             return KVBatchMeta(partition_id="train", keys=combined_keys, tags=combined_tags)
         finally:
             del self._streamopd_runtime_accumulation_steps
+
+    def _wait_for_posthoc_ready(self) -> float:
+        stream_config = self.config.distillation.streamopd_kv
+        # This is a coarse global-batch barrier, not latency-sensitive queue
+        # arbitration. Avoid flooding the Ray scheduler while rollout workers
+        # and terminal Teacher prefills are still active.
+        poll_seconds = max(int(stream_config.scheduler_poll_interval_ms) / 1000.0, 0.1)
+        timeout = float(stream_config.scheduler_timeout_seconds)
+        started = time.perf_counter()
+        while True:
+            state = ray.get(self._scheduler.snapshot.remote())
+            if bool(state["posthoc_ready"]):
+                return time.perf_counter() - started
+            if time.perf_counter() - started > timeout:
+                raise TimeoutError(f"timed out waiting for post-hoc StreamOPD barrier: {state}")
+            time.sleep(poll_seconds)
 
     def on_sample_end(self):
         # Rollout owns a separate pool and remains resident while this
@@ -151,9 +190,23 @@ class PPOTrainerStreamOPDColocate(PPOTrainer):
             raise RuntimeError("StreamOPD policy barrier has no active version")
         with marked_timer("policy_barrier", self.timing_raw, color="cyan"):
             scheduler_metrics = ray.get(self._scheduler.end_policy.remote(self._policy_version))
+        memory_started = time.perf_counter()
+        teacher_memory = self.teacher_model_manager.collect_device_memory_stats()
+        teacher_memory_metrics = {
+            f"streamopd/teacher_memory/{name.removesuffix('_bytes')}_gib": value / (1024**3)
+            for name, value in teacher_memory.items()
+        }
+        teacher_memory_metrics["streamopd/teacher_memory/collect_seconds"] = time.perf_counter() - memory_started
+        rollout_memory = self.llm_server_manager.collect_device_memory_stats()
+        rollout_memory_metrics = {
+            f"streamopd/rollout_memory/{name.removesuffix('_bytes')}_gib": value / (1024**3)
+            for name, value in rollout_memory.items()
+        }
         with marked_timer("update_weights", self.timing_raw, color="red"):
             sync_metrics = dict(self.checkpoint_manager.update_weights(self.global_steps) or {})
         sync_metrics.update(scheduler_metrics)
+        sync_metrics.update(teacher_memory_metrics)
+        sync_metrics.update(rollout_memory_metrics)
         self._pending_sync_metrics = sync_metrics
         self._policy_version = None
 

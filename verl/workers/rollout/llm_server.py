@@ -308,6 +308,7 @@ class LLMServerClient:
                     "streamopd_terminal_only_after_initial",
                     False,
                 )
+                kwargs["streamopd_terminal_only"] = getattr(self, "streamopd_terminal_only", False)
                 kwargs["streamopd_first_chunk_includes_prompt"] = getattr(
                     self,
                     "streamopd_first_chunk_includes_prompt",
@@ -699,6 +700,25 @@ class LLMServerManager:
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""
         return self.rollout_replicas
+
+    @auto_await
+    async def reset_device_memory_stats(self) -> None:
+        await asyncio.gather(
+            *(server.collective_rpc.remote("reset_device_memory_stats") for server in self.server_handles)
+        )
+
+    @auto_await
+    async def collect_device_memory_stats(self) -> dict[str, int]:
+        responses = await asyncio.gather(
+            *(server.collective_rpc.remote("get_device_memory_stats") for server in self.server_handles)
+        )
+        worker_stats = [stats for response in responses for stats in (response or [])]
+        if not worker_stats:
+            raise RuntimeError("Rollout vLLM workers returned no device memory statistics")
+        return {
+            key: max(int(stats[key]) for stats in worker_stats)
+            for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
+        }
 
     @auto_await
     async def start_profile(self, **kwargs):

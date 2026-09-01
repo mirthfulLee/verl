@@ -45,6 +45,7 @@ from verl.experimental.streamopd_kv import (
 from verl.experimental.streamopd_kv.fsdp_worker import (
     StreamOPDKVTrainingWorker,
     _dynamic_reverse_chunk_size,
+    _fixed_reverse_slot_plan,
     _forward_kl_topk_sum,
     _has_valid_response,
     _memory_limited_reverse_batch_size,
@@ -53,6 +54,7 @@ from verl.experimental.streamopd_kv.fsdp_worker import (
 )
 from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
+from verl.experimental.streamopd_kv.snapshot_io import load_vllm_slot_snapshot
 from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.workers.config.distillation import DistillationConfig, StreamOPDKVConfig
 
@@ -377,6 +379,76 @@ async def test_committed_publisher_can_emit_one_early_chunk_then_terminal_catch_
     ]
 
 
+@pytest.mark.asyncio
+async def test_posthoc_publisher_emits_one_complete_trajectory_at_eos() -> None:
+    emitted = []
+
+    async def submit(chunk: CommittedTokenChunk) -> None:
+        emitted.append(chunk)
+
+    publisher = CommittedChunkPublisher(
+        TrajectoryKey(9, "posthoc"),
+        [1, 2, 3],
+        chunk_size=4,
+        submit=submit,
+        terminal_only=True,
+    )
+    await publisher.observe([10, 11, 12, 13])
+    await publisher.observe([10, 11, 12, 13, 14, 15])
+    assert emitted == []
+
+    await publisher.observe([10, 11, 12, 13, 14, 15], terminal=True)
+
+    assert len(emitted) == 1
+    assert emitted[0].prompt_ids == (1, 2, 3)
+    assert emitted[0].token_ids == (10, 11, 12, 13, 14, 15)
+    assert emitted[0].start == 0
+    assert emitted[0].terminal is True
+
+
+def test_posthoc_publisher_rejects_initial_plus_terminal_modes() -> None:
+    async def submit(chunk: CommittedTokenChunk) -> None:
+        del chunk
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        CommittedChunkPublisher(
+            TrajectoryKey(9, "invalid-posthoc"),
+            [1],
+            chunk_size=4,
+            submit=submit,
+            terminal_only=True,
+            terminal_only_after_initial=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_posthoc_teacher_scores_each_trajectory_as_soon_as_it_reaches_eos() -> None:
+    started = asyncio.Event()
+
+    async def score(fragment: list[int], request_id: str, terminal: bool):
+        del request_id
+        assert terminal is True
+        started.set()
+        ids = torch.tensor(fragment, dtype=torch.int32).unsqueeze(-1)
+        return ids, -ids.float()
+
+    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=4)
+    first = TrajectoryKey(10, "first-eos")
+    await coordinator.submit(
+        CommittedTokenChunk(
+            key=first,
+            start=0,
+            prompt_ids=(1, 2),
+            token_ids=(3, 4),
+            terminal=True,
+        )
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    ids, _ = await coordinator.result(first, required_completion_tokens=2)
+    assert ids.shape[0] == 4
+
+
 def test_vllm_prompt_logprobs_can_extract_incremental_tensor_suffix() -> None:
     from verl.workers.rollout.vllm_rollout.utils import extract_prompt_logprobs
 
@@ -393,6 +465,80 @@ def test_vllm_prompt_logprobs_can_extract_incremental_tensor_suffix() -> None:
     assert result["prompt_ids"].dtype == torch.int32
     assert result["prompt_logprobs"].dtype == torch.float32
     torch.testing.assert_close(result["prompt_ids"], torch.tensor([[20, 21], [30, 31], [0, 0]], dtype=torch.int32))
+
+
+def test_vllm_worker_reports_and_resets_device_memory_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    from verl.workers.rollout.vllm_rollout import utils
+
+    class DeviceModule:
+        reset_device = None
+
+        def reset_peak_memory_stats(self, device) -> None:
+            self.reset_device = device
+
+        @staticmethod
+        def memory_allocated(device) -> int:
+            assert device == 2
+            return 11
+
+        @staticmethod
+        def memory_reserved(device) -> int:
+            assert device == 2
+            return 12
+
+        @staticmethod
+        def max_memory_allocated(device) -> int:
+            assert device == 2
+            return 21
+
+        @staticmethod
+        def max_memory_reserved(device) -> int:
+            assert device == 2
+            return 22
+
+    device_module = DeviceModule()
+    monkeypatch.setattr(utils, "get_torch_device", lambda: device_module)
+    worker = SimpleNamespace(device=2)
+
+    utils.vLLMColocateWorkerExtension.reset_device_memory_stats(worker)
+    stats = utils.vLLMColocateWorkerExtension.get_device_memory_stats(worker)
+
+    assert device_module.reset_device == 2
+    assert stats == {
+        "allocated_bytes": 11,
+        "reserved_bytes": 12,
+        "max_allocated_bytes": 21,
+        "max_reserved_bytes": 22,
+    }
+
+
+def test_rollout_manager_aggregates_vllm_worker_memory_stats() -> None:
+    from verl.workers.rollout.llm_server import LLMServerManager
+
+    class RemoteMethod:
+        def __init__(self, stats):
+            self.stats = stats
+
+        async def remote(self, method):
+            assert method == "get_device_memory_stats"
+            return self.stats
+
+    class Server:
+        def __init__(self, stats):
+            self.collective_rpc = RemoteMethod(stats)
+
+    manager = LLMServerManager.__new__(LLMServerManager)
+    manager.server_handles = [
+        Server([{"allocated_bytes": 1, "reserved_bytes": 3, "max_allocated_bytes": 5, "max_reserved_bytes": 7}]),
+        Server([{"allocated_bytes": 2, "reserved_bytes": 4, "max_allocated_bytes": 6, "max_reserved_bytes": 8}]),
+    ]
+
+    assert manager.collect_device_memory_stats() == {
+        "allocated_bytes": 2,
+        "reserved_bytes": 4,
+        "max_allocated_bytes": 6,
+        "max_reserved_bytes": 8,
+    }
 
 
 def test_snapshot_lifecycle_teacher_coverage_and_version_barrier() -> None:
@@ -566,6 +712,19 @@ def test_streamed_vllm_snapshot_loader_assembles_contiguous_chunks(tmp_path) -> 
     assert snapshot.layers[0][0].shape == (1, 2, 5, 4)
     torch.testing.assert_close(snapshot.layers[0][0][0].transpose(0, 1), packed[:, 0])
 
+    slot_snapshot = load_vllm_slot_snapshot(
+        base_path,
+        key=TrajectoryKey(4, "trajectory"),
+        tp_rank=0,
+        expected_tp_size=1,
+        expected_token_ids=[2, 3, 5, 7, 11],
+        expected_prompt_length=2,
+        pin_memory=False,
+    )
+    assert slot_snapshot.layers[0].key.shape == (5, 2, 4)
+    assert slot_snapshot.layers[0].key.is_contiguous()
+    torch.testing.assert_close(slot_snapshot.layers[0].key, packed[:, 0])
+
 
 def test_vllm_range_extraction_copies_only_intersecting_blocks() -> None:
     cache = torch.arange(4 * 2 * 4 * 1 * 2).reshape(4, 2, 4, 1, 2)
@@ -699,6 +858,58 @@ def test_reverse_batch_planner_preserves_chunk_size_and_uses_stable_power_of_two
     )
 
 
+def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
+    config = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=28,
+        num_key_value_heads=8,
+        num_attention_heads=16,
+        head_dim=128,
+        vocab_size=151936,
+    )
+    model = SimpleNamespace(config=config, model=SimpleNamespace(layers=[object()] * 28))
+    memory = int(58.5 * 1024**3)
+
+    capped = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=16,
+        token_capacity=4096,
+        max_batch_tokens=32768,
+        max_chunk_size=1024,
+        min_chunk_size=256,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=memory,
+    )
+    assert (capped.batch_size, capped.token_capacity, capped.chunk_size) == (8, 4096, 1024)
+
+    wide = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=16,
+        token_capacity=4096,
+        max_batch_tokens=65536,
+        max_chunk_size=1024,
+        min_chunk_size=256,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=memory,
+    )
+    assert (wide.batch_size, wide.token_capacity, wide.chunk_size) == (16, 4096, 256)
+
+    long = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=16,
+        token_capacity=8192,
+        max_batch_tokens=65536,
+        max_chunk_size=1024,
+        min_chunk_size=256,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=memory,
+    )
+    assert (long.batch_size, long.token_capacity, long.chunk_size) == (8, 8192, 512)
+
+
 def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
     worker = StreamOPDKVTrainingWorker.__new__(StreamOPDKVTrainingWorker)
     worker._gpu_kv_lease_active = True
@@ -813,6 +1024,11 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     stale_config.trainer.v1.trainer_mode = "sync"
     with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd_colocate"):
         prepare_streamopd_kv_config(stale_config)
+
+    multi_sample_config = copy.deepcopy(config)
+    multi_sample_config.actor_rollout_ref.rollout.n = 2
+    with pytest.raises(NotImplementedError, match="rollout.n=1"):
+        prepare_streamopd_kv_config(multi_sample_config)
 
 
 def test_prepare_config_does_not_mutate_sync_baseline() -> None:
@@ -956,6 +1172,35 @@ def test_teacher_session_slot_refills_after_eos() -> None:
     scheduler.end_policy(15)
 
 
+def test_posthoc_scheduler_waits_for_all_terminal_teacher_results() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(17, expected_trajectories=2)
+    scheduler.teacher_trajectory_terminal_submitted(17)
+    scheduler.teacher_trajectory_completed(17)
+    assert scheduler.snapshot()["posthoc_ready"] is False
+
+    scheduler.teacher_trajectory_terminal_submitted(17)
+    assert scheduler.snapshot()["posthoc_ready"] is False
+    scheduler.teacher_trajectory_completed(17)
+
+    state = scheduler.snapshot()
+    assert state["posthoc_ready"] is True
+    assert state["terminal_trajectories"] == 2
+    assert state["completed_teacher_trajectories"] == 2
+    metrics = scheduler.end_policy(17)
+    assert metrics["streamopd/scheduler_terminal_trajectories"] == 2
+    assert metrics["streamopd/scheduler_completed_teacher_trajectories"] == 2
+
+
+def test_policy_barrier_rejects_missing_teacher_trajectory() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(18, expected_trajectories=2)
+    scheduler.teacher_trajectory_terminal_submitted(18)
+    scheduler.teacher_trajectory_completed(18)
+    with pytest.raises(RuntimeError, match="incomplete trajectories"):
+        scheduler.end_policy(18)
+
+
 @pytest.mark.asyncio
 async def test_teacher_client_holds_load_balancer_lease_until_stream_eos() -> None:
     from verl.workers.rollout.llm_server import LLMServerClient
@@ -1064,6 +1309,14 @@ def test_distillation_config_coerces_streamopd_mapping_without_mutating_frozen_f
     )
     assert isinstance(config.streamopd_kv, StreamOPDKVConfig)
     assert config.streamopd_kv.reverse_chunk_size == 32
+
+
+def test_posthoc_config_rejects_initial_streaming_ablation() -> None:
+    with pytest.raises(ValueError, match="incompatible"):
+        StreamOPDKVConfig(
+            posthoc_ablation=True,
+            teacher_terminal_only_after_initial=True,
+        )
 
 
 def test_dapo_adapter_wraps_plain_prompt_as_chat_messages() -> None:

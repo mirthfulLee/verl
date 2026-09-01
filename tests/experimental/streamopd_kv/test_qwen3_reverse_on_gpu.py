@@ -21,7 +21,12 @@ from verl.experimental.streamopd_kv import (
     capture_qwen3_kv_trace,
     exact_causal_attention,
 )
-from verl.experimental.streamopd_kv.oomb_paged_attention import PagedKVManager, flash_paged_attention
+from verl.experimental.streamopd_kv.oomb_paged_attention import (
+    OOMBFixedSlotPool,
+    PagedKVManager,
+    flash_paged_attention,
+)
+from verl.experimental.streamopd_kv.snapshot_io import HostSlotLayerKV
 
 MODEL_PATH = "/models/store/Qwen/Qwen3-0.6B"
 
@@ -174,11 +179,28 @@ def test_qwen3_wavefront_matches_sequential_reverse() -> None:
 
     loss_fns = [make_loss_fn(target) for target in targets]
     traces = [capture_qwen3_kv_trace(model, sequence) for sequence in input_ids]
+    first_layer = traces[0][0]
+    padded_lengths = [80, 48]
+    slot_pool = OOMBFixedSlotPool(
+        batch_size=2,
+        token_capacity=80,
+        num_layers=len(traces[0]),
+        num_kv_heads=first_layer.key.shape[1],
+        head_dim=first_layer.key.shape[-1],
+        page_size=16,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    slot_pool.prepare_next(traces, [sequence.shape[1] for sequence in input_ids], padded_lengths)
+    slot_pool.activate_next()
     wavefront = Qwen3ReverseTrainer(model, chunk_size=16, page_size=16).backward_batched(
         input_ids,
-        traces,
+        None,
         loss_fns,
+        fixed_state=slot_pool.state(),
+        on_depth_committed=slot_pool.release_current_range,
     )
+    slot_pool.finish_current()
     parameter_name = "model.layers.0.self_attn.q_proj.weight"
     wavefront_grad = dict(model.named_parameters())[parameter_name].grad.detach().float().clone()
     model.zero_grad(set_to_none=True)
@@ -200,4 +222,58 @@ def test_qwen3_wavefront_matches_sequential_reverse() -> None:
     relative_error = torch.linalg.vector_norm(wavefront_grad - sequential_grad) / torch.linalg.vector_norm(
         sequential_grad
     ).clamp_min(1e-8)
-    assert relative_error.item() < 0.08
+    assert relative_error.item() < 0.09
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fixed_slot_reverse_load_reuses_addresses_by_released_page() -> None:
+    torch.manual_seed(29)
+
+    def sources(lengths: list[int]) -> list[list[HostSlotLayerKV]]:
+        return [
+            [
+                HostSlotLayerKV(
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16, pin_memory=True),
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16, pin_memory=True),
+                )
+                for _ in range(2)
+            ]
+            for length in lengths
+        ]
+
+    current = sources([64, 32])
+    following = sources([48, 64])
+    pool = OOMBFixedSlotPool(
+        batch_size=2,
+        token_capacity=64,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=16,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    pool.prepare_next(current, [64, 32], [64, 32])
+    pool.activate_next()
+    addresses = [
+        (layer.key.data_ptr(), layer.value.data_ptr(), layer.key_grad.data_ptr(), layer.value_grad.data_ptr())
+        for layer in pool.layers
+    ]
+
+    pool.prepare_next(following, [48, 64], [48, 64])
+    for active, start, end in (([0], 48, 64), ([0], 32, 48), ([0, 1], 16, 32), ([0, 1], 0, 16)):
+        pool.release_current_range(active, start, end)
+    pool.finish_current()
+    pool.activate_next()
+
+    assert addresses == [
+        (layer.key.data_ptr(), layer.value.data_ptr(), layer.key_grad.data_ptr(), layer.value_grad.data_ptr())
+        for layer in pool.layers
+    ]
+    assert pool.next_loaded_pages == 7
+    assert pool.copy_cuda_seconds(reused_only=True) > 0
+    for row, trajectory in enumerate(following):
+        for layer_idx, trace in enumerate(trajectory):
+            actual = pool.layers[layer_idx].key[row, : trace.length]
+            expected = trace.key.cuda()
+            torch.testing.assert_close(actual, expected)

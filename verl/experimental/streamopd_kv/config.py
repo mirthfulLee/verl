@@ -27,6 +27,8 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         raise NotImplementedError("StreamOPD-KV MVP supports the vLLM rollout backend only")
     if rollout.tensor_model_parallel_size != 1 or rollout.pipeline_model_parallel_size != 1:
         raise NotImplementedError("StreamOPD-KV MVP requires rollout TP=1 and PP=1")
+    if int(rollout.get("n", 1)) != 1:
+        raise NotImplementedError("StreamOPD currently requires actor_rollout_ref.rollout.n=1")
     actor = config.actor_rollout_ref.actor
     if actor.strategy not in ("fsdp", "fsdp2"):
         raise NotImplementedError("StreamOPD-KV MVP requires an FSDP actor")
@@ -57,6 +59,14 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     if micro_batch_size < 1 or train_batch_size % micro_batch_size:
         raise ValueError("StreamOPD requires data.train_batch_size to be divisible by streamopd_kv.micro_batch_size")
     accumulation_steps = train_batch_size // micro_batch_size
+    if int(stream_config.get("reverse_slot_max_tokens", 0)) == 0:
+        prompt_limit = int(config.data.get("max_prompt_length", 0))
+        response_limit = int(config.data.get("max_response_length", 0))
+        configured_limit = prompt_limit + response_limit
+        if configured_limit == 0:
+            configured_limit = max(1, int(rollout.get("max_model_len", 4097)) - 1)
+        with open_dict(stream_config):
+            stream_config.reverse_slot_max_tokens = configured_limit
     with open_dict(config.trainer.v1.streamopd_colocate):
         config.trainer.v1.streamopd_colocate.micro_batch_size = micro_batch_size
         config.trainer.v1.streamopd_colocate.parameter_sync_step = accumulation_steps

@@ -1,18 +1,19 @@
 # StreamOPD benchmark
 
-The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD exposes four physical
-placements: Trainer can share Teacher GPUs, share Rollout GPUs, span disjoint Teacher+Rollout subsets (`union`), or
-use dedicated GPUs. Teacher and Rollout remain separate resident model processes in every placement.
+The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD supports four
+physical Trainer placements: shared with Teacher GPUs, shared with Rollout GPUs, spanning disjoint Teacher and
+Rollout subsets (`union`), or dedicated GPUs. Teacher and Rollout remain separate resident model processes in every
+placement.
 
-The benchmark harness intentionally sets `distillation.streamopd_kv.runtime_profile=manual` so historical ablations
-remain exactly reproducible. This is not the normal user interface. The production example defaults to `auto` and
-reuses verl's existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count
-configuration; its only optional default-path topology setting is `trainer_placement`.
+StreamOPD is under active development. Benchmark outputs under `benchmarks/streamopd_kv/results/` remain local
+because scheduler, memory-planning, and transport changes can quickly invalidate them. Once the method stabilizes,
+publication-quality comparisons and their complete experimental settings should be recorded in dedicated
+documentation.
 
 ## Environment
 
-The measured environment uses Python 3.12.13, PyTorch 2.9.1+cu128, vLLM 0.15.1, transformers 4.57.6, and four
-A100-80GB GPUs. Activate the CUDA 12.8 environment for the driver and Ray workers:
+The development benchmark environment uses Python 3.12, PyTorch with CUDA 12.8, vLLM 0.15.1, and A100-80GB GPUs.
+Activate the CUDA environment for the driver and Ray workers:
 
 ```bash
 export PATH="$PWD/.venv-cu128/bin:$PATH"
@@ -20,7 +21,18 @@ export VIRTUAL_ENV="$PWD/.venv-cu128"
 export VERL_USE_UV=0
 ```
 
-Run the 4096/8192 matrix with:
+The benchmark harness intentionally sets `distillation.streamopd_kv.runtime_profile=manual` so controlled ablations
+can pin the compared settings. This is not the normal user interface. The production example defaults to `auto` and
+reuses verl's existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count
+configuration; its only optional default-path topology setting is `trainer_placement`.
+
+The normal auto profile jointly selects Rollout `gpu_memory_utilization` and `max_num_seqs` from model weights, KV
+bytes per token, maximum trajectory length, physical GPU memory, pool placement, and any explicit user constraint.
+Reverse batch width and chunk size are selected by startup preflight and remain fixed inside the policy loop.
+
+## End-to-end matrix
+
+Run the 4096/8192-token matrix with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 BATCH_SIZE=128 TOTAL_TRAINING_STEPS=1 \
@@ -29,162 +41,34 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 BATCH_SIZE=128 TOTAL_TRAINING_STEPS=1 \
 
 The benchmark wrapper calls the current path `streamopd`; the internal trainer mode remains `streamopd_colocate`.
 Rollout uses an independent `max_num_seqs`, and baseline modes do not consume StreamOPD compatibility fields. The
-reverse width/chunk and Teacher session budget default to startup preflight plans. The matrix exposes separate
-`BASELINE_ROLLOUT_MAX_NUM_SEQS`/`STREAMOPD_ROLLOUT_MAX_NUM_SEQS` and
-`BASELINE_AGENT_LOOP_WORKERS`/`STREAMOPD_AGENT_LOOP_WORKERS` overrides so StreamOPD tuning cannot silently change the
-baseline denominator.
+matrix exposes separate `BASELINE_ROLLOUT_MAX_NUM_SEQS`/`STREAMOPD_ROLLOUT_MAX_NUM_SEQS` and
+`BASELINE_AGENT_LOOP_WORKERS`/`STREAMOPD_AGENT_LOOP_WORKERS` overrides so StreamOPD tuning cannot silently change
+the baseline denominator.
 
-The normal auto profile does not use a fixed Rollout utilization. It jointly solves `gpu_memory_utilization` and
-`max_num_seqs` from weights, KV bytes/token, maximum length, physical GPU memory, and any user-supplied constraint.
-The benchmark wrapper remains `runtime_profile=manual` because it intentionally pins these values for matched
-ablations; do not interpret its historical `0.65` value as the StreamOPD default.
-
-Reverse preflight also reserves rank-local gradients and optimizer tensors that are materialized by the first
-backward/update. This calculation and the selected slot batch/chunk are logged and frozen before the first policy
-version; the benchmark does not query the allocator or reshape kernels inside the policy loop.
-
-### Constraint-planner and sleep validation
-
-On A100-80GB with a 2-GPU shared Teacher/Trainer pool and one dedicated Rollout GPU, B128 auto planning selected
-Rollout128/0.90 for total length 4096 and Rollout64/0.90 for 8192. The 4096 stable step was 114.89s, versus 121.15s
-for the earlier manually capped Rollout0.50 run (5.16% lower). The 8192 one-step run was 350.74s, versus 381.08s for
-the safe manual Rollout32/reverse-B2 configuration (7.96% lower, or 6.36% lower per generated token). The 8192 run
-retained reverse B4/chunk1024; conditional Teacher cache trimming released up to 9.20 GiB and avoided the previous
-early-reverse OOM. Teacher level-1 sleep cost 0.41-0.43s, while the next-step wake exposed only 0.02-0.04s alongside
-Rollout startup.
-
-A separate two-step Rollout/Trainer-shared B16/1K ablation measured 15.58s with level-2 sleep and 15.47s without it.
-Level-2 released roughly 12.5 GiB more physical GPU memory but did not enlarge the already frozen reverse plan, so it
-remains an opt-in memory-pressure control rather than the auto throughput default.
-
-The shared-Rollout planner is also evaluated after fixed reverse slots are allocated. In a two-GPU `union` B128/4K
-run, the unconstrained 0.90/128 Rollout plan could not fit even the minimum reverse workspace. Joint preflight derived
-a 0.60 ceiling, selected 0.50/64 from model KV geometry, and completed without OOM. This is a startup calculation; no
-allocator query or kernel reshaping occurs in a policy step.
-
-### Shared Host KV slot transport
-
-The default connector uses one fixed shared mmap per TP shard instead of writing a safetensors file for every committed
-chunk and a second file at EOS. A fixed pinned staging ring performs rollout D2H; Trainer reads token-major K/V views
-directly from the shared rows. On A100-80GB, Qwen3-1.7B/4B, B32/2K, B4/C512, and the same deterministic requests, the
-three-step comparison is:
-
-| Transport | Stable step | Actor update | Host load/unit | H2D/unit |
-| --- | ---: | ---: | ---: | ---: |
-| chunk safetensors | 26.48 s | 10.36 s | 0.625 s | 0.032 s |
-| shared Host slots | 25.28 s | 9.06 s | 0.028 s | 0.095 s |
-
-Shared slots reduce Host loading by 95.4%, improve actor update by 14.3%, and improve the full step by 1.047x. The mmap
-source is pageable, so H2D grows by about 0.063 seconds per unit; this is much smaller than the removed deserialization
-and tensor assembly. Rollout remains effectively unchanged at 10.23 versus 10.20 seconds. Across all three policy
-versions the pool remains four fixed files (7.00 GiB logical data backing, 3.25 KiB control backing, descriptor, and
-lock), and ends with all 32 slots `FREE`. A final-policy smoke released a 1.75 GiB pool in 1.07ms and left its handoff
-directory empty.
-
-`verl-sync-opd` uses a 2-GPU student pool plus a separate 2-GPU teacher pool. `verl-colocate-opd` is a sync-baseline
-placement ablation configured by `distillation.colocate_teacher_with_student`; it does not enable any StreamOPD code.
-
-## Scheduler ablation
-
-`run_scheduler_ablation.sh` compares the same streaming rollout/Teacher implementation with only the scheduling
-policy changed. `teacher_then_train` waits for complete Teacher drain; `adaptive` admits reverse units from the ready
-queue. Both use the same GPU allocation, model processes, policy barrier, and preflight plan.
-
-The following A100-80GB measurements use one shared Teacher/Trainer GPU plus one rollout GPU, B32, and three policy
-steps. Stable means steps 2-3. Each batch contains 25% short and 75% long trajectories so early-ready work is
-deterministic.
-
-| Total cap | Reverse plan | Drain-first stable mean | Adaptive stable mean | Adaptive speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 1024 | B8 / C256 (controlled cap) | 19.82 s | 19.17 s | 1.034x |
-| 2048 | B4 / C512 (controlled cap) | 32.51 s | 26.94 s | 1.207x |
-
-These measurements predate the backlog-adaptive update: the 2K scheduler starts at 8/32 completed trajectories and
-uses one-unit reverse quanta with Teacher turns between them. It reduces the stable step by 17.13%. The 1K case is
-short enough that hysteresis mostly converges to drain-first behavior, but it no longer regresses as the eager-switch
-prototype did.
-
-Automatic reverse planning was also checked on B32/1K without batch/chunk caps. The initial memory-first rule chose
-B32/C256: 7.0 GiB fixed backing, 10.58-second actor update, and a 58.32-second first step. Joint chunk-first planning
-chooses B8/C1024: 1.75 GiB backing, 6.78-second actor update, and a 44.91-second first step. This is a 22.99% step
-reduction and demonstrates why memory feasibility alone is not the planner objective.
-
-Placement-aware scheduling was also measured with automatic startup plans:
-
-| Placement | Batch / cap | Distinct GPUs | Drain-first | Adaptive | Result |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `teacher` | B128 / 4096 | 3 | 122.51 s | 113.77 s | 1.077x |
-| `rollout` | B32 / 2048 | 2 | 26.22 s | 24.17 s | 1.085x |
-| `union` | B32 / 2048 | 2 | 22.46 s | topology fallback | drain-first |
-
-The B128/4K shared-Teacher run uses two Trainer/Teacher GPUs and one Rollout GPU. Adaptive starts at Teacher 32/128
-and Rollout 69/128, reducing the stable step by 7.13%. The Rollout-shared run starts only after Rollout 32/32 EOS,
-then overlaps reverse with a Teacher tail (1.69-2.12 seconds), reducing the stable mean by 7.81%.
-
-In `union`, Trainer needs both the Teacher and Rollout subsets. An interleaving probe was 0.24% slower than
-drain-first because no post-EOS compute can overlap; the scheduler now derives this from the resource topology and
-records `streamopd/scheduler_topology_fallback=1` while executing the drain-first policy. On Rollout-shared GPUs,
-preflight reserves full non-preemptible KV plus checkpoint buffers and caps the B32/2K reverse plan at B4/C1024.
-
-### Backlog-adaptive update
-
-The current scheduler starts from one genuinely ready reverse width and retains Trainer ownership while at least one
-more Teacher-complete width remains. If the controller has not registered that next unit within a bounded handoff
-window, Teacher resumes, so an inaccurate readiness prediction cannot leave the shared pool idle. The decision uses
-queue progress rather than model names, GPU types, or a user-tuned reverse quantum.
-
-On the same one-GPU Teacher/Trainer plus one-GPU Rollout topology, Qwen3-1.7B/4B, BF16, and deterministic ragged
-requests:
-
-| Batch / cap | Comparison | Step | Policy span | Pool idle | First train | Teacher turns |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| B32 / 2048 | previous adaptive | 26.94 s | 20.78 s | 7.39 s | 4.20 s | 1.5 |
-| B32 / 2048 | backlog-adaptive | 26.48 s | 20.73 s | 7.02 s | 4.20 s | 1.5 |
-| B128 / 4096 | drain-first | 174.92 s | 164.48 s | 52.15 s | 77.19 s | 0 |
-| B128 / 4096 | backlog-adaptive | 169.93 s | 159.34 s | 48.92 s | 14.63 s | 7 |
-
-The B32 case naturally makes eight trajectories ready together, so removing the old two-width gate changes little:
-the stable step improves by 1.76% and policy span by 0.25%. At B128, the matched Rollout terminal times are 59.63 and
-59.78 seconds; backlog-adaptive improves the step by 2.93% and the scheduler span by 3.23%. Its 64 reverse units form
-bursts of up to 12 units rather than forcing a Teacher turn after every unit. The remaining limit is resource
-allocation rather than admission: the one-GPU Trainer preflight selects B2/C1024, and its 81.93 seconds of reverse
-compute exceeds the 59.78-second Rollout path.
-
-With the same two physical GPUs assigned as `union`, startup planning selects Rollout64/0.50 and global reverse width
-4 (B2 per rank). The stable step is 148.28 seconds: Rollout terminal grows to 74.66 seconds, but reverse busy falls to
-50.70 seconds. This is 1.146x faster than the 169.93-second Teacher-shared placement. It also confirms the topology
-rule: once Trainer spans both pools, drain-first is preferable because no Teacher or Rollout compute can overlap it.
-
-## Current 4K result
-
-The following one-step GPU0-3 runs use Qwen3-1.7B/Qwen3-4B, BF16, batch 128, deterministic rollout, the same DAPO
-data, and a total trajectory cap of 4096. They were sampled from the same checkout after removing fixed Teacher
-cohorts.
-
-| Path | Microbatch | Step | Rollout | Actor update | Throughput | Reverse parallel/rank |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verl-sync-opd` | - | 184.17 s | 104.78 s | 27.38 s | 547.98 tok/s | - |
-| StreamOPD | 16 | 123.37 s | 52.32 s | 43.11 s | 818.51 tok/s | 8 |
-| StreamOPD | 32 | 112.63 s | 38.23 s | 45.20 s | 894.74 tok/s | 8 |
-
-The MB32 run is 1.635x faster than the matched sync baseline, a 38.85% wall-time reduction. Both paths report maximum
-policy staleness zero. These are one-step engineering measurements; publication-quality numbers should use multiple
-post-warmup steps and repeated process launches.
-
-The earlier fixed-cohort scheduler reduced each 4096-token Teacher cohort to eight global trajectories because of
-the 32768-token reservation. That limited reverse width to four trajectories per DP rank and increased the step to
-152.46 seconds. The fixed-cohort code and its vLLM sleep/wake ablation have been removed.
-
-Machine-readable historical two-pool results remain under `benchmarks/streamopd_kv/results/`. Generate a summary for
-new logs with:
+Generate a local machine-readable summary with:
 
 ```bash
 python benchmarks/streamopd_kv/summarize_colocate_matrix.py <result-dir>
 ```
 
+## Scheduler ablation
+
+`run_scheduler_ablation.sh` compares the same streaming Rollout/Teacher implementation with only the scheduling
+policy changed. `teacher_then_train` waits for complete Teacher drain; `adaptive` admits reverse units from the ready
+queue. Both use the same GPU allocation, model processes, strict policy barrier, and startup preflight plan.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash benchmarks/streamopd_kv/run_scheduler_ablation.sh
+```
+
+The scheduler derives whether Teacher, Trainer, and Rollout work can overlap from their GPU resource sets. A Trainer
+that spans both Teacher and Rollout subsets uses drain-first scheduling because neither pool can compute concurrently
+with it.
+
 ## Teacher StreamingInput validation
 
-Validate resumable teacher sessions independently with:
+Validate resumable Teacher sessions independently with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 .venv-cu128/bin/python \
@@ -197,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 .venv-cu128/bin/python \
 
 ## Kernel stage benchmark
 
-For a two-GPU numerical and stage-timing check:
+Run a two-GPU numerical and stage-timing check with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. .venv-cu128/bin/python \
@@ -209,96 +93,31 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. .venv-cu128/bin/python \
   --token-chunk-size 32 --reverse-chunk-size 256
 ```
 
-This stage benchmark excludes model loading and warmup. End-to-end runs are required to include host KV transport,
+This benchmark excludes model loading and warmup. End-to-end runs are required to include Host KV transport,
 scheduler gaps, checkpoint publication, and pipeline fill/drain.
 
 ## Post-hoc Teacher/Trainer ablation
 
-Run the matched two-step comparison with:
+Run the streaming-versus-post-hoc comparison with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   bash benchmarks/streamopd_kv/run_posthoc_ablation.sh
 ```
 
-Both modes use a 2-GPU Rollout Pool and a 2-GPU Teacher/Trainer Pool, B128, total trajectory length 4096, and MB32.
-The table reports stable step 2, after lazy agent workers and metrics RPCs are warm. Post-hoc submits one complete
-Teacher request immediately when each individual trajectory reaches EOS; only Trainer waits for the global barrier.
-This archived Teacher-schedule comparison predates fixed reverse slots and used `reverse_fixed_slots=false` in both
-columns, so the later fixed-slot ablation remains orthogonal.
-
-| Metric | Streaming StreamOPD | Post-hoc ablation |
-| --- | ---: | ---: |
-| Step | 98.98 s | 109.71 s |
-| Throughput | 1023.43 tok/s | 922.53 tok/s |
-| First Teacher start | 8.51 s | 28.16 s |
-| All rollout EOS | 59.22 s | 56.67 s |
-| All Teacher complete | 84.62 s | 63.66 s |
-| Teacher drain after all EOS | 25.41 s | 7.00 s |
-| Teacher busy before all EOS | 12.96 s | 9.58 s |
-| Teacher busy total | 19.98 s | 16.57 s |
-| Reverse busy | 38.43 s | 38.25 s |
-| Teacher/Trainer Pool idle | 33.06 s | 47.42 s |
-| Teacher/Trainer Pool utilization | 63.86% | 53.62% |
-| Teacher forwards | 180 | 128 |
-| Rollout peak allocated/reserved | not sampled | 51.29 / 51.50 GiB |
-| Trainer peak allocated/reserved | 53.80 / 61.50 GiB | 53.80 / 61.06 GiB |
-| Teacher peak allocated/reserved | 12.42 / 15.25 GiB | 12.42 / 15.25 GiB |
-
-Post-hoc is 10.83% slower, or equivalently streaming is 1.108x faster. Full requests save 3.41 seconds of Teacher
-busy time and reduce request count by 28.9%, but the global reverse barrier loses more overlap: the 38.25-second
-reverse phase begins only after Teacher completion. The allocator peaks are effectively unchanged, so this ablation
-does not create useful Trainer headroom under the current persistent-Teacher layout. A conservative sum of independent
-reserved peaks is 76.75 GiB for streaming and 76.32 GiB for post-hoc; because Teacher and Trainer kernels are
-serialized, this sum is an upper bound rather than a simultaneous allocation measurement.
-
-The matched timing run predates the Rollout Pool allocator RPC, so its streaming column does not claim a measured
-rollout peak. A separate two-step post-hoc memory run measured 51.29 GiB allocated and 51.50 GiB reserved per rollout
-worker on stable step 2, close to the configured 65% vLLM target. The reset and collection RPCs took 28 ms and 14 ms,
-respectively; stable step time was 110.81 seconds versus 109.71 seconds in the matched post-hoc run, so allocator
-sampling adds no material hot-path cost. This separate run is used only to complete the memory accounting, not to
-replace the matched timing comparison.
-
-Rollout KV remains streamed before EOS in both modes (about 28 chunks and 43K KV tokens per rank in these runs), so
-the result isolates Teacher request granularity and the reverse barrier rather than changing KV transport. Exact
-step-level metrics are stored in `results/posthoc_ablation_b128_4k_2step/summary.json`; the Rollout Pool memory
-re-sample is stored in `results/posthoc_ablation_b128_4k_2step_memory/summary.json`.
+Post-hoc submits one complete Teacher request when each trajectory reaches EOS, while Trainer waits for the global
+barrier. The comparison isolates Teacher request granularity and early reverse overlap. Rollout KV remains streamed
+before EOS in both modes.
 
 ## Fixed-slot reverse ablation
 
-Run the legacy/fixed/B16 comparison with:
+Run the legacy/fixed-slot and reverse batch/chunk comparison with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   bash benchmarks/streamopd_kv/run_fixed_slot_ablation.sh
 ```
 
-The completed matched run used physical GPU0,1,3 because an unrelated persistent serving process occupied GPU2: a
-one-GPU Rollout Pool and a two-GPU Teacher/Trainer Pool, B128, total length 4096, MB32, stable step 2. Post-hoc makes
-reverse training serial after rollout/Teacher completion, so reverse time, H2D overlap, and Teacher/Trainer memory are
-directly comparable even though total step includes the slower one-GPU rollout.
-
-| Metric | Legacy B8/C960 | Fixed B8/C1024 | Fixed B16/C256 | Fixed B16/C512 |
-| --- | ---: | ---: | ---: | ---: |
-| Step | 158.36 s | 154.74 s | 160.24 s | 174.54 s |
-| Rollout/Teacher window | 114.81 s | 115.67 s | 114.84 s | 115.11 s |
-| Reverse/update | 36.74 s | 32.92 s | 38.55 s | 52.60 s |
-| Scheduler training busy | 36.72 s | 32.91 s | 38.53 s | 52.57 s |
-| Planned trajectories/rank | 8 | 8 | 16 | 16 |
-| Backward calls/rank | 7.0 | 7.0 | 13.8 | 7.0 |
-| Host prefetch exposed wait | 1.09 s | 0.51 s | 0.81 s | 0.95 s |
-| Next-group DMA / exposed tail | - | 0.20 / 0.09 s | - | - |
-| Trainer peak allocated | 53.81 GiB | 50.06 GiB | 42.47 GiB | 57.50 GiB |
-| Trainer peak reserved | 61.21 GiB | 59.27 GiB | 48.16 GiB | 61.59 GiB |
-
-The selected B8 plan reduces reverse time by 10.39% and end-to-end step by 2.29%. Allocated/reserved peaks fall by
-3.75/1.94 GiB. The next-group DMA starts while the current suffix backward is active; 0.11 seconds of its 0.20-second
-copy is hidden, and only 0.09 seconds remains at group activation. Token-major host loading and raw CUDA submission
-reduce copy enqueue from the initial fixed-slot prototype's 1.23 seconds to 0.07 seconds.
-
-B16 is memory-feasible and reduces peak memory further, but it forces chunk 256 under the same preflight reserve.
-The doubled wavefront depth dominates the larger batch: reverse is 4.93% slower than legacy and 17.10% slower than
-B8. Forcing B16/C512 with no preflight reserve is slower still: its larger activation and LM-head working set makes
-reverse 59.79% slower than B8/C1024 and raises reserved memory to 61.59 GiB. The default 4096 plan therefore retains
-B8/C1024. Stable metrics are in `results/posthoc_fixed_slot_dma_w4_b128_4k_3gpu/summary.json`; the forced C512 probe
-is in `results/posthoc_fixed_slot_dma_w4_b16_chunk512_b128_4k_3gpu/summary.json`.
+The comparison covers fixed backing allocation, reverse wavefront width, reverse chunk size, Host prefetch wait,
+next-group DMA overlap, and Trainer peak memory. Use repeated post-warmup policy steps and fresh process launches
+before treating any output as a stable result.

@@ -19,7 +19,9 @@ import torch
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from verl.experimental.streamopd_kv import LayerKVTrace, Qwen3ReverseTrainer
+from verl.experimental.streamopd_kv import Qwen3ReverseTrainer
+from verl.experimental.streamopd_kv.reverse_attention import ReverseKVSlotPool
+from verl.experimental.streamopd_kv.snapshot_io import HostSlotLayerKV
 
 DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -318,23 +320,43 @@ def main() -> None:
             int(local_valid.sum()),
         )
 
-    # Reverse attention has a distinct backward graph, so warm it independently.
-    Qwen3ReverseTrainer(student, args.reverse_chunk_size).backward(
-        trace_ids,
-        [LayerKVTrace(layer.keys, layer.values) for layer in rollout_cache.layers],
-        reverse_loss,
+    page_size = min(64, args.reverse_chunk_size)
+    token_capacity = (trace_ids.shape[1] + args.reverse_chunk_size - 1) // args.reverse_chunk_size
+    token_capacity *= args.reverse_chunk_size
+    layers = [HostSlotLayerKV(layer.keys, layer.values) for layer in rollout_cache.layers]
+    first = layers[0]
+    slots = ReverseKVSlotPool(
+        batch_size=1,
+        token_capacity=token_capacity,
+        num_layers=len(layers),
+        num_kv_heads=first.key.shape[1],
+        head_dim=first.key.shape[-1],
+        page_size=page_size,
+        dtype=first.key.dtype,
+        device=student_device,
     )
+
+    def reverse_backward():
+        slots.prepare_next([layers], [trace_ids.shape[1]], [token_capacity])
+        slots.activate_next()
+        result = Qwen3ReverseTrainer(student, args.reverse_chunk_size, page_size=page_size).backward(
+            [trace_ids],
+            [reverse_loss],
+            state=slots.state(),
+            on_depth_committed=slots.release_current_range,
+        )
+        slots.finish_current()
+        return result
+
+    # Reverse attention has a distinct backward graph, so warm it independently.
+    reverse_backward()
     synchronize(student_device)
     student.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(student_device)
 
     start = time.perf_counter()
-    reverse_result = Qwen3ReverseTrainer(student, args.reverse_chunk_size).backward(
-        trace_ids,
-        [LayerKVTrace(layer.keys, layer.values) for layer in rollout_cache.layers],
-        reverse_loss,
-    )
+    reverse_result = reverse_backward()
     synchronize(student_device)
     reverse_train_seconds = time.perf_counter() - start
     reverse_train_peak_gb = torch.cuda.max_memory_allocated(student_device) / 2**30

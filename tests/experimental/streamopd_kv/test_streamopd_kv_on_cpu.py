@@ -17,108 +17,37 @@ import pytest
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-from safetensors.torch import save_file
 from tensordict import TensorDict
 from torch import nn
 
 from verl.experimental.streamopd_kv import (
-    BatchedReverseChunkState,
     CommittedChunkPublisher,
     CommittedTokenChunk,
-    KVLayout,
-    KVSnapshotStore,
-    LayerKVTrace,
-    PolicyVersionBarrier,
-    Qwen3ReverseTrainer,
-    ReverseChunkState,
-    SealedKVSnapshot,
-    SnapshotState,
     StreamingTeacherCoordinator,
-    TeacherArtifactBuffer,
     TrajectoryKey,
-    cleanup_vllm_snapshot,
-    exact_causal_attention,
-    extract_vllm_nhd_token_range,
-    extract_vllm_nhd_tokens,
-    load_vllm_snapshot,
-    move_vllm_snapshot,
     prepare_streamopd_kv_config,
 )
 from verl.experimental.streamopd_kv.config import _auto_streamopd_runtime_profile
 from verl.experimental.streamopd_kv.fsdp_worker import (
     StreamOPDKVTrainingWorker,
     _deferred_training_state_bytes,
-    _dynamic_reverse_chunk_size,
     _fixed_reverse_slot_plan,
     _forward_kl_topk_sum,
     _has_valid_response,
-    _memory_limited_reverse_batch_size,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
 )
 from verl.experimental.streamopd_kv.host_slot_pool import HostKVSlotPool, cleanup_host_kv_pools
 from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
-from verl.experimental.streamopd_kv.snapshot_io import load_vllm_slot_snapshot
+from verl.experimental.streamopd_kv.snapshot_io import (
+    extract_vllm_nhd_token_range,
+    extract_vllm_nhd_tokens,
+    load_vllm_snapshot,
+    release_vllm_snapshot,
+)
 from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.workers.config.distillation import DistillationConfig, StreamOPDKVConfig
-
-
-class _ToyBlock(nn.Module):
-    def __init__(self, hidden_size: int, query_heads: int, kv_heads: int) -> None:
-        super().__init__()
-        self.query_heads = query_heads
-        self.kv_heads = kv_heads
-        self.head_dim = hidden_size // query_heads
-        self.norm = nn.LayerNorm(hidden_size)
-        self.q_proj = nn.Linear(hidden_size, query_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.ff_norm = nn.LayerNorm(hidden_size)
-        self.ff = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2), nn.GELU(), nn.Linear(hidden_size * 2, hidden_size)
-        )
-
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        *,
-        layer_idx: int,
-        reverse_state: ReverseChunkState | None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        batch, tokens, _ = hidden.shape
-        normed = self.norm(hidden)
-        query = self.q_proj(normed).view(batch, tokens, self.query_heads, self.head_dim).transpose(1, 2)
-        key = self.k_proj(normed).view(batch, tokens, self.kv_heads, self.head_dim).transpose(1, 2)
-        value = self.v_proj(normed).view(batch, tokens, self.kv_heads, self.head_dim).transpose(1, 2)
-        if reverse_state is None:
-            attention = exact_causal_attention(query, key, value, query_start=0)
-        else:
-            attention = reverse_state.attention(layer_idx, query, key, value)
-        attention = attention.transpose(1, 2).reshape(batch, tokens, -1)
-        hidden = hidden + self.o_proj(attention)
-        hidden = hidden + self.ff(self.ff_norm(hidden))
-        return hidden, (key, value)
-
-
-class _ToyCausalLM(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.embedding = nn.Embedding(31, 16)
-        self.layers = nn.ModuleList([_ToyBlock(16, 4, 2), _ToyBlock(16, 4, 2)])
-        self.norm = nn.LayerNorm(16)
-        self.head = nn.Linear(16, 31, bias=False)
-
-    def forward(
-        self, input_ids: torch.Tensor, reverse_state: ReverseChunkState | None = None
-    ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
-        hidden = self.embedding(input_ids)
-        cache = []
-        for layer_idx, layer in enumerate(self.layers):
-            hidden, kv = layer(hidden, layer_idx=layer_idx, reverse_state=reverse_state)
-            cache.append(kv)
-        return self.head(self.norm(hidden)), tuple(cache)
 
 
 @pytest.mark.asyncio
@@ -206,27 +135,6 @@ async def test_committed_publisher_long_prompt_starts_after_one_aligned_page() -
     assert emitted == []
     await publisher.observe([10, 11, 12, 13])
     assert [(chunk.start, chunk.end) for chunk in emitted] == [(0, 4)]
-
-
-@pytest.mark.asyncio
-async def test_committed_publisher_can_ablate_prompt_in_first_chunk_budget() -> None:
-    emitted = []
-
-    async def submit(chunk: CommittedTokenChunk) -> None:
-        emitted.append(chunk)
-
-    publisher = CommittedChunkPublisher(
-        TrajectoryKey(4, "response-only-budget"),
-        list(range(12)),
-        chunk_size=8,
-        page_size=4,
-        first_chunk_includes_prompt=False,
-        submit=submit,
-    )
-    await publisher.observe(list(range(4)))
-    assert emitted == []
-    await publisher.observe(list(range(8)))
-    assert [(chunk.start, chunk.end) for chunk in emitted] == [(0, 8)]
 
 
 @pytest.mark.asyncio
@@ -358,100 +266,6 @@ async def test_teacher_streaming_limits_active_trajectories_and_kv_tokens() -> N
     release.set()
     await asyncio.gather(*(coordinator.result(key, required_completion_tokens=3) for key in keys))
     assert max_active == 1
-
-
-@pytest.mark.asyncio
-async def test_committed_publisher_can_emit_one_early_chunk_then_terminal_catch_up() -> None:
-    emitted = []
-
-    async def submit(chunk: CommittedTokenChunk) -> None:
-        emitted.append(chunk)
-
-    publisher = CommittedChunkPublisher(
-        TrajectoryKey(5, "terminal-catch-up"),
-        [1, 2],
-        4,
-        submit,
-        terminal_only_after_initial=True,
-    )
-    await publisher.observe([10, 11])
-    await publisher.observe([10, 11, 12, 13])
-    await publisher.observe([10, 11, 12, 13, 14], terminal=True)
-
-    assert [(chunk.start, chunk.token_ids, chunk.terminal) for chunk in emitted] == [
-        (0, (10, 11), False),
-        (2, (12, 13, 14), True),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_posthoc_publisher_emits_one_complete_trajectory_at_eos() -> None:
-    emitted = []
-
-    async def submit(chunk: CommittedTokenChunk) -> None:
-        emitted.append(chunk)
-
-    publisher = CommittedChunkPublisher(
-        TrajectoryKey(9, "posthoc"),
-        [1, 2, 3],
-        chunk_size=4,
-        submit=submit,
-        terminal_only=True,
-    )
-    await publisher.observe([10, 11, 12, 13])
-    await publisher.observe([10, 11, 12, 13, 14, 15])
-    assert emitted == []
-
-    await publisher.observe([10, 11, 12, 13, 14, 15], terminal=True)
-
-    assert len(emitted) == 1
-    assert emitted[0].prompt_ids == (1, 2, 3)
-    assert emitted[0].token_ids == (10, 11, 12, 13, 14, 15)
-    assert emitted[0].start == 0
-    assert emitted[0].terminal is True
-
-
-def test_posthoc_publisher_rejects_initial_plus_terminal_modes() -> None:
-    async def submit(chunk: CommittedTokenChunk) -> None:
-        del chunk
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        CommittedChunkPublisher(
-            TrajectoryKey(9, "invalid-posthoc"),
-            [1],
-            chunk_size=4,
-            submit=submit,
-            terminal_only=True,
-            terminal_only_after_initial=True,
-        )
-
-
-@pytest.mark.asyncio
-async def test_posthoc_teacher_scores_each_trajectory_as_soon_as_it_reaches_eos() -> None:
-    started = asyncio.Event()
-
-    async def score(fragment: list[int], request_id: str, terminal: bool):
-        del request_id
-        assert terminal is True
-        started.set()
-        ids = torch.tensor(fragment, dtype=torch.int32).unsqueeze(-1)
-        return ids, -ids.float()
-
-    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=4)
-    first = TrajectoryKey(10, "first-eos")
-    await coordinator.submit(
-        CommittedTokenChunk(
-            key=first,
-            start=0,
-            prompt_ids=(1, 2),
-            token_ids=(3, 4),
-            terminal=True,
-        )
-    )
-
-    await asyncio.wait_for(started.wait(), timeout=1.0)
-    ids, _ = await coordinator.result(first, required_completion_tokens=2)
-    assert ids.shape[0] == 4
 
 
 def test_vllm_prompt_logprobs_can_extract_incremental_tensor_suffix() -> None:
@@ -599,191 +413,6 @@ def test_vllm_worker_reports_profiled_kv_capacity() -> None:
         vLLMColocateWorkerExtension.get_kv_cache_capacity(worker)
 
 
-def test_snapshot_lifecycle_teacher_coverage_and_version_barrier() -> None:
-    key = TrajectoryKey(3, "trajectory")
-    layout = KVLayout(num_layers=1, num_kv_heads=2, head_dim=4, dtype="float32", page_size=16)
-    snapshot = SealedKVSnapshot(
-        key=key,
-        token_ids=(1, 2, 3),
-        prompt_length=2,
-        layout=layout,
-        layers=((torch.randn(1, 2, 3, 4), torch.randn(1, 2, 3, 4)),),
-    )
-    store = KVSnapshotStore()
-    store.seal(snapshot)
-    lease = store.acquire(key)
-    assert lease.state is SnapshotState.LEASED
-    with pytest.raises(RuntimeError, match="leased"):
-        store.invalidate_version(3)
-    lease.release()
-    assert lease.state is SnapshotState.RELEASED
-    assert store.invalidate_version(3) == 1
-
-    artifacts = TeacherArtifactBuffer()
-    artifacts.append(key, 0, torch.tensor([[1], [2]]), torch.tensor([[-1.0], [-2.0]]))
-    artifacts.append(key, 2, torch.tensor([[3]]), torch.tensor([[-3.0]]), terminal=True)
-    assert artifacts.is_complete(key, 3)
-    ids, logprobs = artifacts.consume_reverse(key, 1, 3)
-    torch.testing.assert_close(ids[:, 0], torch.tensor([2, 3]))
-    torch.testing.assert_close(logprobs[:, 0], torch.tensor([-2.0, -3.0]))
-
-    parameter = nn.Parameter(torch.tensor([1.0]))
-    parameter.grad = torch.tensor([6.0])
-    barrier = PolicyVersionBarrier(3, ["a", "b"], valid_token_count=3)
-    barrier.mark_backward_complete(TrajectoryKey(3, "a"))
-    with pytest.raises(RuntimeError, match="not ready"):
-        barrier.step([parameter], lambda: None)
-    barrier.mark_backward_complete(TrajectoryKey(3, "b"))
-    barrier.step([parameter], lambda: parameter.data.add_(-parameter.grad))
-    torch.testing.assert_close(parameter, torch.tensor([-1.0]))
-
-
-def test_vllm_snapshot_loader_validates_identity_and_restores_layout(tmp_path) -> None:
-    base_path = str(tmp_path / "sealed")
-    filename = base_path + ".tp0.safetensors"
-    packed = torch.arange(3 * 2 * 2 * 4, dtype=torch.float32).reshape(3, 2, 2, 4)
-    save_file(
-        {"token_ids": torch.tensor([4, 5, 6]), "layer_00000": packed},
-        filename,
-        metadata={
-            "format": "verl-streamopd-kv-v1",
-            "request_id": "request-backend-suffix",
-            "trajectory_id": "request",
-            "policy_version": "2",
-            "prompt_length": "2",
-            "tp_rank": "0",
-            "tp_size": "1",
-            "page_size": "16",
-            "axis_order": "token_kv_head_dim",
-            "rope_convention": "post_rope_key",
-            "layer_names": '["model.layers.0.self_attn"]',
-        },
-    )
-    (tmp_path / "sealed.tp0.safetensors.lock").touch()
-    snapshot = load_vllm_snapshot(
-        base_path,
-        key=TrajectoryKey(2, "request"),
-        tp_rank=0,
-        expected_tp_size=1,
-        expected_token_ids=[4, 5, 6],
-        expected_prompt_length=2,
-        pin_memory=True,
-    )
-    assert snapshot.layout.num_layers == 1
-    assert snapshot.layout.num_kv_heads == 2
-    assert snapshot.layers[0][0].shape == (1, 2, 3, 4)
-    torch.testing.assert_close(snapshot.layers[0][0][0, :, 1], packed[1, 0])
-    with pytest.raises(RuntimeError, match="token identity"):
-        load_vllm_snapshot(
-            base_path,
-            key=TrajectoryKey(2, "request"),
-            tp_rank=0,
-            expected_tp_size=1,
-            expected_token_ids=[4, 5, 7],
-        )
-    with pytest.raises(RuntimeError, match="request identity"):
-        load_vllm_snapshot(
-            base_path,
-            key=TrajectoryKey(2, "other-request"),
-            tp_rank=0,
-            expected_tp_size=1,
-        )
-
-
-def test_move_vllm_snapshot_preserves_ownership_metadata() -> None:
-    key = TrajectoryKey(5, "prefetch")
-    layout = KVLayout(num_layers=1, num_kv_heads=2, head_dim=4, dtype="float32", page_size=16)
-    source = SealedKVSnapshot(
-        key=key,
-        token_ids=(1, 2, 3),
-        prompt_length=1,
-        layout=layout,
-        layers=((torch.ones(1, 2, 3, 4), torch.zeros(1, 2, 3, 4)),),
-        source="host-prefetch",
-        handoff_seconds=0.25,
-        streamed_tokens_before_eos=2,
-        streamed_chunks_before_eos=1,
-    )
-    staged = move_vllm_snapshot(source, "meta", non_blocking=False)
-    assert staged is not source
-    assert staged.state is SnapshotState.SEALED
-    assert staged.key == key
-    assert staged.source == source.source
-    assert staged.handoff_seconds == source.handoff_seconds
-    assert staged.layers[0][0].device.type == "meta"
-    assert source.layers[0][0].device.type == "cpu"
-
-
-def test_streamed_vllm_snapshot_loader_assembles_contiguous_chunks(tmp_path) -> None:
-    base_path = str(tmp_path / "streamed")
-    packed = torch.arange(5 * 2 * 2 * 4, dtype=torch.bfloat16).reshape(5, 2, 2, 4)
-    for chunk_index, (start, end) in enumerate(((0, 2), (2, 5))):
-        save_file(
-            {"layer_00000": packed[start:end]},
-            f"{base_path}.tp0.chunk{chunk_index:05d}.safetensors",
-            metadata={
-                "format": "verl-streamopd-kv-v2-chunk",
-                "request_id": "backend-request",
-                "trajectory_id": "trajectory",
-                "policy_version": "4",
-                "tp_rank": "0",
-                "tp_size": "1",
-                "chunk_index": str(chunk_index),
-                "start": str(start),
-                "end": str(end),
-            },
-        )
-    manifest = f"{base_path}.tp0.manifest.safetensors"
-    save_file(
-        {"token_ids": torch.tensor([2, 3, 5, 7, 11])},
-        manifest,
-        metadata={
-            "format": "verl-streamopd-kv-v2",
-            "request_id": "backend-request",
-            "trajectory_id": "trajectory",
-            "policy_version": "4",
-            "prompt_length": "2",
-            "tp_rank": "0",
-            "tp_size": "1",
-            "page_size": "16",
-            "axis_order": "token_kv_head_dim",
-            "rope_convention": "post_rope_key",
-            "layer_names": '["model.layers.0.self_attn"]',
-            "num_chunks": "2",
-            "streamed_tokens_before_eos": "2",
-            "streamed_chunks_before_eos": "1",
-        },
-    )
-    (tmp_path / "streamed.tp0.manifest.safetensors.lock").touch()
-
-    snapshot = load_vllm_snapshot(
-        base_path,
-        key=TrajectoryKey(4, "trajectory"),
-        tp_rank=0,
-        expected_tp_size=1,
-        expected_token_ids=[2, 3, 5, 7, 11],
-        expected_prompt_length=2,
-    )
-    assert snapshot.source == "vllm-stream-v2"
-    assert snapshot.streamed_tokens_before_eos == 2
-    assert snapshot.streamed_chunks_before_eos == 1
-    assert snapshot.layers[0][0].shape == (1, 2, 5, 4)
-    torch.testing.assert_close(snapshot.layers[0][0][0].transpose(0, 1), packed[:, 0])
-
-    slot_snapshot = load_vllm_slot_snapshot(
-        base_path,
-        key=TrajectoryKey(4, "trajectory"),
-        tp_rank=0,
-        expected_tp_size=1,
-        expected_token_ids=[2, 3, 5, 7, 11],
-        expected_prompt_length=2,
-        pin_memory=False,
-    )
-    assert slot_snapshot.layers[0].key.shape == (5, 2, 4)
-    assert slot_snapshot.layers[0].key.is_contiguous()
-    torch.testing.assert_close(slot_snapshot.layers[0].key, packed[:, 0])
-
-
 def test_shared_host_kv_slot_pool_uses_fixed_backing_and_reuses_rows(tmp_path) -> None:
     pool = HostKVSlotPool.create_or_open(
         str(tmp_path),
@@ -816,33 +445,31 @@ def test_shared_host_kv_slot_pool_uses_fixed_backing_and_reuses_rows(tmp_path) -
         streamed_tokens_before_eos=2,
         streamed_chunks_before_eos=1,
     )
-    snapshot = load_vllm_slot_snapshot(
+    snapshot = load_vllm_snapshot(
         first,
         key=TrajectoryKey(3, "trajectory-a"),
         tp_rank=0,
         expected_tp_size=1,
         expected_token_ids=[4, 5, 6],
         expected_prompt_length=1,
-        pin_memory=False,
     )
     assert snapshot.layers[0].key.is_contiguous()
     assert snapshot.streamed_tokens_before_eos == 2
     torch.testing.assert_close(snapshot.layers[1].key, torch.full((3, 1, 2), 2.0))
     torch.testing.assert_close(snapshot.layers[1].value, torch.full((3, 1, 2), -2.0))
     with pytest.raises(RuntimeError, match="token identity"):
-        load_vllm_slot_snapshot(
+        load_vllm_snapshot(
             first,
             key=TrajectoryKey(3, "trajectory-a"),
             tp_rank=0,
             expected_tp_size=1,
             expected_token_ids=[4, 5, 7],
             expected_prompt_length=1,
-            pin_memory=False,
         )
 
     data_path = HostKVSlotPool.data_path(pool.root)
     fixed_size = os.path.getsize(data_path)
-    cleanup_vllm_snapshot(first, tp_size=1)
+    release_vllm_snapshot(first)
     pool.release(second)
     reused = pool.acquire(
         request_id="backend-c",
@@ -883,7 +510,7 @@ def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
     state = _SchedulerSaveState(
         req_id="backend",
         trajectory_id="trajectory",
-        base_path="/tmp/trajectory",
+        slot_path="/tmp/trajectory",
         block_ids_by_group=[[0, 1, 2, 3]],
         policy_version=6,
         prompt_length=2,
@@ -900,101 +527,6 @@ def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
     ]
     assert state.published_tokens == 7
     assert state.next_chunk_index == 2
-
-
-@pytest.mark.parametrize(
-    ("max_chunk", "min_chunk", "microbatch_size", "trace_length", "target_length", "expected"),
-    [
-        (2048, 256, 1, 4096, 4096, 2048),
-        (2048, 256, 16, 4096, 4096, 2048),
-        (2048, 256, 32, 4096, 4096, 1024),
-        (2048, 256, 1, 8192, 4096, 1024),
-        (2048, 256, 64, 2048, 4096, 512),
-        (2048, 256, 128, 2048, 4096, 256),
-    ],
-)
-def test_dynamic_reverse_chunk_size_bounds_token_working_set(
-    max_chunk: int,
-    min_chunk: int,
-    microbatch_size: int,
-    trace_length: int,
-    target_length: int,
-    expected: int,
-) -> None:
-    assert (
-        _dynamic_reverse_chunk_size(
-            max_chunk,
-            min_chunk,
-            microbatch_size,
-            max_trace_length=trace_length,
-            target_trace_length=target_length,
-            alignment=64,
-        )
-        == expected
-    )
-
-
-def test_dynamic_reverse_chunk_size_prefers_maximum_with_memory_headroom() -> None:
-    assert (
-        _dynamic_reverse_chunk_size(
-            2048,
-            256,
-            32,
-            max_trace_length=8192,
-            target_trace_length=4096,
-            alignment=64,
-            available_memory_bytes=64 * 1024**3,
-            estimated_base_bytes=4 * 1024**3,
-            estimated_bytes_per_token=8 * 1024**2,
-        )
-        == 2048
-    )
-
-
-def test_reverse_batch_planner_preserves_chunk_size_and_uses_stable_power_of_two() -> None:
-    config = SimpleNamespace(
-        hidden_size=2048,
-        num_hidden_layers=28,
-        num_key_value_heads=8,
-        num_attention_heads=16,
-        head_dim=128,
-        vocab_size=151936,
-    )
-    model = SimpleNamespace(config=config, model=SimpleNamespace(layers=[object()] * 28))
-
-    assert (
-        _memory_limited_reverse_batch_size(
-            model,
-            configured_batch_size=16,
-            trace_length=4096,
-            chunk_size=1024,
-            dtype=torch.bfloat16,
-            available_memory_bytes=int(58.5 * 1024**3),
-        )
-        == 8
-    )
-    assert (
-        _memory_limited_reverse_batch_size(
-            model,
-            configured_batch_size=16,
-            trace_length=8192,
-            chunk_size=1024,
-            dtype=torch.bfloat16,
-            available_memory_bytes=int(58.5 * 1024**3),
-        )
-        == 4
-    )
-    assert (
-        _memory_limited_reverse_batch_size(
-            model,
-            configured_batch_size=32,
-            trace_length=4096,
-            chunk_size=1024,
-            dtype=torch.bfloat16,
-            available_memory_bytes=256 * 1024**3,
-        )
-        == 32
-    )
 
 
 def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
@@ -1047,6 +579,31 @@ def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
         available_memory_bytes=memory,
     )
     assert (long.batch_size, long.token_capacity, long.chunk_size) == (4, 8192, 1024)
+
+
+def test_fixed_slot_preflight_reports_memory_budget_on_failure() -> None:
+    config = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=28,
+        num_key_value_heads=8,
+        num_attention_heads=16,
+        head_dim=128,
+        vocab_size=151936,
+    )
+    model = SimpleNamespace(config=config, model=SimpleNamespace(layers=[object()] * 28))
+
+    with pytest.raises(RuntimeError, match=r"available=.*reserve=.*chunk_limit=.*minimum_chunk=64"):
+        _fixed_reverse_slot_plan(
+            model,
+            configured_batch_size=1,
+            token_capacity=4096,
+            max_batch_tokens=4096,
+            max_chunk_size=1024,
+            min_chunk_size=64,
+            page_size=64,
+            dtype=torch.bfloat16,
+            available_memory_bytes=1024**3,
+        )
 
 
 def test_reverse_preflight_reserves_lazy_adam_state_and_gradients() -> None:
@@ -1121,7 +678,7 @@ def test_zero_loss_synthetic_padding_is_not_trainable() -> None:
     assert _has_valid_response(TensorDict({"response_mask": padding}, batch_size=[])) is False
 
 
-def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> None:
+def test_prepare_config_installs_connector_only_for_streamopd() -> None:
     config = OmegaConf.create(
         {
             "trainer": {
@@ -1129,8 +686,8 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd_colocate",
-                    "streamopd_colocate": {"micro_batch_size": 1, "parameter_sync_step": 1},
+                    "trainer_mode": "streamopd",
+                    "streamopd": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -1160,7 +717,6 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
                     "enabled": True,
                     "runtime_profile": "manual",
                     "kv_handoff_dir": "/tmp/test-streamopd",
-                    "micro_batch_size": 16,
                 },
                 "distillation_loss": {
                     "loss_mode": "forward_kl_topk",
@@ -1176,8 +732,7 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
     assert connector.kv_connector_extra_config.streamopd_host_slot_count == 128
     assert connector.kv_connector_extra_config.streamopd_host_slot_tokens == 4096
-    assert config.trainer.v1.streamopd_colocate.micro_batch_size == 128
-    assert config.trainer.v1.streamopd_colocate.parameter_sync_step == 1
+    assert OmegaConf.to_container(config.trainer.v1.streamopd) == {}
     assert config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
     assert config.algorithm.filter_groups.enable is False
@@ -1188,20 +743,9 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     assert config.distillation.streamopd_kv.reverse_chunk_size == 1024
     assert config.distillation.streamopd_kv.reverse_chunk_min_size == 64
 
-    reverse_trigger_config = copy.deepcopy(config)
-    reverse_trigger_config.distillation.streamopd_kv.micro_batch_size = 32
-    reverse_trigger_config.distillation.streamopd_kv.reverse_batch_size = 16
-    prepare_streamopd_kv_config(reverse_trigger_config)
-    assert reverse_trigger_config.trainer.v1.streamopd_colocate.parameter_sync_step == 1
-
-    ragged_unit_config = copy.deepcopy(config)
-    ragged_unit_config.data.train_batch_size = 130
-    ragged_unit_config.distillation.streamopd_kv.micro_batch_size = 32
-    prepare_streamopd_kv_config(ragged_unit_config)
-
     stale_config = copy.deepcopy(config)
     stale_config.trainer.v1.trainer_mode = "sync"
-    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd_colocate"):
+    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd"):
         prepare_streamopd_kv_config(stale_config)
 
     multi_sample_config = copy.deepcopy(config)
@@ -1412,8 +956,8 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd_colocate",
-                    "streamopd_colocate": {"micro_batch_size": 1, "parameter_sync_step": 1},
+                    "trainer_mode": "streamopd",
+                    "streamopd": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -1535,34 +1079,29 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
         scheduler.teacher_enqueued(8)
 
 
-def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd_colocate import (
-        _checkpoint_weight_bytes,
-        _minimum_device_total_bytes,
-        _plan_host_kv_handoff,
-        _plan_rollout_memory,
-        _plan_shared_rollout_memory,
-        _plan_teacher_admission,
-        _planned_local_reverse_width,
-        _rollout_kv_bytes_per_token,
-        _shared_vllm_utilization_limit,
-        _streamopd_batch_sizes,
+def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from verl.experimental.streamopd_kv.planning import (
+        checkpoint_weight_bytes,
+        kv_bytes_per_token,
+        minimum_device_total_bytes,
+        partition_training_units,
+        plan_host_kv,
+        plan_teacher_admission,
+        plan_vllm_memory,
+        planned_reverse_width,
+        shared_vllm_utilization_limit,
     )
 
-    assert _streamopd_batch_sizes(32, 16, 16) == [16, 16]
-    assert _streamopd_batch_sizes(128, 32, 16) == [16, 32, 32, 32, 16]
-    assert _streamopd_batch_sizes(128, 32, 16, planned_unit_size=16) == [16] * 8
-    assert _streamopd_batch_sizes(130, 0, 0, planned_unit_size=16) == [16] * 8 + [2]
+    assert partition_training_units(128, 16) == [16] * 8
+    assert partition_training_units(130, 16) == [16] * 8 + [2]
     assert (
-        _planned_local_reverse_width(
+        planned_reverse_width(
             [{"slot_batch_size": 8.0}, [{"slot_batch_size": 4.0}]],
             fallback=16,
         )
         == 4
     )
-    assert _plan_teacher_admission(
+    assert plan_teacher_admission(
         expected_trajectories=32,
         trajectory_tokens=1000,
         vllm_capacity_tokens=40000,
@@ -1578,7 +1117,7 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
         "trajectory_tokens": 1024,
         "prefill_wave": 5,
     }
-    capped = _plan_teacher_admission(
+    capped = plan_teacher_admission(
         expected_trajectories=32,
         trajectory_tokens=4096,
         vllm_capacity_tokens=20000,
@@ -1592,7 +1131,7 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
     assert capped["active_trajectories"] == 2
     assert capped["active_kv_tokens"] == 8192
     with pytest.raises(ValueError, match="cannot fit one trajectory"):
-        _plan_teacher_admission(
+        plan_teacher_admission(
             expected_trajectories=8,
             trajectory_tokens=4096,
             vllm_capacity_tokens=20000,
@@ -1603,8 +1142,8 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
             token_cap=2048,
         )
 
-    assert _minimum_device_total_bytes([{"total_bytes": 80 * 1024**3}, [{"total_bytes": 79 * 1024**3}]]) == 79 * 1024**3
-    shared_limit = _shared_vllm_utilization_limit(
+    assert minimum_device_total_bytes([{"total_bytes": 80 * 1024**3}, [{"total_bytes": 79 * 1024**3}]]) == 79 * 1024**3
+    shared_limit = shared_vllm_utilization_limit(
         [
             {"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3},
             {"free_bytes": 68 * 1024**3, "total_bytes": 80 * 1024**3},
@@ -1620,43 +1159,13 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
         "reverse_reserve_gib": 28.0,
     }
     with pytest.raises(ValueError, match="insufficient memory"):
-        _shared_vllm_utilization_limit(
+        shared_vllm_utilization_limit(
             [{"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3}],
             rank_offset=0,
             world_size=1,
             required_free_bytes=20 * 1024**3,
         )
-    rollout_plan = _plan_shared_rollout_memory(
-        total_memory_bytes=80 * 1024**3,
-        weight_bytes=4 * 1024**3,
-        kv_bytes_per_token=128 * 1024,
-        max_num_seqs=32,
-        max_model_len=1024,
-        configured_utilization=0.65,
-    )
-    assert 0.18 <= rollout_plan["gpu_memory_utilization"] < 0.25
-    assert rollout_plan["kv_gib"] == 4.0
-    smaller_gpu_plan = _plan_shared_rollout_memory(
-        total_memory_bytes=40 * 1024**3,
-        weight_bytes=4 * 1024**3,
-        kv_bytes_per_token=128 * 1024,
-        max_num_seqs=32,
-        max_model_len=1024,
-        configured_utilization=1.0,
-    )
-    assert smaller_gpu_plan["gpu_memory_utilization"] > rollout_plan["gpu_memory_utilization"]
-    assert smaller_gpu_plan["required_gib"] == rollout_plan["required_gib"]
-    with pytest.raises(ValueError, match="cannot hold"):
-        _plan_shared_rollout_memory(
-            total_memory_bytes=80 * 1024**3,
-            weight_bytes=4 * 1024**3,
-            kv_bytes_per_token=128 * 1024,
-            max_num_seqs=32,
-            max_model_len=1024,
-            configured_utilization=0.1,
-        )
-
-    inferred_4k = _plan_rollout_memory(
+    inferred_4k = plan_vllm_memory(
         total_memory_bytes=80 * 1024**3,
         weight_bytes=4063479808,
         kv_bytes_per_token=112 * 1024,
@@ -1669,7 +1178,7 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
     assert inferred_4k["max_num_seqs"] == 128
     assert inferred_4k["gpu_memory_utilization"] == 0.9
 
-    inferred_8k = _plan_rollout_memory(
+    inferred_8k = plan_vllm_memory(
         total_memory_bytes=80 * 1024**3,
         weight_bytes=4063479808,
         kv_bytes_per_token=112 * 1024,
@@ -1682,7 +1191,7 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
     assert inferred_8k["max_num_seqs"] == 64
     assert inferred_8k["gpu_memory_utilization"] == 0.9
 
-    memory_capped_8k = _plan_rollout_memory(
+    memory_capped_8k = plan_vllm_memory(
         total_memory_bytes=80 * 1024**3,
         weight_bytes=4063479808,
         kv_bytes_per_token=112 * 1024,
@@ -1696,7 +1205,7 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
     assert memory_capped_8k["gpu_memory_utilization"] == 0.5
 
     with pytest.raises(ValueError, match="explicitly requested"):
-        _plan_rollout_memory(
+        plan_vllm_memory(
             total_memory_bytes=80 * 1024**3,
             weight_bytes=4063479808,
             kv_bytes_per_token=112 * 1024,
@@ -1708,18 +1217,18 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
         )
 
     monkeypatch.setattr(
-        "verl.trainer.ppo.v1.trainer_streamopd_colocate.shutil.disk_usage",
+        "verl.experimental.streamopd_kv.planning.shutil.disk_usage",
         lambda path: SimpleNamespace(total=200 * 1024**3, used=0, free=200 * 1024**3),
     )
-    host_plan = _plan_host_kv_handoff(
+    host_plan = plan_host_kv(
         handoff_dir=str(tmp_path / "handoff"),
         global_batch_size=128,
         max_model_len=4096,
         kv_bytes_per_token=112 * 1024,
     )
     assert host_plan["host_kv_required_gib"] == 56.0
-    with pytest.raises(ValueError, match="host KV backing"):
-        _plan_host_kv_handoff(
+    with pytest.raises(ValueError, match="Host KV backing"):
+        plan_host_kv(
             handoff_dir=str(tmp_path / "handoff"),
             global_batch_size=512,
             max_model_len=8192,
@@ -1733,8 +1242,8 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
         '{"num_hidden_layers": 4, "num_key_value_heads": 2, '
         '"num_attention_heads": 8, "hidden_size": 512, "head_dim": 64}'
     )
-    assert _checkpoint_weight_bytes(str(model_dir)) == 12345
-    assert _rollout_kv_bytes_per_token(str(model_dir), "bfloat16") == 4 * 2 * 64 * 2 * 2
+    assert checkpoint_weight_bytes(str(model_dir)) == 12345
+    assert kv_bytes_per_token(str(model_dir), "bfloat16") == 4 * 2 * 64 * 2 * 2
 
 
 def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
@@ -1772,44 +1281,6 @@ def test_teacher_admission_waits_for_asynchronous_wake() -> None:
     assert scheduler.try_teacher_started(12) is True
     scheduler.teacher_finished(12)
     scheduler.end_policy(12)
-
-
-@pytest.mark.asyncio
-async def test_vllm_level_two_sleep_reuses_weight_backing_for_sync() -> None:
-    from verl.workers.rollout.replica import RolloutMode
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
-
-    class FakeEngine:
-        def __init__(self) -> None:
-            self.calls = []
-
-        async def sleep(self, *, level: int) -> None:
-            self.calls.append(("sleep", level))
-
-        async def wake_up(self, *, tags: list[str]) -> None:
-            self.calls.append(("wake_up", tuple(tags)))
-
-        async def reset_prefix_cache(self, **kwargs) -> None:
-            self.calls.append(("reset_prefix_cache", kwargs))
-
-    server = vLLMHttpServer.__new__(vLLMHttpServer)
-    server.node_rank = 0
-    server.config = SimpleNamespace(free_cache_engine=True)
-    server.rollout_mode = RolloutMode.STANDALONE
-    server.engine = FakeEngine()
-    server._sleeping_tags = set()
-    server._sleep_level = 0
-
-    await server.sleep(level=2)
-    await server.release_kv_cache()
-    await server.resume_kv_cache()
-
-    assert server.engine.calls[0] == ("sleep", 2)
-    assert server.engine.calls[1] == ("wake_up", ("weights",))
-    assert server.engine.calls[2] == ("wake_up", ("kv_cache",))
-    assert server.engine.calls[3][0] == "reset_prefix_cache"
-    assert server._sleeping_tags == set()
-    assert server._sleep_level == 0
 
 
 def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
@@ -1984,26 +1455,6 @@ def test_teacher_session_slot_refills_after_eos() -> None:
     scheduler.end_policy(15)
 
 
-def test_posthoc_scheduler_waits_for_all_terminal_teacher_results() -> None:
-    scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(17, expected_trajectories=2)
-    scheduler.teacher_trajectory_terminal_submitted(17)
-    scheduler.teacher_trajectory_completed(17)
-    assert scheduler.snapshot()["posthoc_ready"] is False
-
-    scheduler.teacher_trajectory_terminal_submitted(17)
-    assert scheduler.snapshot()["posthoc_ready"] is False
-    scheduler.teacher_trajectory_completed(17)
-
-    state = scheduler.snapshot()
-    assert state["posthoc_ready"] is True
-    assert state["terminal_trajectories"] == 2
-    assert state["completed_teacher_trajectories"] == 2
-    metrics = scheduler.end_policy(17)
-    assert metrics["streamopd/scheduler_terminal_trajectories"] == 2
-    assert metrics["streamopd/scheduler_completed_teacher_trajectories"] == 2
-
-
 def test_policy_barrier_rejects_missing_teacher_trajectory() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(18, expected_trajectories=2)
@@ -2123,14 +1574,6 @@ def test_distillation_config_coerces_streamopd_mapping_without_mutating_frozen_f
     assert config.streamopd_kv.reverse_chunk_size == 32
 
 
-def test_posthoc_config_rejects_initial_streaming_ablation() -> None:
-    with pytest.raises(ValueError, match="incompatible"):
-        StreamOPDKVConfig(
-            posthoc_ablation=True,
-            teacher_terminal_only_after_initial=True,
-        )
-
-
 def test_streamopd_runtime_profile_rejects_unknown_policy() -> None:
     with pytest.raises(ValueError, match="runtime_profile"):
         StreamOPDKVConfig(runtime_profile="guess")
@@ -2149,45 +1592,55 @@ def test_dapo_adapter_wraps_plain_prompt_as_chat_messages(monkeypatch) -> None:
 
 
 def test_streamopd_trainer_does_not_expose_unused_reward_handles() -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd_colocate import PPOTrainerStreamOPDColocate
+    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
 
-    trainer = PPOTrainerStreamOPDColocate.__new__(PPOTrainerStreamOPDColocate)
+    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
     assert trainer.get_reward_handles() is None
+    assert trainer._get_required_batch_multiple(dp_size=3) == 3
+    assert trainer._optimizer_updates_per_global_step() == 1
+    metric_data = TensorDict({"responses": torch.ones(2, 3, dtype=torch.long)}, batch_size=[2])
+    prepared = trainer._prepare_metric_tensors(metric_data)
+    assert torch.equal(prepared["rm_scores"], torch.zeros(2, 3))
 
 
 def test_union_topology_falls_back_to_drain_first_policy() -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd_colocate import PPOTrainerStreamOPDColocate
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
 
-    trainer = PPOTrainerStreamOPDColocate.__new__(PPOTrainerStreamOPDColocate)
+    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
     trainer.config = OmegaConf.create(
         {"distillation": {"streamopd_kv": {"trainer_placement": "union", "scheduler_policy": "adaptive"}}}
     )
+    trainer.placement = TrainerPlacement.UNION
     assert trainer._effective_scheduler_policy() == "teacher_then_train"
     trainer.config.distillation.streamopd_kv.trainer_placement = "rollout"
+    trainer.placement = TrainerPlacement.ROLLOUT
     assert trainer._effective_scheduler_policy() == "adaptive"
 
 
-def test_vllm_connector_waits_for_claimed_copy_event_and_ignores_unclaimed_request() -> None:
+def test_vllm_connector_waits_for_terminal_seal_and_ignores_unclaimed_request() -> None:
     from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector
 
-    class Event:
+    class SealFuture:
         complete = False
 
-        def query(self) -> bool:
+        def done(self) -> bool:
             return self.complete
+
+        def result(self) -> None:
+            assert self.complete
 
     connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
     connector._connector_metadata = None
     connector._finished_requests = set()
     connector._claimed_requests = {"claimed"}
-    connector._copy_events = {}
-    connector._lock_fds = {}
+    connector._seal_futures = {}
     assert connector.get_finished({"claimed", "ordinary"}) == (None, None)
 
-    event = Event()
-    connector._copy_events["claimed"] = event
+    future = SealFuture()
+    connector._seal_futures["claimed"] = future
     assert connector.get_finished(set()) == (None, None)
-    event.complete = True
+    future.complete = True
     assert connector.get_finished(set()) == ({"claimed"}, None)
     assert not connector._claimed_requests
 
@@ -2206,7 +1659,7 @@ def test_vllm_connector_finish_is_idempotent() -> None:
         "backend-id": _SchedulerSaveState(
             req_id="backend-id",
             trajectory_id="trajectory-id",
-            base_path="/tmp/streamopd/backend-id",
+            slot_path="/tmp/streamopd/backend-id",
             block_ids_by_group=[[0, 1]],
             policy_version=3,
             prompt_length=1,
@@ -2241,143 +1694,3 @@ def test_vllm_connector_finish_is_idempotent() -> None:
     assert not connector._claimed_requests
     with pytest.raises(RuntimeError, match="no scheduler state"):
         connector.request_finished_all_groups(request, ([0, 1],))
-
-
-@pytest.mark.parametrize(("sequence_length", "chunk_size"), [(5, 8), (7, 3), (9, 4)])
-def test_reverse_chunk_gradients_match_full_sequence_opd(sequence_length: int, chunk_size: int) -> None:
-    torch.manual_seed(7)
-    baseline = _ToyCausalLM().eval()
-    reverse = copy.deepcopy(baseline).eval()
-    full_tokens = torch.tensor([[2, 5, 7, 11, 13, 17, 19, 23, 29, 3]])[:, : sequence_length + 1]
-    input_ids, targets = full_tokens[:, :-1], full_tokens[:, 1:]
-    loss_mask = torch.arange(sequence_length).unsqueeze(0) >= 2
-
-    baseline_logits, _ = baseline(input_ids)
-    baseline_loss = F.cross_entropy(baseline_logits[loss_mask], targets[loss_mask], reduction="sum")
-    baseline_loss.backward()
-
-    with torch.no_grad():
-        _, rollout_cache = reverse(input_ids)
-    state = ReverseChunkState([LayerKVTrace(key, value) for key, value in rollout_cache])
-    reverse_loss = torch.zeros(())
-    for end in range(input_ids.shape[1], 0, -chunk_size):
-        start = max(0, end - chunk_size)
-        state.begin(start, end)
-        logits, _ = reverse(input_ids[:, start:end], reverse_state=state)
-        local_mask = loss_mask[:, start:end]
-        chunk_loss = (
-            F.cross_entropy(logits[local_mask], targets[:, start:end][local_mask], reduction="sum")
-            if local_mask.any()
-            else logits.sum() * 0.0
-        )
-        (chunk_loss + state.gradient_injection()).backward()
-        state.commit_prefix_gradients(release_processed_suffix=True)
-        reverse_loss += chunk_loss.detach()
-
-    torch.testing.assert_close(reverse_loss, baseline_loss.detach(), rtol=1e-6, atol=1e-6)
-    for (baseline_name, baseline_parameter), (reverse_name, reverse_parameter) in zip(
-        baseline.named_parameters(), reverse.named_parameters(), strict=True
-    ):
-        assert baseline_name == reverse_name
-        assert baseline_parameter.grad is not None, baseline_name
-        assert reverse_parameter.grad is not None, reverse_name
-        torch.testing.assert_close(
-            reverse_parameter.grad,
-            baseline_parameter.grad,
-            rtol=2e-4,
-            atol=2e-5,
-            msg=lambda message, name=baseline_name: f"{name}: {message}",
-        )
-
-
-def test_batched_ragged_reverse_gradients_match_full_sequence() -> None:
-    torch.manual_seed(43)
-    baseline = _ToyCausalLM().eval()
-    reverse = copy.deepcopy(baseline).eval()
-    sequences = [
-        torch.tensor([[2, 5, 7, 11, 13, 17, 19]]),
-        torch.tensor([[3, 7, 11, 17, 23, 29, 2, 5, 13]]),
-    ]
-    targets = [torch.roll(sequence, shifts=-1, dims=1) for sequence in sequences]
-    valid_masks = [torch.arange(sequence.shape[1]).unsqueeze(0) >= 2 for sequence in sequences]
-
-    baseline_loss = torch.zeros(())
-    for sequence, target, valid in zip(sequences, targets, valid_masks, strict=True):
-        logits, _ = baseline(sequence)
-        baseline_loss = baseline_loss + F.cross_entropy(logits[valid], target[valid], reduction="sum")
-    baseline_loss.backward()
-
-    traces = []
-    with torch.no_grad():
-        for sequence in sequences:
-            _, cache = reverse(sequence)
-            traces.append([LayerKVTrace(key, value) for key, value in cache])
-    state = BatchedReverseChunkState(traces)
-    chunk_size = 3
-    ends = [sequence.shape[1] for sequence in sequences]
-    reverse_loss = torch.zeros(())
-    while active := [idx for idx, end in enumerate(ends) if end >= chunk_size]:
-        starts = [ends[idx] - chunk_size for idx in active]
-        active_ends = [ends[idx] for idx in active]
-        state.begin(active, starts, active_ends)
-        chunk_ids = torch.cat(
-            [sequences[idx][:, start:end] for idx, start, end in zip(active, starts, active_ends, strict=True)]
-        )
-        logits, _ = reverse(chunk_ids, reverse_state=state)
-        chunk_loss = logits.sum() * 0.0
-        for row, (idx, start, end) in enumerate(zip(active, starts, active_ends, strict=True)):
-            mask = valid_masks[idx][:, start:end]
-            if mask.any():
-                chunk_loss = chunk_loss + F.cross_entropy(
-                    logits[row : row + 1][mask], targets[idx][:, start:end][mask], reduction="sum"
-                )
-        (chunk_loss + state.gradient_injection()).backward()
-        state.commit_prefix_gradients(release_processed_suffix=True)
-        reverse_loss += chunk_loss.detach()
-        for idx, start in zip(active, starts, strict=True):
-            ends[idx] = start
-
-    if active := [idx for idx, end in enumerate(ends) if end]:
-        starts = [0] * len(active)
-        active_ends = [ends[idx] for idx in active]
-        state.begin(active, starts, active_ends)
-        max_residual = max(active_ends)
-        chunk_ids = torch.cat(
-            [
-                F.pad(sequences[idx][:, :end], (0, max_residual - end))
-                for idx, end in zip(active, active_ends, strict=True)
-            ]
-        )
-        logits, _ = reverse(chunk_ids, reverse_state=state)
-        chunk_loss = logits.sum() * 0.0
-        for row, (idx, end) in enumerate(zip(active, active_ends, strict=True)):
-            mask = valid_masks[idx][:, :end]
-            if mask.any():
-                chunk_loss = chunk_loss + F.cross_entropy(
-                    logits[row : row + 1, :end][mask], targets[idx][:, :end][mask], reduction="sum"
-                )
-        (chunk_loss + state.gradient_injection()).backward()
-        state.commit_prefix_gradients(release_processed_suffix=True)
-        reverse_loss += chunk_loss.detach()
-
-    torch.testing.assert_close(reverse_loss, baseline_loss.detach(), rtol=1e-6, atol=1e-6)
-    for (baseline_name, baseline_parameter), (reverse_name, reverse_parameter) in zip(
-        baseline.named_parameters(), reverse.named_parameters(), strict=True
-    ):
-        assert baseline_name == reverse_name
-        torch.testing.assert_close(
-            reverse_parameter.grad,
-            baseline_parameter.grad,
-            rtol=3e-4,
-            atol=3e-5,
-            msg=lambda message, name=baseline_name: f"{name}: {message}",
-        )
-
-
-def test_qwen3_paged_reverse_rejects_trace_length_mismatch() -> None:
-    trainer = Qwen3ReverseTrainer(torch.nn.Linear(2, 2).eval(), chunk_size=16, page_size=16)
-    sequences = [torch.ones((1, 4), dtype=torch.long), torch.ones((1, 5), dtype=torch.long)]
-    loss_fns = [lambda *_: (torch.zeros(()), 0), lambda *_: (torch.zeros(()), 0)]
-    layer = LayerKVTrace(torch.zeros((1, 1, 4, 2)), torch.zeros((1, 1, 4, 2)))
-    with pytest.raises(ValueError, match="trace must match"):
-        trainer.backward_batched(sequences, [[layer], [layer]], loss_fns)

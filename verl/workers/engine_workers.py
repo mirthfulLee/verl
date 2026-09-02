@@ -465,13 +465,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
-        streamopd_config = getattr(distillation_config, "streamopd_kv", None)
-        if streamopd_config is not None and getattr(streamopd_config, "enabled", False):
-            if config.actor.strategy not in ("fsdp", "fsdp2"):
-                raise NotImplementedError("StreamOPD-KV training currently supports FSDP/FSDP2 only")
-            from verl.experimental.streamopd_kv.fsdp_worker import StreamOPDKVTrainingWorker
-
-            self.actor_worker_cls = StreamOPDKVTrainingWorker
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
@@ -536,37 +529,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def set_loss_fn(self, loss_fn):
         self.actor.set_loss_fn(loss_fn=loss_fn)
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def prepare_streamopd_reverse_plan(self):
-        if self.actor is None or not hasattr(self.actor, "prepare_reverse_plan"):
-            return None
-        return self.actor.prepare_reverse_plan()
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def configure_streamopd_reverse_preflight(self, batch_cap=None, additional_reserve_gib=0.0):
-        if self.actor is None or not hasattr(self.actor, "configure_reverse_preflight"):
-            return None
-        self.actor.configure_reverse_preflight(
-            batch_cap=batch_cap,
-            additional_reserve_gib=additional_reserve_gib,
-        )
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def reset_streamopd_memory_stats(self):
-        if self.actor is None:
-            return None
-        get_torch_device().reset_peak_memory_stats()
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_streamopd_device_memory_stats(self):
-        device_module = get_torch_device()
-        free_bytes, total_bytes = device_module.mem_get_info()
-        return {
-            "free_bytes": int(free_bytes),
-            "total_bytes": int(total_bytes),
-            "allocated_bytes": int(device_module.memory_allocated()),
-            "reserved_bytes": int(device_module.memory_reserved()),
-        }
+    def _configure_actor_training_worker(self, training_config, distillation_config) -> None:
+        """Allow specialized outer workers to configure their TrainingWorker."""
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -650,9 +614,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=actor_config.checkpoint,
                 profiler_config=actor_profiler_config,
             )
-            if distillation_config is not None and distillation_config.streamopd_kv.enabled:
-                actor_training_config.extra_context["streamopd_kv"] = distillation_config.streamopd_kv
-                actor_training_config.extra_context["distillation"] = distillation_config
+            self._configure_actor_training_worker(actor_training_config, distillation_config)
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz
 

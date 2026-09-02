@@ -19,7 +19,7 @@ MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
 # Compatibility hooks used by the matched baseline harness. Normal StreamOPD
 # runs leave these defaults unchanged; advanced studies use Hydra overrides.
 DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT=${DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT:-False}
-TRAINER_MODE=${TRAINER_MODE:-streamopd_colocate}
+TRAINER_MODE=${TRAINER_MODE:-streamopd}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 STREAMOPD_KV_ENABLED=${STREAMOPD_KV_ENABLED:-True}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-streamopd_kv_qwen3}

@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import os
+from importlib.metadata import PackageNotFoundError, version
 
 from omegaconf import DictConfig, OmegaConf, open_dict
+from packaging.version import Version
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -157,24 +159,18 @@ def _auto_streamopd_runtime_profile(
 
     derived_stream_values = {
         "token_chunk_size": response_chunk,
-        "teacher_initial_chunk_size": response_chunk,
         "reverse_chunk_size": 0,
         "reverse_chunk_min_size": 0,
         "reverse_page_size": page_size,
         "reverse_batch_size": 0,
         "reverse_batch_max_tokens": 0,
-        "reverse_fixed_slots": True,
         "reverse_slot_max_tokens": 0,
         "reverse_slot_reserve_gib": 4.0,
-        "micro_batch_size": min(32, global_batch),
-        "teacher_priority_threshold": 0,
         "teacher_prefill_max_active_trajectories": 0,
         "teacher_prefill_max_active_kv_tokens": 0,
         "teacher_prefill_kv_page_size": page_size,
         "kv_prefetch_depth": 1,
         "kv_prefetch_workers": 4,
-        "kv_prefetch_pin_memory": True,
-        "release_stage1_kv_after_copy": True,
         "kv_handoff_dir": f"/dev/shm/verl-streamopd-kv-{os.getpid()}",
     }
     for key, value in derived_stream_values.items():
@@ -204,11 +200,17 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     stream_config = config.distillation.get("streamopd_kv", {})
     trainer_mode = config.trainer.v1.trainer_mode if config.trainer.use_v1 else None
     if not stream_config.get("enabled", False):
-        if trainer_mode == "streamopd_colocate":
-            raise ValueError("trainer_mode=streamopd_colocate requires distillation.streamopd_kv.enabled=true")
+        if trainer_mode == "streamopd":
+            raise ValueError("trainer_mode=streamopd requires distillation.streamopd_kv.enabled=true")
         return
-    if not config.trainer.use_v1 or trainer_mode != "streamopd_colocate":
-        raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd_colocate")
+    if not config.trainer.use_v1 or trainer_mode != "streamopd":
+        raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd")
+    try:
+        installed_vllm = version("vllm")
+    except PackageNotFoundError as error:
+        raise RuntimeError("StreamOPD requires vLLM >= 0.15.1") from error
+    if Version(installed_vllm) < Version("0.15.1"):
+        raise RuntimeError(f"StreamOPD requires vLLM >= 0.15.1, found {installed_vllm}")
     runtime_profile = str(stream_config.get("runtime_profile", "auto"))
     if runtime_profile not in {"auto", "manual"}:
         raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
@@ -288,12 +290,6 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
             stream_config.reverse_chunk_size = min(aligned_slot_tokens, 1024)
         if int(stream_config.get("reverse_chunk_min_size", 0)) == 0:
             stream_config.reverse_chunk_min_size = page_size
-    with open_dict(config.trainer.v1.streamopd_colocate):
-        # Runtime preflight determines the actual training-unit width and
-        # accumulation count. These values are placeholders for base-trainer
-        # initialization only.
-        config.trainer.v1.streamopd_colocate.micro_batch_size = train_batch_size
-        config.trainer.v1.streamopd_colocate.parameter_sync_step = 1
     with open_dict(config.trainer.v1.sampler):
         # ReplayBuffer measures the number of policy versions spanned by a
         # trajectory. A strict single-version trajectory therefore has span 1.

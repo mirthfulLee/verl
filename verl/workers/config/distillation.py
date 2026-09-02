@@ -235,12 +235,6 @@ class StreamOPDKVConfig(BaseConfig):
     # verl options remain the public constraints; this field is diagnostic.
     planner_explicit_options: list[str] = field(default_factory=list)
     token_chunk_size: int = 256
-    teacher_initial_chunk_size: int = 256
-    teacher_first_chunk_includes_prompt: bool = True
-    teacher_terminal_only_after_initial: bool = False
-    # Ablation: submit one complete prompt+response at EOS and defer all
-    # reverse work until every trajectory in the global batch is scored.
-    posthoc_ablation: bool = False
     # Physical GPU allocation is user-controlled. ``teacher`` colocates the
     # fixed-topology trainer with Teacher vLLM; ``rollout`` colocates separate
     # rollout processes on Trainer GPUs; ``union`` spans disjoint Teacher and
@@ -259,21 +253,12 @@ class StreamOPDKVConfig(BaseConfig):
     reverse_batch_max_tokens: int = 0
     # Persistent K/V/dK/dV rows planned and allocated before policy version 0.
     # A zero token limit is resolved from data.max_prompt/response_length.
-    reverse_fixed_slots: bool = True
     reverse_slot_max_tokens: int = 0
     reverse_slot_reserve_gib: float = 4.0
-    micro_batch_size: int = 32
-    teacher_priority_threshold: int = 0
     scheduler_poll_interval_ms: int = 10
     scheduler_timeout_seconds: float = 600.0
     scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
-    # Sleep is automatic only when another role can reuse the same GPU pool.
-    # Disable for controlled lifecycle ablations.
-    enable_pool_sleep: bool = True
-    # Level-2 Rollout sleep is opt-in: fixed reverse slots are planned while
-    # Rollout is resident, so released memory does not yet increase throughput.
-    enable_rollout_sleep_level2: bool = False
     # Optional preflight caps. Zero lets the scheduler derive stable values
     # from vLLM's profiled KV blocks and the reverse training-unit width.
     teacher_prefill_max_active_trajectories: int = 0
@@ -287,13 +272,8 @@ class StreamOPDKVConfig(BaseConfig):
     # how many sealed host snapshots may be in flight.
     kv_prefetch_depth: int = 1
     kv_prefetch_workers: int = 4
-    kv_prefetch_pin_memory: bool = True
-    release_stage1_kv_after_copy: bool = True
     kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
-    rollout_backend: str = "vllm"
-    exact_dense_attention: bool = True
     require_same_tokenizer: bool = True
-    cleanup_after_step: bool = True
     validate_teacher_artifacts: bool = False
     validate_full_forward_loss: bool = False
     validation_atol: float = 1e-4
@@ -303,9 +283,7 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
         for name in (
             "token_chunk_size",
-            "teacher_initial_chunk_size",
             "reverse_page_size",
-            "micro_batch_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
             "teacher_prefill_kv_page_size",
@@ -340,26 +318,18 @@ class StreamOPDKVConfig(BaseConfig):
             raise ValueError("streamopd_kv.reverse_slot_reserve_gib must be non-negative")
         if self.validation_atol < 0:
             raise ValueError("streamopd_kv.validation_atol must be non-negative")
-        if self.teacher_priority_threshold < 0:
-            raise ValueError("streamopd_kv.teacher_priority_threshold must be non-negative")
         if self.teacher_prefill_max_active_trajectories < 0:
             raise ValueError("streamopd_kv.teacher_prefill_max_active_trajectories must be non-negative")
         if self.teacher_prefill_max_active_kv_tokens < 0:
             raise ValueError("streamopd_kv.teacher_prefill_max_active_kv_tokens must be non-negative")
         if self.scheduler_timeout_seconds <= 0:
             raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
-        if self.posthoc_ablation and self.teacher_terminal_only_after_initial:
-            raise ValueError("posthoc_ablation is incompatible with teacher_terminal_only_after_initial")
         if self.trainer_placement not in {"teacher", "rollout", "union", "dedicated"}:
             raise NotImplementedError(
                 "streamopd_kv.trainer_placement supports 'teacher', 'rollout', 'union', and 'dedicated'"
             )
         if self.scheduler_policy not in {"adaptive", "teacher_then_train"}:
             raise ValueError("streamopd_kv.scheduler_policy must be 'adaptive' or 'teacher_then_train'")
-        if self.enabled and self.rollout_backend != "vllm":
-            raise NotImplementedError("StreamOPD-KV MVP supports rollout_backend='vllm' only")
-        if self.enabled and not self.exact_dense_attention:
-            raise ValueError("strict StreamOPD-KV requires exact_dense_attention=true")
 
 
 @dataclass
@@ -404,8 +374,8 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
-    # Generic V1 sync-baseline placement option. StreamOPD has a dedicated
-    # rollout pool and always shares the trainer pool with its teacher.
+    # Generic V1 sync-baseline placement option. StreamOPD uses the separate
+    # trainer_placement setting and does not read this flag.
     colocate_teacher_with_student: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0

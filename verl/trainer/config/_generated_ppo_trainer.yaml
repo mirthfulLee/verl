@@ -884,10 +884,6 @@ distillation:
     runtime_profile: auto
     planner_explicit_options: []
     token_chunk_size: 256
-    teacher_initial_chunk_size: 256
-    teacher_first_chunk_includes_prompt: true
-    teacher_terminal_only_after_initial: false
-    posthoc_ablation: false
     trainer_placement: teacher
     scheduler_policy: adaptive
     reverse_chunk_size: 0
@@ -895,29 +891,19 @@ distillation:
     reverse_page_size: 64
     reverse_batch_size: 0
     reverse_batch_max_tokens: 0
-    reverse_fixed_slots: true
     reverse_slot_max_tokens: 0
     reverse_slot_reserve_gib: 4.0
-    micro_batch_size: 32
-    teacher_priority_threshold: 0
     scheduler_poll_interval_ms: 10
     scheduler_timeout_seconds: 600.0
     scheduler_actor_name: ''
     max_pending_teacher_chunks: 128
-    enable_pool_sleep: true
-    enable_rollout_sleep_level2: false
     teacher_prefill_max_active_trajectories: 0
     teacher_prefill_max_active_kv_tokens: 0
     teacher_prefill_kv_page_size: 64
     kv_prefetch_depth: 1
     kv_prefetch_workers: 4
-    kv_prefetch_pin_memory: true
-    release_stage1_kv_after_copy: true
     kv_handoff_dir: /tmp/verl-streamopd-kv
-    rollout_backend: vllm
-    exact_dense_attention: true
     require_same_tokenizer: true
-    cleanup_after_step: true
     validate_teacher_artifacts: false
     validate_full_forward_loss: false
     validation_atol: 0.0001
@@ -1034,9 +1020,7 @@ trainer:
         switch_threshold_step_down: 0.03
         switch_threshold_release_steps: 2
         switch_cost_window_size: 3
-    streamopd_colocate:
-      micro_batch_size: 32
-      parameter_sync_step: 4
+    streamopd: {}
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

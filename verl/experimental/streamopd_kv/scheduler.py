@@ -12,12 +12,10 @@ import time
 
 
 class StreamOPDTaskScheduler:
-    """Central accounting and admission state for a shared teacher/trainer pool.
+    """Central accounting and atomic admission for StreamOPD work queues.
 
-    Teacher inference remains asynchronous, but teacher forward and student
-    backward are mutually exclusive on the shared teacher/trainer GPU pool.
-    Rollout runs in its independent pool. Admission is atomic
-    so polling clients cannot race between observing and starting work.
+    Teacher inference remains asynchronous. Teacher and Trainer may execute
+    concurrently only when their declared resource sets are disjoint.
     """
 
     def __init__(
@@ -413,7 +411,6 @@ class StreamOPDTaskScheduler:
             "expected_trajectories": self.expected_trajectories,
             "terminal_trajectories": self.terminal_trajectories,
             "completed_teacher_trajectories": self.completed_teacher_trajectories,
-            "posthoc_ready": self.posthoc_ready,
             "teacher_pending": self.teacher_pending,
             "teacher_available": self.teacher_available,
             "training_active": self.training_active,
@@ -530,10 +527,6 @@ class StreamOPDTaskScheduler:
     @property
     def teacher_pending(self) -> int:
         return self.teacher_queued + self.teacher_active
-
-    @property
-    def posthoc_ready(self) -> bool:
-        return self.teacher_drained
 
     @property
     def teacher_drained(self) -> bool:

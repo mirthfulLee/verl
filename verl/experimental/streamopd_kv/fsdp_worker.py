@@ -23,55 +23,15 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name, get_torch_device
 from verl.workers.engine_workers import TrainingWorker
 
-from .attention import LayerKVTrace
 from .protocol import TrajectoryKey
 from .qwen3 import Qwen3ReverseTrainer
-from .snapshot_io import cleanup_vllm_snapshot, load_vllm_slot_snapshot, load_vllm_snapshot, move_vllm_snapshot
+from .snapshot_io import load_vllm_snapshot, release_vllm_snapshot
 
 
 def _reverse_backward_calls(lengths: list[int], chunk_size: int) -> int:
     if not lengths:
         return 0
     return max(math.ceil(length / chunk_size) for length in lengths)
-
-
-def _dynamic_reverse_chunk_size(
-    max_chunk_size: int,
-    min_chunk_size: int,
-    microbatch_size: int,
-    *,
-    max_trace_length: int = 0,
-    target_trace_length: int = 0,
-    alignment: int = 1,
-    available_memory_bytes: int | None = None,
-    estimated_base_bytes: int = 0,
-    estimated_bytes_per_token: int = 0,
-) -> int:
-    if (
-        min_chunk_size < 1
-        or max_chunk_size < min_chunk_size
-        or microbatch_size < 1
-        or alignment < 1
-        or min_chunk_size % alignment
-        or max_chunk_size % alignment
-    ):
-        raise ValueError("invalid dynamic reverse chunk configuration")
-    # Start at the largest kernel-friendly chunk. The legacy token-pressure
-    # heuristic is retained only for callers without a device memory estimate.
-    if available_memory_bytes is None:
-        pressure = max(1, math.ceil(microbatch_size / 16))
-        if max_trace_length > 0 and target_trace_length > 0:
-            pressure = max(pressure, math.ceil(max_trace_length / target_trace_length))
-        chunk_size = max_chunk_size // pressure
-    else:
-        budget = max(0, int(available_memory_bytes * 0.75) - estimated_base_bytes)
-        if estimated_bytes_per_token > 0:
-            chunk_size = budget // estimated_bytes_per_token
-        else:
-            chunk_size = max_chunk_size
-        chunk_size = min(max_chunk_size, chunk_size)
-    chunk_size = max(min_chunk_size, chunk_size // alignment * alignment)
-    return min(max_chunk_size, chunk_size)
 
 
 def _reverse_memory_estimate(
@@ -140,38 +100,6 @@ def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.opti
     return reserve
 
 
-def _memory_limited_reverse_batch_size(
-    model: torch.nn.Module,
-    *,
-    configured_batch_size: int,
-    trace_length: int,
-    chunk_size: int,
-    dtype: torch.dtype,
-    available_memory_bytes: int | None,
-    reserve_bytes: int = 4 * 1024**3,
-) -> int:
-    """Choose a stable wavefront width from the pre-policy memory budget."""
-
-    if configured_batch_size < 1 or trace_length < 1 or chunk_size < 1:
-        raise ValueError("invalid reverse batch planning configuration")
-    if available_memory_bytes is None:
-        return configured_batch_size
-
-    candidate = 1 << (configured_batch_size.bit_length() - 1)
-    budget = int(available_memory_bytes * 0.85)
-    while candidate > 1:
-        fixed_bytes, bytes_per_token = _reverse_memory_estimate(
-            model,
-            trajectory_count=candidate,
-            trace_length=trace_length,
-            dtype=dtype,
-        )
-        if reserve_bytes + fixed_bytes + chunk_size * bytes_per_token <= budget:
-            break
-        candidate //= 2
-    return candidate
-
-
 @dataclass(frozen=True)
 class ReverseSlotPlan:
     batch_size: int
@@ -203,6 +131,7 @@ def _fixed_reverse_slot_plan(
         raise ValueError("reverse_batch_max_tokens cannot fit one fixed trajectory slot")
     candidate = 1 << (max_rows.bit_length() - 1)
     best_plan: ReverseSlotPlan | None = None
+    smallest_attempt: tuple[int, int, int, int] | None = None
     while candidate:
         slot_bytes, bytes_per_token = _reverse_memory_estimate(
             model,
@@ -215,6 +144,7 @@ def _fixed_reverse_slot_plan(
         else:
             workspace_budget = int(available_memory_bytes * 0.85) - reserve_bytes - slot_bytes
             chunk_limit = min(max_chunk_size, workspace_budget // max(1, bytes_per_token))
+        smallest_attempt = (candidate, slot_bytes, bytes_per_token, chunk_limit)
         chunk_size = 0
         for proposed in range(chunk_limit // page_size * page_size, min_chunk_size - 1, -page_size):
             if token_capacity % proposed == 0:
@@ -238,7 +168,13 @@ def _fixed_reverse_slot_plan(
         candidate //= 2
     if best_plan is not None:
         return best_plan
-    raise RuntimeError("preflight could not fit one fixed reverse slot with the minimum chunk size")
+    candidate, slot_bytes, bytes_per_token, chunk_limit = smallest_attempt or (0, 0, 0, 0)
+    raise RuntimeError(
+        "preflight could not fit one fixed reverse slot with the minimum chunk size: "
+        f"available={available_memory_bytes}, reserve={reserve_bytes}, candidate_rows={candidate}, "
+        f"slot_bytes={slot_bytes}, workspace_bytes_per_token={bytes_per_token}, "
+        f"chunk_limit={chunk_limit}, minimum_chunk={min_chunk_size}"
+    )
 
 
 def _available_cuda_memory(device: str | torch.device) -> int:
@@ -430,16 +366,17 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
     def prepare_reverse_plan(self) -> dict[str, float]:
         """Measure reverse headroom before the first policy version starts."""
 
+        model = self.engine.module
         if self._reverse_available_memory_bytes is None:
             try:
-                self._reverse_available_memory_bytes = _available_cuda_memory(self.device_name)
+                parameter_device = next(model.parameters()).device
+                self._reverse_available_memory_bytes = _available_cuda_memory(parameter_device)
             except (AttributeError, RuntimeError):
                 self._reverse_available_memory_bytes = 0
         metrics = {
             "available_memory_gib": (self._reverse_available_memory_bytes or 0) / (1024**3),
         }
-        if bool(self.streamopd_config.reverse_fixed_slots) and self._reverse_slot_pool is None:
-            model = self.engine.module
+        if self._reverse_slot_pool is None:
             deferred_training_state_bytes = _deferred_training_state_bytes(model, self.engine.optimizer)
             metrics["deferred_training_state_gib"] = deferred_training_state_bytes / (1024**3)
             parameter_dtype = next(model.parameters()).dtype
@@ -465,7 +402,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                     + deferred_training_state_bytes
                 ),
             )
-            from .oomb_paged_attention import OOMBFixedSlotPool
+            from .reverse_attention import ReverseKVSlotPool
 
             config = getattr(model, "config", None)
             base_model = getattr(model, "model", None)
@@ -474,7 +411,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             hidden_size = int(getattr(config, "hidden_size", 0) or 0)
             query_heads = int(getattr(config, "num_attention_heads", 0) or 0)
             head_dim = int(getattr(config, "head_dim", 0) or 0) or hidden_size // query_heads
-            self._reverse_slot_pool = OOMBFixedSlotPool(
+            self._reverse_slot_pool = ReverseKVSlotPool(
                 batch_size=self._reverse_slot_plan.batch_size,
                 token_capacity=self._reverse_slot_plan.token_capacity,
                 num_layers=len(getattr(base_model, "layers", ())),
@@ -588,68 +525,26 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         model = self.engine.module
         parameter_dtype = next(model.parameters()).dtype
         forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
-        max_chunk_size = int(self.streamopd_config.reverse_chunk_size)
-        min_chunk_size = int(self.streamopd_config.reverse_chunk_min_size)
         page_size = int(self.streamopd_config.reverse_page_size)
         trace_lengths = [self._sample_tensor(sample, "input_ids").numel() - 1 for sample in samples]
         # The memory budget was captured once by prepare_reverse_plan before
         # policy version zero. Planning below is deterministic and does not
         # query the allocator or change kernel shapes after training starts.
         available_memory_bytes = self._reverse_available_memory_bytes or None
-        fixed_slots = bool(self.streamopd_config.reverse_fixed_slots)
-        if fixed_slots:
-            if self._reverse_slot_plan is None or self._reverse_slot_pool is None:
-                raise RuntimeError("fixed reverse slots were not prepared before policy version zero")
-            if max(trace_lengths) > self._reverse_slot_plan.token_capacity:
-                raise RuntimeError(
-                    "trajectory exceeds the preflight fixed reverse token capacity: "
-                    f"trace={max(trace_lengths)}, slot={self._reverse_slot_plan.token_capacity}"
-                )
-            planned_batch_size = self._reverse_slot_plan.batch_size
-        else:
-            planned_batch_size = _memory_limited_reverse_batch_size(
-                model,
-                configured_batch_size=int(self.streamopd_config.reverse_batch_size),
-                trace_length=max(trace_lengths),
-                chunk_size=max_chunk_size,
-                dtype=forward_dtype,
-                available_memory_bytes=available_memory_bytes,
+        if self._reverse_slot_plan is None or self._reverse_slot_pool is None:
+            raise RuntimeError("reverse slots were not prepared before policy version zero")
+        if max(trace_lengths) > self._reverse_slot_plan.token_capacity:
+            raise RuntimeError(
+                "trajectory exceeds the preflight reverse token capacity: "
+                f"trace={max(trace_lengths)}, slot={self._reverse_slot_plan.token_capacity}"
             )
+        planned_batch_size = self._reverse_slot_plan.batch_size
         reverse_microbatches = _partition_reverse_microbatches(
             trace_lengths,
             max_batch_size=planned_batch_size,
             max_batch_tokens=int(self.streamopd_config.reverse_batch_max_tokens),
         )
-        if fixed_slots:
-            reverse_chunk_sizes = [self._reverse_slot_plan.chunk_size] * len(reverse_microbatches)
-        else:
-            target_trace_length = min(8192, int(self.streamopd_config.reverse_batch_max_tokens))
-            reverse_chunk_sizes = []
-            for group in reverse_microbatches:
-                max_trace_length = max(trace_lengths[idx] for idx in group)
-                estimated_base_bytes = 0
-                estimated_bytes_per_token = 0
-                if available_memory_bytes is not None:
-                    estimated_base_bytes, estimated_bytes_per_token = _reverse_memory_estimate(
-                        model,
-                        trajectory_count=len(group),
-                        trace_length=max_trace_length,
-                        dtype=forward_dtype,
-                    )
-                    estimated_base_bytes += 4 * 1024**3
-                reverse_chunk_sizes.append(
-                    _dynamic_reverse_chunk_size(
-                        max_chunk_size,
-                        min_chunk_size,
-                        int(self.streamopd_config.micro_batch_size),
-                        max_trace_length=max_trace_length,
-                        target_trace_length=target_trace_length,
-                        alignment=page_size,
-                        available_memory_bytes=available_memory_bytes,
-                        estimated_base_bytes=estimated_base_bytes,
-                        estimated_bytes_per_token=estimated_bytes_per_token,
-                    )
-                )
+        reverse_chunk_sizes = [self._reverse_slot_plan.chunk_size] * len(reverse_microbatches)
         local_chunks = sum(
             sum(math.ceil(trace_lengths[idx] / chunk_size) for idx in group)
             for group, chunk_size in zip(reverse_microbatches, reverse_chunk_sizes, strict=True)
@@ -703,7 +598,6 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         prefetch_transfer_seconds = 0.0
         prefetched_snapshots = 0
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
-        step_succeeded = False
         finalize = accumulation_step == accumulation_steps - 1
         # Map sealed Host KV slots ahead of the reverse unit. This
         # queue is intentionally bounded by reverse units rather than
@@ -728,27 +622,14 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         def load_host_snapshot(sample_idx: int):
             base_path, key, token_ids, prompt_length = snapshot_specs[sample_idx]
             started = time.perf_counter()
-            if fixed_slots:
-                snapshot = load_vllm_slot_snapshot(
-                    base_path,
-                    key=key,
-                    tp_rank=0,
-                    expected_tp_size=1,
-                    expected_token_ids=token_ids,
-                    expected_prompt_length=prompt_length,
-                    pin_memory=bool(self.streamopd_config.kv_prefetch_pin_memory),
-                )
-            else:
-                snapshot = load_vllm_snapshot(
-                    base_path,
-                    key=key,
-                    tp_rank=0,
-                    expected_tp_size=1,
-                    expected_token_ids=token_ids,
-                    expected_prompt_length=prompt_length,
-                    device="cpu",
-                    pin_memory=bool(self.streamopd_config.kv_prefetch_pin_memory),
-                )
+            snapshot = load_vllm_snapshot(
+                base_path,
+                key=key,
+                tp_rank=0,
+                expected_tp_size=1,
+                expected_token_ids=token_ids,
+                expected_prompt_length=prompt_length,
+            )
             return snapshot, time.perf_counter() - started
 
         def schedule_prefetch(group_idx: int) -> None:
@@ -783,7 +664,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 prefetch_host_seconds += load_seconds
                 if wait_started is not None:
                     prefetch_wait_seconds += time.perf_counter() - wait_started
-                first_key = snapshot.layers[0].key if fixed_slots else snapshot.layers[0][0]
+                first_key = snapshot.layers[0].key
                 if first_key.dtype != forward_dtype:
                     raise RuntimeError(
                         "rollout KV dtype does not match the trainer forward dtype: "
@@ -808,12 +689,11 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
 
         try:
             model.eval()
-            if fixed_slots:
-                self._reverse_slot_pool.reset_metrics()
+            self._reverse_slot_pool.reset_metrics()
             for group_idx, (group, chunk_size) in enumerate(
                 zip(reverse_microbatches, reverse_chunk_sizes, strict=True)
             ):
-                host_snapshots = [] if fixed_slots and group_idx > 0 else resolve_host_group(group_idx)
+                host_snapshots = [] if group_idx > 0 else resolve_host_group(group_idx)
                 sequences = []
                 loss_fns = []
                 for sample_idx in group:
@@ -843,91 +723,54 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                             full_forward_validation_loss += sample_loss.float()
 
                 trainer = Qwen3ReverseTrainer(model, chunk_size=chunk_size, page_size=page_size)
-                if fixed_slots:
-                    trajectory_layers = [list(snapshot.layers) for snapshot in host_snapshots]
-                    group_lengths = [sequence.shape[1] for sequence in sequences]
-                    padded_lengths = [math.ceil(length / chunk_size) * chunk_size for length in group_lengths]
-                    if group_idx == 0:
-                        transfer_started = time.perf_counter()
-                        self._reverse_slot_pool.prepare_next(trajectory_layers, group_lengths, padded_lengths)
-                        self._reverse_slot_pool.activate_next()
-                        prefetch_transfer_seconds += time.perf_counter() - transfer_started
-                    resolved_host_groups.pop(group_idx, None)
-                    next_idx = group_idx + 1
-                    next_prepared = False
+                trajectory_layers = [list(snapshot.layers) for snapshot in host_snapshots]
+                group_lengths = [sequence.shape[1] for sequence in sequences]
+                padded_lengths = [math.ceil(length / chunk_size) * chunk_size for length in group_lengths]
+                if group_idx == 0:
+                    transfer_started = time.perf_counter()
+                    self._reverse_slot_pool.prepare_next(trajectory_layers, group_lengths, padded_lengths)
+                    self._reverse_slot_pool.activate_next()
+                    prefetch_transfer_seconds += time.perf_counter() - transfer_started
+                resolved_host_groups.pop(group_idx, None)
+                next_idx = group_idx + 1
+                next_prepared = False
 
-                    def prepare_next_group(*, block: bool, target_idx: int = next_idx) -> None:
-                        nonlocal next_prepared
-                        if next_prepared or target_idx >= len(reverse_microbatches):
-                            return
-                        if not block and not host_group_ready(target_idx):
-                            return
-                        next_hosts = resolve_host_group(target_idx)
-                        next_group = reverse_microbatches[target_idx]
-                        next_layers = [list(snapshot.layers) for snapshot in next_hosts]
-                        next_lengths = [trace_lengths[idx] for idx in next_group]
-                        next_chunk = reverse_chunk_sizes[target_idx]
-                        next_padded = [math.ceil(length / next_chunk) * next_chunk for length in next_lengths]
-                        self._reverse_slot_pool.prepare_next(next_layers, next_lengths, next_padded)
-                        resolved_host_groups.pop(target_idx, None)
-                        next_prepared = True
+                def prepare_next_group(*, block: bool, target_idx: int = next_idx) -> None:
+                    nonlocal next_prepared
+                    if next_prepared or target_idx >= len(reverse_microbatches):
+                        return
+                    if not block and not host_group_ready(target_idx):
+                        return
+                    next_hosts = resolve_host_group(target_idx)
+                    next_group = reverse_microbatches[target_idx]
+                    next_layers = [list(snapshot.layers) for snapshot in next_hosts]
+                    next_lengths = [trace_lengths[idx] for idx in next_group]
+                    next_chunk = reverse_chunk_sizes[target_idx]
+                    next_padded = [math.ceil(length / next_chunk) * next_chunk for length in next_lengths]
+                    self._reverse_slot_pool.prepare_next(next_layers, next_lengths, next_padded)
+                    resolved_host_groups.pop(target_idx, None)
+                    next_prepared = True
 
+                prepare_next_group(block=False)
+
+                def release_slot_depth(active: Sequence[int], start: int, end: int) -> None:
+                    self._reverse_slot_pool.release_current_range(active, start, end)
                     prepare_next_group(block=False)
 
-                    def release_slot_depth(active: Sequence[int], start: int, end: int) -> None:
-                        self._reverse_slot_pool.release_current_range(active, start, end)
-                        prepare_next_group(block=False)
-
-                    with mixed_precision_context():
-                        result = trainer.backward_batched(
-                            sequences,
-                            None,
-                            loss_fns,
-                            backward_context=backward_context,
-                            fixed_state=self._reverse_slot_pool.state(),
-                            on_depth_committed=release_slot_depth,
-                        )
-                    self._reverse_slot_pool.finish_current()
-                    if next_idx < len(reverse_microbatches):
-                        prepare_next_group(block=True)
-                        transfer_started = time.perf_counter()
-                        self._reverse_slot_pool.activate_next()
-                        prefetch_transfer_seconds += time.perf_counter() - transfer_started
-                else:
-                    snapshots = []
-                    try:
-                        trajectory_layers = []
-                        for sample_idx, host_snapshot in zip(group, host_snapshots, strict=True):
-                            policy_version = int(samples[sample_idx]["streamopd_policy_version"])
-                            transfer_started = time.perf_counter()
-                            snapshot = move_vllm_snapshot(
-                                host_snapshot,
-                                self.device_name,
-                                non_blocking=True,
-                            ).acquire(policy_version)
-                            prefetch_transfer_seconds += time.perf_counter() - transfer_started
-                            snapshots.append(snapshot)
-                            trajectory_layers.append([LayerKVTrace(key, value) for key, value in snapshot.layers])
-                        resolved_host_groups.pop(group_idx, None)
-
-                        def release_stage1_snapshots(stage1_snapshots=snapshots) -> None:
-                            for snapshot in stage1_snapshots:
-                                if snapshot.refcount:
-                                    snapshot.release()
-
-                        with mixed_precision_context():
-                            result = trainer.backward_batched(
-                                sequences,
-                                trajectory_layers,
-                                loss_fns,
-                                backward_context=backward_context,
-                                stage1_release=release_stage1_snapshots,
-                                release_stage1_kv_after_copy=bool(self.streamopd_config.release_stage1_kv_after_copy),
-                            )
-                    finally:
-                        for snapshot in snapshots:
-                            if snapshot.refcount:
-                                snapshot.release()
+                with mixed_precision_context():
+                    result = trainer.backward(
+                        sequences,
+                        loss_fns,
+                        state=self._reverse_slot_pool.state(),
+                        backward_context=backward_context,
+                        on_depth_committed=release_slot_depth,
+                    )
+                self._reverse_slot_pool.finish_current()
+                if next_idx < len(reverse_microbatches):
+                    prepare_next_group(block=True)
+                    transfer_started = time.perf_counter()
+                    self._reverse_slot_pool.activate_next()
+                    prefetch_transfer_seconds += time.perf_counter() - transfer_started
                 max_parallel_trajectories = max(max_parallel_trajectories, result.max_parallel_trajectories)
                 lm_head_tokens += result.lm_head_tokens
                 dense_lm_head_tokens += result.dense_lm_head_tokens
@@ -950,7 +793,6 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             else:
                 grad_norm = 0.0
                 lr = self.engine.optimizer.param_groups[0]["lr"]
-            step_succeeded = True
         except Exception:
             self._reset_accumulation(zero_grad=True)
             raise
@@ -966,9 +808,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                         # background reader can race row reuse.
                         pass
             model.train(was_training)
-            if self.streamopd_config.cleanup_after_step or not step_succeeded:
-                for base_path in paths_to_cleanup:
-                    cleanup_vllm_snapshot(base_path, tp_size=1)
+            for base_path in paths_to_cleanup:
+                release_vllm_snapshot(base_path)
 
         elapsed = time.perf_counter() - started
         reported_loss = total_loss.detach()
@@ -980,26 +821,15 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 op=dist.ReduceOp.SUM,
                 group=self.engine.get_data_parallel_group(),
             )
-        if fixed_slots:
-            slot_copy_seconds = self._reverse_slot_pool.copy_cuda_seconds()
-            slot_next_copy_seconds = self._reverse_slot_pool.copy_cuda_seconds(reused_only=True)
-            slot_initial_wait_seconds = self._reverse_slot_pool.initial_wait_seconds
-            slot_next_wait_seconds = self._reverse_slot_pool.next_wait_seconds
-            slot_next_loaded_pages = self._reverse_slot_pool.next_loaded_pages
-            slot_loaded_gib = self._reverse_slot_pool.loaded_bytes / (1024**3)
-            slot_bytes_gib = self._reverse_slot_pool.slot_bytes / (1024**3)
-            slot_copy_enqueue_seconds = self._reverse_slot_pool.copy_enqueue_seconds
-            slot_next_copy_enqueue_seconds = self._reverse_slot_pool.next_copy_enqueue_seconds
-        else:
-            slot_copy_seconds = 0.0
-            slot_next_copy_seconds = 0.0
-            slot_initial_wait_seconds = 0.0
-            slot_next_wait_seconds = 0.0
-            slot_next_loaded_pages = 0
-            slot_loaded_gib = 0.0
-            slot_bytes_gib = 0.0
-            slot_copy_enqueue_seconds = 0.0
-            slot_next_copy_enqueue_seconds = 0.0
+        slot_copy_seconds = self._reverse_slot_pool.copy_cuda_seconds()
+        slot_next_copy_seconds = self._reverse_slot_pool.copy_cuda_seconds(reused_only=True)
+        slot_initial_wait_seconds = self._reverse_slot_pool.initial_wait_seconds
+        slot_next_wait_seconds = self._reverse_slot_pool.next_wait_seconds
+        slot_next_loaded_pages = self._reverse_slot_pool.next_loaded_pages
+        slot_loaded_gib = self._reverse_slot_pool.loaded_bytes / (1024**3)
+        slot_bytes_gib = self._reverse_slot_pool.slot_bytes / (1024**3)
+        slot_copy_enqueue_seconds = self._reverse_slot_pool.copy_enqueue_seconds
+        slot_next_copy_enqueue_seconds = self._reverse_slot_pool.next_copy_enqueue_seconds
         metrics = {
             "loss": normalized_loss.item(),
             "grad_norm": grad_norm,
@@ -1016,9 +846,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/reverse_chunk_size_max": max(reverse_chunk_sizes, default=0),
             "streamopd/reverse_page_size": page_size,
             "streamopd/reverse_memory_budget_gib": (available_memory_bytes or 0) / (1024**3),
-            "streamopd/reverse_fixed_slots": float(fixed_slots),
-            "streamopd/reverse_slot_batch_size": planned_batch_size if fixed_slots else 0,
-            "streamopd/reverse_slot_token_capacity": (self._reverse_slot_plan.token_capacity if fixed_slots else 0),
+            "streamopd/reverse_slot_batch_size": planned_batch_size,
+            "streamopd/reverse_slot_token_capacity": self._reverse_slot_plan.token_capacity,
             "streamopd/reverse_slot_backing_gib": slot_bytes_gib,
             "streamopd/reverse_slot_loaded_gib": slot_loaded_gib,
             "streamopd/reverse_slot_copy_cuda_seconds": slot_copy_seconds,

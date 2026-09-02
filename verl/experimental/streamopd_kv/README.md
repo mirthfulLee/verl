@@ -12,8 +12,7 @@ dedicated  Trainer, Teacher, and Rollout use disjoint GPUs
 
 The rollout engine remains resident and uses continuous batching. Shared roles are separate Ray processes in the same
 placement group; model loading is not repeated per unit. The scheduler serializes kernels on intersecting resource
-sets and allows work on disjoint sets to overlap. The internal trainer registration remains `streamopd_colocate` for
-compatibility.
+sets and allows work on disjoint sets to overlap. The trainer is registered as `streamopd`.
 
 ## Minimal configuration
 
@@ -60,24 +59,22 @@ values are logged under `streamopd/runtime_profile_*`.
 
 The implementation fails closed outside the following configuration:
 
-- `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd_colocate`;
+- `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd`;
 - `trainer_placement=teacher`, `rollout`, `union`, or `dedicated` on one node;
 - text-only, single-turn Qwen3 with one frozen teacher;
 - vLLM rollout with TP=1, PP=1, `n=1`, and a non-quantized KV cache;
 - FSDP/FSDP2 student, one PPO epoch, and global `token-mean` aggregation;
 - direct `forward_kl_topk` distillation without task rewards or a policy-gradient term;
-- exact dense attention using CUDA FlashAttention for batched wavefront reverse and the vendored OOMB Triton kernel
-  for singleton validation, with no SDPA fallback;
+- exact dense attention using CUDA FlashAttention for batched wavefront reverse, with no SDPA fallback;
 - BF16 CUDA KV/query tensors, `head_dim <= 256`, right-padded batches, and page-aligned reverse chunks.
 
-The removed legacy integration enabled StreamOPD inside the `sync` trainer, where rollout and trainer shared a GPU
-pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedicated two-pool trainer mode is selected.
+`distillation.streamopd_kv.enabled=true` is rejected unless the dedicated StreamOPD trainer mode is selected.
 
 ## Streaming path
 
 1. `CommittedChunkPublisher` observes cumulative vLLM output and publishes every committed token/KV range during
    generation. The first teacher input budget includes the complete prompt plus the initial response prefix; later
-   resumable chunks contain only newly committed response tokens. EOS seals the already-streamed KV manifest.
+   resumable chunks contain only newly committed response tokens. EOS seals the already-streamed Host KV slot.
 2. `StreamingTeacherCoordinator` submits chunks to the central scheduler. vLLM 0.15.1 resumable `StreamingInput`
    sessions retain causal teacher KV across fragments. Contiguous queued fragments may be coalesced without changing
    token coverage. A session reservation is held until EOS; releasing it immediately permits another trajectory to
@@ -94,14 +91,12 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
    Teacher sessions refill as earlier trajectories reach EOS; there is no per-unit model sleep/wake boundary.
 4. At a shared Teacher/Trainer role switch, inactive Teacher allocator cache is trimmed while weights, live paged KV,
    and request state remain resident. Once all Teacher sessions drain, vLLM enters level-1 sleep; the next policy
-   version wakes it behind a scheduler admission gate while Rollout is already starting. Level-2 Rollout sleep is
-   implemented for Rollout/Trainer sharing but remains opt-in: with the current fixed plan it releases memory but does
-   not enlarge reverse slots, and measured low-pressure steps show no throughput gain.
+   version wakes it behind a scheduler admission gate while Rollout is already starting.
 5. `StreamOPDKVConnector` copies completed rollout KV ranges from live vLLM pages into a fixed shared Host KV slot pool
    before EOS. Each TP shard owns one stable data mmap and one fixed control array; a bounded pinned staging ring moves
    D2H chunks into their assigned rows without serializing per-chunk tensor files. Multiple generating or sealed
-   microbatches may be host-resident, while each trainer worker may hold exactly one GPU KV lease. Trainer prefetch maps
-   the next slot as a zero-copy tensor view while the current reverse unit executes. Within the leased microbatch, the
+   training units may be host-resident, while each trainer worker may hold exactly one GPU KV lease. Trainer prefetch
+   maps the next slot as a zero-copy tensor view while the current reverse unit executes. Within the leased microbatch, the
    next reverse group may reuse suffix pages released by the current group; the next microbatch still cannot acquire
    GPU KV until the current lease is released.
 6. Once `EOS && student KV complete && teacher supervision complete`, the trainer uses rollout KV as OOMB Stage-1 and
@@ -117,14 +112,14 @@ pool. `distillation.streamopd_kv.enabled=true` is now rejected unless the dedica
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
 
-Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`.
-`micro_batch_size` remains a compatibility field but no longer determines reverse units. Set reverse batch/chunk and
-Teacher admission caps to zero (the default) for automatic preflight planning; non-zero values are experimental caps.
+Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`. Set
+reverse batch/chunk and Teacher admission caps to zero (the default) for automatic preflight planning; non-zero values
+are experimental caps.
 
 ## Fixed reverse slots
 
-`reverse_fixed_slots=true` removes per-group GPU snapshot and contiguous-backing allocation. Each layer owns stable
-`[B_slot, T_slot, H_kv, D]` K, V, dK, and dV tensors. `reverse_slot_max_tokens=0` resolves `T_slot` from the configured
+Each layer owns stable `[B_slot, T_slot, H_kv, D]` K, V, dK, and dV tensors.
+`reverse_slot_max_tokens=0` resolves `T_slot` from the configured
 prompt/response upper bounds and page-aligns it. Preflight evaluates the fixed backing, active reverse workspace,
 LM-head workspace, model/optimizer reserve, and H2D reserve before selecting `B_slot` and a chunk size that divides
 `T_slot`. The optimizer reserve is derived per rank from gradients and optimizer tensors that have not yet been
@@ -144,23 +139,6 @@ reserve. It first maximizes the feasible chunk (up to the profiled 1024-token ke
 batch that forces a smaller chunk is not selected merely because it fits in memory. Non-zero token/batch/chunk caps
 remain available for controlled ablations.
 
-## Post-hoc ablation
-
-Set `distillation.streamopd_kv.posthoc_ablation=true` to isolate the value of Teacher chunk streaming and early
-reverse training. This mode preserves the configured placement, rollout KV connector, host KV cache, reverse kernels,
-preflight plan, and strict policy barrier. It changes only the Teacher/Trainer schedule:
-
-1. each trajectory sends no Teacher request before EOS;
-2. as soon as that individual trajectory reaches EOS, it immediately submits one complete `prompt + response`
-   prefill to Teacher vLLM; it does not wait for the other trajectories;
-3. rollout KV continues to stream into the host cache before EOS;
-4. reverse training remains blocked until every trajectory in the global batch is terminal and has complete Teacher
-   artifacts, then processes the existing reverse microbatches on the Teacher/Trainer Pool only.
-
-The scheduler records the first Teacher start, all-rollout EOS, all-Teacher completion, Teacher busy time before and
-after all-rollout EOS, reverse busy time, pool idle/utilization, and the Teacher drain tail. Per-step allocator peaks
-are reset and collected independently for rollout vLLM, Teacher vLLM, and student trainer workers.
-
 ## Baseline isolation
 
 When `distillation.streamopd_kv.enabled=false`, StreamOPD config preparation returns without modifying the rollout
@@ -173,10 +151,10 @@ its native rollout/trainer path. Its optional teacher placement is configured se
 The single-node transport preallocates `global_batch * T_slot` Host KV rows per TP shard. Fixed control records track
 `FREE -> WRITING -> SEALED -> FREE`, with a monotonically increasing generation plus policy, request, trajectory, and
 token-sequence digests. A stale descriptor therefore cannot release or consume a reused row. The default auto profile
-places the mmap under `/dev/shm`; historical numbered safetensors remain read-compatible but are not emitted by the
-configured connector. A future multi-node backend should preserve the multiple-host-MB/single-GPU-lease contract
-while replacing the shared mmap with RDMA or an equivalent streaming transport.
+places the mmap under `/dev/shm`. A future multi-node backend should preserve the
+multiple-host-units/single-GPU-lease contract while replacing the shared mmap with RDMA or an equivalent streaming
+transport.
 
-The reverse chain rule, dense paged attention, and parameter gradients are checked against ordinary full-sequence
-training. OOMB kernels are BF16-only, so tests use numerical tolerances rather than bitwise equality. Unsupported
+The reverse chain rule, fixed-slot attention, and parameter gradients are checked against ordinary full-sequence
+training. Reverse kernels are BF16-only, so tests use numerical tolerances rather than bitwise equality. Unsupported
 device, dtype, head dimension, page size, or reverse shape fails before training starts.

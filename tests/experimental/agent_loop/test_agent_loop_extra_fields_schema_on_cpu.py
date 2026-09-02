@@ -165,6 +165,17 @@ def test_agent_loop_output_as_dict_promotes_teacher_fields_without_mutating_mode
     assert output.extra_fields["teacher_logprobs"] == [-0.1, -0.2]
 
 
+def test_agent_loop_output_as_dict_promotes_transfer_queue_fields():
+    output = _make_agent_loop_output()
+    output.extra_fields["transfer_queue_fields"] = {"external_artifact": "/tmp/artifact"}
+
+    fields = output.as_dict()
+
+    assert fields["external_artifact"] == "/tmp/artifact"
+    assert fields["extra_fields"] == {}
+    assert output.extra_fields["transfer_queue_fields"] == {"external_artifact": "/tmp/artifact"}
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeypatch):
     captured_kwargs: dict[str, Any] = {}

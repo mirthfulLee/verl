@@ -22,8 +22,7 @@ if [[ ${CLEANUP_HANDOFF_DIR:-1} == 1 ]]; then
       ;;
   esac
   # Each benchmark case owns a deterministic handoff directory.  Removing
-  # stale chunks before a rerun prevents an interrupted case from being read
-  # as part of a later manifest.
+  # Stale slot files from an interrupted run must not enter a later pool.
   rm -rf -- "$KV_HANDOFF_DIR"
 fi
 mkdir -p "$KV_HANDOFF_DIR"
@@ -35,27 +34,21 @@ export VERL_USE_UV=${VERL_USE_UV:-0}
 export STREAMOPD_RUNTIME_PROFILE=${STREAMOPD_RUNTIME_PROFILE:-manual}
 export ACTOR_MAX_TOKENS_PER_GPU=${ACTOR_MAX_TOKENS_PER_GPU:-$TOTAL_TRAJECTORY_LENGTH}
 export TEACHER_MAX_BATCHED_TOKENS=${TEACHER_MAX_BATCHED_TOKENS:-2048}
-export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=${TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES:-0}
+export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=${TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES:-$MICRO_BATCH_SIZE}
 export TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS=${TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS:-0}
 export TEACHER_PREFILL_KV_PAGE_SIZE=${TEACHER_PREFILL_KV_PAGE_SIZE:-64}
-export TEACHER_FIRST_CHUNK_INCLUDES_PROMPT=${TEACHER_FIRST_CHUNK_INCLUDES_PROMPT:-True}
-export POSTHOC_ABLATION=${POSTHOC_ABLATION:-False}
 export TRAINER_PLACEMENT=${TRAINER_PLACEMENT:-teacher}
 export STREAMOPD_SCHEDULER_POLICY=${STREAMOPD_SCHEDULER_POLICY:-adaptive}
-export REVERSE_FIXED_SLOTS=${REVERSE_FIXED_SLOTS:-True}
 export REVERSE_SLOT_MAX_TOKENS=${REVERSE_SLOT_MAX_TOKENS:-$TOTAL_TRAJECTORY_LENGTH}
 export REVERSE_SLOT_RESERVE_GIB=${REVERSE_SLOT_RESERVE_GIB:-4.0}
 export KV_PREFETCH_DEPTH=${KV_PREFETCH_DEPTH:-1}
 export KV_PREFETCH_WORKERS=${KV_PREFETCH_WORKERS:-4}
-export KV_PREFETCH_PIN_MEMORY=${KV_PREFETCH_PIN_MEMORY:-True}
-export RELEASE_STAGE1_KV_AFTER_COPY=${RELEASE_STAGE1_KV_AFTER_COPY:-True}
 export TOKEN_CHUNK_SIZE=${TOKEN_CHUNK_SIZE:-$(((MAX_RESPONSE_LENGTH + 1) / 2))}
 export REVERSE_CHUNK_SIZE=${REVERSE_CHUNK_SIZE:-0}
 export REVERSE_CHUNK_MIN_SIZE=${REVERSE_CHUNK_MIN_SIZE:-0}
 export REVERSE_PAGE_SIZE=${REVERSE_PAGE_SIZE:-64}
-export REVERSE_BATCH_SIZE=${REVERSE_BATCH_SIZE:-0}
-export REVERSE_BATCH_MAX_TOKENS=${REVERSE_BATCH_MAX_TOKENS:-0}
-export TRAINER_MICRO_BATCH_SIZE=$MICRO_BATCH_SIZE
+export REVERSE_BATCH_SIZE=${REVERSE_BATCH_SIZE:-$MICRO_BATCH_SIZE}
+export REVERSE_BATCH_MAX_TOKENS=${REVERSE_BATCH_MAX_TOKENS:-$((MICRO_BATCH_SIZE * TOTAL_TRAJECTORY_LENGTH))}
 
 case "$MODE" in
   verl-sync-opd)
@@ -68,8 +61,6 @@ case "$MODE" in
     export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.55}
     export USE_LIGER=${USE_LIGER:-False} ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
     export TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
-    export TEACHER_INITIAL_CHUNK_SIZE=${TEACHER_INITIAL_CHUNK_SIZE:-$TOKEN_CHUNK_SIZE}
-    export TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
     export CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-null}
     ;;
   verl-colocate-opd)
@@ -82,36 +73,25 @@ case "$MODE" in
     export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.25}
     export USE_LIGER=${USE_LIGER:-False} ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
     export TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
-    export TEACHER_INITIAL_CHUNK_SIZE=${TEACHER_INITIAL_CHUNK_SIZE:-$TOKEN_CHUNK_SIZE}
-    export TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
     export CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-null}
     ;;
-  streamopd|streamopd-adaptive|streamopd-teacher-then-train|streamopd-rollout|streamopd-rollout-baseline|streamopd-union|streamopd-union-baseline|streamopd-dedicated|streamopd-dedicated-baseline|streamopd-posthoc|streamopd-posthoc-legacy|streamopd-posthoc-fixed|streamopd-posthoc-fixed-wide)
-    export TRAINER_MODE=streamopd_colocate STREAMOPD_KV_ENABLED=True
+  streamopd|streamopd-adaptive|streamopd-teacher-then-train|streamopd-rollout|streamopd-rollout-baseline|streamopd-union|streamopd-union-baseline|streamopd-dedicated|streamopd-dedicated-baseline)
+    export TRAINER_MODE=streamopd STREAMOPD_KV_ENABLED=True
     export STUDENT_GPUS=${STUDENT_GPUS:-2}
     export TEACHER_GPUS=${TEACHER_GPUS:-$STUDENT_GPUS}
     export ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
     export ROLLOUT_NNODES=1
     export AGENT_LOOP_WORKERS="$STREAMOPD_AGENT_LOOP_WORKERS"
     export ROLLOUT_MAX_NUM_SEQS="$STREAMOPD_ROLLOUT_MAX_NUM_SEQS"
-    export DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT=False CHECKPOINT_ENGINE_BACKEND=host
+    export DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT=False
+    export CHECKPOINT_ENGINE_BACKEND=${CHECKPOINT_ENGINE_BACKEND:-host}
     export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.65}
     # Leave headroom for the colocated trainer's exact-attention recomputation.
     export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.19}
-    export TEACHER_PRIORITY_THRESHOLD=${TEACHER_PRIORITY_THRESHOLD:-$MICRO_BATCH_SIZE}
     USE_LIGER=${USE_LIGER:-True}
     ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
     TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
-    # Score every rollout/KV chunk. The default follows TOKEN_CHUNK_SIZE so
-    # each committed 1536-token chunk creates one stateful teacher forward.
-    TEACHER_INITIAL_CHUNK_SIZE=${TEACHER_INITIAL_CHUNK_SIZE:-$TOKEN_CHUNK_SIZE}
-    # Normal StreamOPD semantics: every committed rollout chunk is scored by
-    # the stateful teacher as soon as it arrives. Set this to True only for the
-    # terminal-catch-up performance ablation.
-    TEACHER_TERMINAL_ONLY_AFTER_INITIAL=${TEACHER_TERMINAL_ONLY_AFTER_INITIAL:-False}
-    if [[ $MODE == streamopd-posthoc* ]]; then
-      POSTHOC_ABLATION=True
-    fi
+  # Score every committed rollout/KV chunk with one stateful Teacher forward.
     if [[ $MODE == streamopd-teacher-then-train || $MODE == streamopd-rollout-baseline || $MODE == streamopd-union-baseline || $MODE == streamopd-dedicated-baseline ]]; then
       STREAMOPD_SCHEDULER_POLICY=teacher_then_train
     fi
@@ -123,14 +103,6 @@ case "$MODE" in
     fi
     if [[ $MODE == streamopd-dedicated || $MODE == streamopd-dedicated-baseline ]]; then
       TRAINER_PLACEMENT=dedicated
-    fi
-    if [[ $MODE == streamopd-posthoc-legacy ]]; then
-      REVERSE_FIXED_SLOTS=False
-    elif [[ $MODE == streamopd-posthoc-fixed || $MODE == streamopd-posthoc-fixed-wide ]]; then
-      REVERSE_FIXED_SLOTS=True
-    fi
-    if [[ $MODE == streamopd-posthoc-fixed-wide ]]; then
-      REVERSE_BATCH_MAX_TOKENS=${REVERSE_BATCH_MAX_TOKENS:-65536}
     fi
     CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-bfloat16}
     ;;
@@ -174,12 +146,8 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   distillation.teacher_models.teacher_model.inference.dtype=bfloat16 \
   distillation.teacher_models.teacher_model.inference.enforce_eager="$TEACHER_ENFORCE_EAGER" \
   distillation.teacher_models.teacher_model.inference.enable_prefix_caching=True \
-  distillation.streamopd_kv.teacher_initial_chunk_size="$TEACHER_INITIAL_CHUNK_SIZE" \
   distillation.streamopd_kv.runtime_profile="$STREAMOPD_RUNTIME_PROFILE" \
   distillation.streamopd_kv.token_chunk_size="$TOKEN_CHUNK_SIZE" \
-  distillation.streamopd_kv.teacher_first_chunk_includes_prompt="$TEACHER_FIRST_CHUNK_INCLUDES_PROMPT" \
-  distillation.streamopd_kv.teacher_terminal_only_after_initial="$TEACHER_TERMINAL_ONLY_AFTER_INITIAL" \
-  distillation.streamopd_kv.posthoc_ablation="$POSTHOC_ABLATION" \
   distillation.streamopd_kv.trainer_placement="$TRAINER_PLACEMENT" \
   distillation.streamopd_kv.scheduler_policy="$STREAMOPD_SCHEDULER_POLICY" \
   distillation.streamopd_kv.reverse_chunk_size="$REVERSE_CHUNK_SIZE" \
@@ -187,7 +155,6 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   distillation.streamopd_kv.reverse_page_size="$REVERSE_PAGE_SIZE" \
   distillation.streamopd_kv.reverse_batch_size="$REVERSE_BATCH_SIZE" \
   distillation.streamopd_kv.reverse_batch_max_tokens="$REVERSE_BATCH_MAX_TOKENS" \
-  distillation.streamopd_kv.reverse_fixed_slots="$REVERSE_FIXED_SLOTS" \
   distillation.streamopd_kv.reverse_slot_max_tokens="$REVERSE_SLOT_MAX_TOKENS" \
   distillation.streamopd_kv.reverse_slot_reserve_gib="$REVERSE_SLOT_RESERVE_GIB" \
   distillation.streamopd_kv.teacher_prefill_max_active_trajectories="$TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES" \
@@ -195,8 +162,6 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   distillation.streamopd_kv.teacher_prefill_kv_page_size="$TEACHER_PREFILL_KV_PAGE_SIZE" \
   distillation.streamopd_kv.kv_prefetch_depth="$KV_PREFETCH_DEPTH" \
   distillation.streamopd_kv.kv_prefetch_workers="$KV_PREFETCH_WORKERS" \
-  distillation.streamopd_kv.kv_prefetch_pin_memory="$KV_PREFETCH_PIN_MEMORY" \
-  distillation.streamopd_kv.release_stage1_kv_after_copy="$RELEASE_STAGE1_KV_AFTER_COPY" \
   actor_rollout_ref.rollout.do_sample=False \
   actor_rollout_ref.rollout.agent.num_workers="$AGENT_LOOP_WORKERS" \
   distillation.streamopd_kv.kv_handoff_dir="$KV_HANDOFF_DIR" \

@@ -303,17 +303,6 @@ class LLMServerClient:
                     raise RuntimeError("StreamOPD-KV client callback was not configured")
                 kwargs["streamopd_callback"] = callback
                 kwargs["streamopd_chunk_size"] = chunk_size
-                kwargs["streamopd_terminal_only_after_initial"] = getattr(
-                    self,
-                    "streamopd_terminal_only_after_initial",
-                    False,
-                )
-                kwargs["streamopd_terminal_only"] = getattr(self, "streamopd_terminal_only", False)
-                kwargs["streamopd_first_chunk_includes_prompt"] = getattr(
-                    self,
-                    "streamopd_first_chunk_includes_prompt",
-                    True,
-                )
                 kwargs["streamopd_page_size"] = getattr(self, "streamopd_page_size", 1)
             multimodal_kwargs = {}
             if audio_data is not None:

@@ -230,7 +230,7 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async", "streamopd_colocate"
+    # Trainer mode: "sync", "colocate_async", "separate_async", "streamopd"
     trainer_mode: sync
 
     # Synchronous PPO trainer
@@ -278,14 +278,9 @@ trainer:
         # Window size for calculating average switch cost.
         switch_cost_window_size: 3
 
-    # Strict StreamOPD with standalone rollout and a colocated teacher/trainer pool
-    streamopd_colocate:
-
-      # Number of rollout trajectories trained by each early-backward unit
-      micro_batch_size: 32
-
-      # Frequency of parameter synchronization; derived from train_batch_size / micro_batch_size
-      parameter_sync_step: 4
+    # Strict StreamOPD. Runtime preflight derives reverse-unit width and the
+    # number of accumulation units before policy version zero.
+    streamopd: {}
 
     # Replay buffer sampling strategy
     sampler:

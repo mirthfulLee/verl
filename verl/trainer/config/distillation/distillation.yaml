@@ -26,10 +26,6 @@ streamopd_kv:
   runtime_profile: auto
   planner_explicit_options: []
   token_chunk_size: 256
-  teacher_initial_chunk_size: 256
-  teacher_first_chunk_includes_prompt: true
-  teacher_terminal_only_after_initial: false
-  posthoc_ablation: false
   trainer_placement: teacher
   scheduler_policy: adaptive
   # Zero selects the largest shape admitted by preflight memory planning.
@@ -38,30 +34,20 @@ streamopd_kv:
   reverse_page_size: 64
   reverse_batch_size: 0
   reverse_batch_max_tokens: 0
-  reverse_fixed_slots: true
   reverse_slot_max_tokens: 0
   reverse_slot_reserve_gib: 4.0
-  micro_batch_size: 32
-  teacher_priority_threshold: 0
   scheduler_poll_interval_ms: 10
   scheduler_timeout_seconds: 600.0
   scheduler_actor_name: ""
   max_pending_teacher_chunks: 128
-  enable_pool_sleep: true
-  enable_rollout_sleep_level2: false
   # Zero selects a stable preflight plan from vLLM KV capacity.
   teacher_prefill_max_active_trajectories: 0
   teacher_prefill_max_active_kv_tokens: 0
   teacher_prefill_kv_page_size: 64
   kv_prefetch_depth: 1
   kv_prefetch_workers: 4
-  kv_prefetch_pin_memory: true
-  release_stage1_kv_after_copy: true
   kv_handoff_dir: /tmp/verl-streamopd-kv
-  rollout_backend: vllm
-  exact_dense_attention: true
   require_same_tokenizer: true
-  cleanup_after_step: true
   validate_teacher_artifacts: false
   validate_full_forward_loss: false
   validation_atol: 1.0e-4

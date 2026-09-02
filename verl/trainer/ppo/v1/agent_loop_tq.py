@@ -193,11 +193,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
-            kv_params = field["extra_fields"].get("kv_transfer_params") or {}
-            if kv_path := kv_params.get("streamopd_kv_path"):
-                field["streamopd_kv_path"] = kv_path
-                field["streamopd_policy_version"] = field["extra_fields"]["streamopd_policy_version"]
-                field["streamopd_trajectory_id"] = field["extra_fields"]["streamopd_trajectory_id"]
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             # TODO: uniform response_mask and loss_mask

@@ -130,9 +130,6 @@ class PPOTrainer(ABC):
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
-        self.streamopd_kv_enabled = bool(
-            self.config.get("distillation", {}).get("streamopd_kv", {}).get("enabled", False)
-        )
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -347,16 +344,7 @@ class PPOTrainer(ABC):
         if self.use_teacher_policy:
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            streamopd_teacher_colocated = bool(
-                self.trainer_mode == "streamopd_colocate"
-                and self.config.distillation.streamopd_kv.get("trainer_placement", "teacher") in {"teacher", "union"}
-            )
-            teacher_colocated = (
-                streamopd_teacher_colocated
-                if self.trainer_mode == "streamopd_colocate"
-                else bool(self.config.distillation.get("colocate_teacher_with_student", False))
-            )
-            if teacher_colocated:
+            if self._is_teacher_colocated():
                 teacher_world_size = sum(
                     teacher.world_size for teacher in self.distillation_config.teacher_models.values()
                 )
@@ -380,7 +368,7 @@ class PPOTrainer(ABC):
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        if self.trainer_mode != "streamopd_colocate":
+        if not self._uses_external_checkpoint_engine():
             checkpoint_engine_config.backend = "naive"
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -390,9 +378,9 @@ class PPOTrainer(ABC):
         logger.info("checkpoint engine manager initialized")
 
         # Hybrid replicas must release memory before the colocated actor loads a
-        # checkpoint. A dedicated StreamOPD rollout lives on another pool and
-        # keeps its weight buffers resident for the initial distributed sync.
-        if self.trainer_mode != "streamopd_colocate":
+        # checkpoint. Trainers with an external rollout process manage that
+        # process's lifecycle themselves.
+        if not self._uses_external_checkpoint_engine():
             self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
@@ -401,12 +389,17 @@ class PPOTrainer(ABC):
     def _create_llm_server_manager(self, actor_rollout_resource_pool) -> LLMServerManager:
         """Create rollout servers; placement-aware trainers may override this hook."""
 
-        dedicated_streamopd_rollout = self.trainer_mode == "streamopd_colocate"
         return LLMServerManager.create(
             config=self.config,
-            worker_group=None if dedicated_streamopd_rollout else self.actor_rollout_wg,
-            rollout_resource_pool=None if dedicated_streamopd_rollout else actor_rollout_resource_pool,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
         )
+
+    def _is_teacher_colocated(self) -> bool:
+        return bool(self.config.distillation.get("colocate_teacher_with_student", False))
+
+    def _uses_external_checkpoint_engine(self) -> bool:
+        return False
 
     def _prepare_teacher_runtime(self) -> None:
         """Hook for placement-aware trainers to resolve Teacher server limits."""
@@ -595,18 +588,16 @@ class PPOTrainer(ABC):
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
-        if not self.streamopd_kv_enabled and self.reward_loop_manager.reward_loop_worker_handles is None:
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
         # 3. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
-        # 4. Direct StreamOPD-KV never consumes PPO ratios or entropy. Its
-        # serving KV already supplies the no-grad causal trace used by training.
-        if not self.streamopd_kv_enabled:
-            with marked_timer("old_log_prob", timing_raw, color="blue"):
-                batch = self._compute_old_log_prob(batch, metrics=metrics)
+        # 4. compute old_log_prob
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            batch = self._compute_old_log_prob(batch, metrics=metrics)
 
         # 5. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
@@ -618,11 +609,9 @@ class PPOTrainer(ABC):
             with marked_timer("values", timing_raw, color="cyan"):
                 batch = self._compute_values(batch, metrics=metrics)
 
-        # 7. Direct StreamOPD-KV optimizes only the token-level distillation
-        # objective, so it has no policy-gradient advantages to compute.
-        if not self.streamopd_kv_enabled:
-            with marked_timer("adv", timing_raw, color="brown"):
-                batch = self._compute_advantage(batch, metrics=metrics)
+        # 7. compute advantage and return
+        with marked_timer("adv", timing_raw, color="brown"):
+            batch = self._compute_advantage(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -768,9 +757,8 @@ class PPOTrainer(ABC):
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
-        # Most V1 modes take one optimizer step per trigger. Strict StreamOPD
-        # overlap instead accumulates every trigger and finalizes exactly once
-        # at the policy-version barrier.
+        # Most V1 modes take one optimizer step per trigger. Specialized
+        # trainers may accumulate several triggers behind one update barrier.
         optim_total_training_steps = total_training_steps * self._optimizer_updates_per_global_step()
         try:
             OmegaConf.set_struct(self.config, True)
@@ -795,12 +783,7 @@ class PPOTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
-        if self.trainer_mode == "streamopd_colocate":
-            if need_reference_policy(config):
-                raise NotImplementedError("streamopd_colocate does not support a reference policy")
-            role = Role.Actor
-        else:
-            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 
@@ -846,11 +829,7 @@ class PPOTrainer(ABC):
                 if distillation_config.n_gpus_per_node >= config.trainer.n_gpus_per_node:
                     raise ValueError("colocated teacher GPU count must be smaller than the student pool GPU count")
 
-            streamopd_teacher_colocation = bool(
-                self.trainer_mode == "streamopd_colocate"
-                and distillation_config.streamopd_kv.get("trainer_placement", "teacher") in {"teacher", "union"}
-            )
-            if streamopd_teacher_colocation or baseline_teacher_colocation:
+            if baseline_teacher_colocation:
                 self.mapping[Role.TeacherModel] = global_pool_id
             else:
                 teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
@@ -1564,13 +1543,6 @@ class PPOTrainer(ABC):
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
-        # The reverse StreamOPD worker consumes the rank-local cohort directly and
-        # does not iterate PPO mini-batches. Requiring lcm(dp_size,
-        # ppo_mini_batch_size) can otherwise turn batch 128 / DP 3 into 384
-        # trajectories. A single zero-loss synthetic sample is sufficient.
-        if self.streamopd_kv_enabled:
-            return dp_size
-
         required_multiple = dp_size
 
         # If enabled with critic training, the batch should align with critic PPO mini-batches.
@@ -1589,8 +1561,6 @@ class PPOTrainer(ABC):
         return required_multiple
 
     def _optimizer_updates_per_global_step(self) -> int:
-        if getattr(self, "streamopd_kv_enabled", False) and getattr(self, "trainer_mode", None) == "streamopd_colocate":
-            return 1
         return self.parameter_sync_step
 
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
@@ -1843,14 +1813,7 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
-        if self.streamopd_kv_enabled:
-            accumulation_steps = getattr(self, "_streamopd_runtime_accumulation_steps", self.parameter_sync_step)
-            extra_info.update(
-                {
-                    "streamopd_accumulation_step": self.local_trigger_step,
-                    "streamopd_accumulation_steps": accumulation_steps,
-                }
-            )
+        extra_info.update(self._actor_update_extra_info())
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
@@ -1860,6 +1823,9 @@ class PPOTrainer(ABC):
         metrics.update(actor_metrics)
 
         return batch
+
+    def _actor_update_extra_info(self) -> dict[str, Any]:
+        return {}
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
@@ -1885,6 +1851,7 @@ class PPOTrainer(ABC):
             accumulator=self._rollout_moe_lb_metrics_accumulator,
             kv_batch_get=tq.kv_batch_get,
         )
+        data = self._prepare_metric_tensors(data)
 
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
@@ -1913,14 +1880,6 @@ class PPOTrainer(ABC):
                 spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
 
         data = data.to_padded_tensor()
-        if "rm_scores" not in data:
-            if not self.streamopd_kv_enabled:
-                raise KeyError("rollout metrics require rm_scores outside direct StreamOPD")
-            # Direct StreamOPD does not consume task rewards, but the shared
-            # reporting schema still expects token-level scores. Keep the
-            # placeholder local to metrics instead of reintroducing reward RPCs
-            # on the trajectory critical path.
-            data["rm_scores"] = torch.zeros_like(data["responses"], dtype=torch.float32)
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]
@@ -1989,6 +1948,9 @@ class PPOTrainer(ABC):
                 "training/off_policy/trajectory_staleness_worst/min": trajectory_staleness_worst.min(),
             }
         )
+
+    def _prepare_metric_tensors(self, data: TensorDict) -> TensorDict:
+        return data
 
 
 TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}

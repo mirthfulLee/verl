@@ -17,8 +17,6 @@ from typing import Any
 
 import torch
 
-from .attention import LayerKVTrace
-
 
 def _compact_loss_mask(loss_fn: Callable, sequence_length: int) -> torch.Tensor | None:
     """Return a CPU target mask when a loss supports compact LM-head logits."""
@@ -51,29 +49,6 @@ def _wavefront_logit_indices(
         if start < sample_end:
             union[: sample_end - start] |= mask[start:sample_end]
     return union.nonzero(as_tuple=False).flatten()
-
-
-def capture_qwen3_kv_trace(model: torch.nn.Module, input_ids: torch.Tensor) -> tuple[LayerKVTrace, ...]:
-    """Build the reference trace used to validate a serving-time KV handoff."""
-
-    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-        raise ValueError("the Qwen3 correctness backend currently supports one trajectory at a time")
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        output = model(input_ids=input_ids, use_cache=True, return_dict=True)
-    if was_training:
-        model.train()
-
-    cache = output.past_key_values
-    layers = getattr(cache, "layers", None)
-    if layers is None:
-        try:
-            legacy = cache.to_legacy_cache()
-        except AttributeError as exc:
-            raise TypeError("unsupported Transformers KV cache representation") from exc
-        return tuple(LayerKVTrace(key.detach(), value.detach()) for key, value in legacy)
-    return tuple(LayerKVTrace(layer.keys.detach(), layer.values.detach()) for layer in layers)
 
 
 @contextmanager
@@ -154,7 +129,7 @@ def _build_reverse_wavefront(sequence_lengths: Sequence[int], chunk_size: int) -
 
 
 class Qwen3ReverseTrainer:
-    """Dense OOMB paged traversal over a sealed Qwen3 KV trace.
+    """Dense OOMB wavefront traversal over fixed rollout-KV slots.
 
     The caller owns loss normalization and the optimizer step. ``loss_fn`` must
     return an unnormalized token-loss sum and the number of valid tokens for the
@@ -174,145 +149,27 @@ class Qwen3ReverseTrainer:
 
     def backward(
         self,
-        input_ids: torch.Tensor,
-        layers: Sequence[LayerKVTrace],
-        loss_fn: Callable[[torch.Tensor, int, int], tuple[torch.Tensor, int]],
-        *,
-        release_processed_suffix: bool = True,
-        backward_context: Callable[[int, int], AbstractContextManager] | None = None,
-        stage1_release: Callable[[], None] | None = None,
-    ) -> ReverseTrainingResult:
-        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
-            raise ValueError("Qwen3 reverse training requires a non-empty [batch, sequence] input")
-        from .oomb_paged_attention import OOMBPagedReverseState
-
-        state = OOMBPagedReverseState(list(layers), chunk_size=self.chunk_size, page_size=self.page_size)
-        if stage1_release is not None:
-            stage1_release()
-        sequence_length = input_ids.shape[1]
-        if state.sequence_length != sequence_length:
-            raise ValueError(f"input/KV token length mismatch: input={sequence_length}, KV={state.sequence_length}")
-
-        loss_sum = torch.zeros((), device=input_ids.device, dtype=torch.float32)
-        valid_tokens = 0
-        chunks = 0
-        lm_head_tokens = 0
-        dense_lm_head_tokens = 0
-        loss_mask = _compact_loss_mask(loss_fn, sequence_length)
-        bounds = [
-            (start, min(start + self.chunk_size, sequence_length))
-            for start in range(0, sequence_length, self.chunk_size)
-        ]
-        total_chunks = len(bounds)
-        with use_qwen3_reverse_attention(self.model, state):
-            for start, end in reversed(bounds):
-                state.begin(start, end)
-                position_ids = torch.arange(start, end, device=input_ids.device).unsqueeze(0)
-                position_ids = position_ids.expand(input_ids.shape[0], -1)
-                model_kwargs = {}
-                if loss_mask is not None:
-                    logit_indices = loss_mask[start:end].nonzero(as_tuple=False).flatten()
-                    model_kwargs["logits_to_keep"] = logit_indices.to(input_ids.device)
-                    lm_head_tokens += input_ids.shape[0] * logit_indices.numel()
-                else:
-                    lm_head_tokens += input_ids.shape[0] * (end - start)
-                dense_lm_head_tokens += input_ids.shape[0] * (end - start)
-                output = self.model(
-                    input_ids=input_ids[:, start:end],
-                    position_ids=position_ids,
-                    use_cache=False,
-                    return_dict=True,
-                    **model_kwargs,
-                )
-                if loss_mask is None:
-                    chunk_loss, chunk_valid_tokens = loss_fn(output.logits, start, end)
-                else:
-                    positions = (start + logit_indices).to(input_ids.device)
-                    chunk_loss, chunk_valid_tokens = loss_fn.compact(output.logits, positions)
-                if chunk_loss.ndim != 0 or chunk_valid_tokens < 0:
-                    raise ValueError("loss_fn must return a scalar loss sum and a non-negative token count")
-                sync_context = backward_context(chunks, total_chunks) if backward_context else nullcontext()
-                with sync_context:
-                    (chunk_loss + state.gradient_injection()).backward()
-                state.commit_prefix_gradients(release_processed_suffix=release_processed_suffix)
-                loss_sum = loss_sum + chunk_loss.detach().float()
-                valid_tokens += chunk_valid_tokens
-                chunks += 1
-        return ReverseTrainingResult(
-            loss_sum=loss_sum,
-            valid_tokens=valid_tokens,
-            chunks=chunks,
-            lm_head_tokens=lm_head_tokens,
-            dense_lm_head_tokens=dense_lm_head_tokens,
-        )
-
-    def backward_batched(
-        self,
         input_ids: Sequence[torch.Tensor],
-        layers: Sequence[Sequence[LayerKVTrace]] | None,
         loss_fns: Sequence[Callable[[torch.Tensor, int, int], tuple[torch.Tensor, int]]],
         *,
-        release_processed_suffix: bool = True,
+        state: Any,
         backward_context: Callable[[int, int], AbstractContextManager] | None = None,
-        stage1_release: Callable[[], None] | None = None,
-        release_stage1_kv_after_copy: bool = True,
-        fixed_state: Any | None = None,
         on_depth_committed: Callable[[Sequence[int], int, int], None] | None = None,
     ) -> ReverseTrainingResult:
         """Run ragged trajectories in reverse-depth wavefront batches."""
 
         if not input_ids or len(input_ids) != len(loss_fns):
             raise ValueError("input trajectories and loss functions must be non-empty and aligned")
-        if fixed_state is None and (layers is None or len(input_ids) != len(layers)):
-            raise ValueError("input trajectories, KV traces, and loss functions must be aligned")
         if any(sequence.ndim != 2 or sequence.shape[0] != 1 for sequence in input_ids):
-            raise ValueError("OOMB paged reverse batches require [1, sequence] inputs")
+            raise ValueError("OOMB reverse batches require [1, sequence] inputs")
         sequence_lengths = [sequence.shape[1] for sequence in input_ids]
-        if layers is not None:
-            layer_counts = {len(trace) for trace in layers}
-            if len(layer_counts) != 1:
-                raise ValueError("OOMB paged reverse batches require the same layer count")
-            for sequence_length, trace in zip(sequence_lengths, layers, strict=True):
-                if any(layer.length != sequence_length for layer in trace):
-                    raise ValueError("each OOMB trajectory KV trace must match its input length")
-
         padded_lengths = [math.ceil(length / self.chunk_size) * self.chunk_size for length in sequence_lengths]
         padded_input_ids = [
             torch.nn.functional.pad(sequence, (0, padded_length - sequence.shape[1]))
             for sequence, padded_length in zip(input_ids, padded_lengths, strict=True)
         ]
-        if fixed_state is None:
-            assert layers is not None
-            padded_trajectories = [
-                [
-                    LayerKVTrace(
-                        layer.key
-                        if padded_length == sequence_length
-                        else torch.nn.functional.pad(layer.key, (0, 0, 0, padded_length - sequence_length)),
-                        layer.value
-                        if padded_length == sequence_length
-                        else torch.nn.functional.pad(layer.value, (0, 0, 0, padded_length - sequence_length)),
-                    )
-                    for layer in trace
-                ]
-                for sequence_length, padded_length, trace in zip(sequence_lengths, padded_lengths, layers, strict=True)
-            ]
-            from .oomb_paged_attention import OOMBFlashWavefrontState
-
-            state = OOMBFlashWavefrontState(padded_trajectories)
-            # The contiguous state now owns the complete Stage-1 trace. Drop
-            # the caller's rollout-KV references before reverse kernels start.
-            if release_stage1_kv_after_copy:
-                for trace in layers:
-                    for layer in trace:
-                        layer.key = layer.key[:, :, :0]
-                        layer.value = layer.value[:, :, :0]
-        else:
-            state = fixed_state
-            if list(getattr(state, "sequence_lengths", ())) != padded_lengths:
-                raise ValueError("fixed reverse slot lengths do not match the padded wavefront")
-        if stage1_release is not None:
-            stage1_release()
+        if list(getattr(state, "sequence_lengths", ())) != padded_lengths:
+            raise ValueError("reverse slot lengths do not match the padded wavefront")
 
         schedule = _build_reverse_wavefront(sequence_lengths, self.chunk_size)
         compact_masks = [
@@ -378,7 +235,7 @@ class Qwen3ReverseTrainer:
                 sync_context = backward_context(call_idx, len(schedule)) if backward_context else nullcontext()
                 with sync_context:
                     (chunk_loss + state.gradient_injection()).backward()
-                state.commit_prefix_gradients(release_processed_suffix=release_processed_suffix)
+                state.commit_prefix_gradients()
                 if on_depth_committed is not None:
                     on_depth_committed(active, start, end)
                 loss_sum = loss_sum + chunk_loss.detach().float()

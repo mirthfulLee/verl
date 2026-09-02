@@ -24,7 +24,9 @@ export VERL_USE_UV=0
 The benchmark harness intentionally sets `distillation.streamopd_kv.runtime_profile=manual` so controlled ablations
 can pin the compared settings. This is not the normal user interface. The production example defaults to `auto` and
 reuses verl's existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count
-configuration; its only optional default-path topology setting is `trainer_placement`.
+configuration; its only optional default-path topology setting is `trainer_placement`. In the manual matrix,
+`MICRO_BATCH_SIZE` caps both live Teacher sessions and reverse trajectories per group; memory preflight may select a
+smaller reverse width when necessary. Baseline modes ignore this setting.
 
 The normal auto profile jointly selects Rollout `gpu_memory_utilization` and `max_num_seqs` from model weights, KV
 bytes per token, maximum trajectory length, physical GPU memory, pool placement, and any explicit user constraint.
@@ -39,8 +41,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 BATCH_SIZE=128 TOTAL_TRAINING_STEPS=1 \
   bash benchmarks/streamopd_kv/run_colocate_matrix.sh
 ```
 
-The benchmark wrapper calls the current path `streamopd`; the internal trainer mode remains `streamopd_colocate`.
-Rollout uses an independent `max_num_seqs`, and baseline modes do not consume StreamOPD compatibility fields. The
+The benchmark wrapper and trainer mode both use `streamopd`. Rollout uses an independent `max_num_seqs`, and baseline
+modes do not consume StreamOPD compatibility fields. The
 matrix exposes separate `BASELINE_ROLLOUT_MAX_NUM_SEQS`/`STREAMOPD_ROLLOUT_MAX_NUM_SEQS` and
 `BASELINE_AGENT_LOOP_WORKERS`/`STREAMOPD_AGENT_LOOP_WORKERS` overrides so StreamOPD tuning cannot silently change
 the baseline denominator.
@@ -95,29 +97,3 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. .venv-cu128/bin/python \
 
 This benchmark excludes model loading and warmup. End-to-end runs are required to include Host KV transport,
 scheduler gaps, checkpoint publication, and pipeline fill/drain.
-
-## Post-hoc Teacher/Trainer ablation
-
-Run the streaming-versus-post-hoc comparison with:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash benchmarks/streamopd_kv/run_posthoc_ablation.sh
-```
-
-Post-hoc submits one complete Teacher request when each trajectory reaches EOS, while Trainer waits for the global
-barrier. The comparison isolates Teacher request granularity and early reverse overlap. Rollout KV remains streamed
-before EOS in both modes.
-
-## Fixed-slot reverse ablation
-
-Run the legacy/fixed-slot and reverse batch/chunk comparison with:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash benchmarks/streamopd_kv/run_fixed_slot_ablation.sh
-```
-
-The comparison covers fixed backing allocation, reverse wavefront width, reverse chunk size, Host prefetch wait,
-next-group DMA overlap, and Trainer peak memory. Use repeated post-warmup policy steps and fresh process launches
-before treating any output as a stable result.

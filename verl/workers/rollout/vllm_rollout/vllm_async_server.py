@@ -746,10 +746,7 @@ class vLLMHttpServer:
         kv_transfer_params: Optional[dict] = None,
         streamopd_callback: Optional[ray.actor.ActorHandle] = None,
         streamopd_chunk_size: Optional[int] = None,
-        streamopd_terminal_only_after_initial: bool = False,
-        streamopd_terminal_only: bool = False,
         streamopd_page_size: int = 1,
-        streamopd_first_chunk_includes_prompt: bool = True,
         prompt_logprobs_start: int = 0,
         prompt_logprobs_as_tensors: bool = False,
     ) -> TokenOutput:
@@ -789,10 +786,7 @@ class vLLMHttpServer:
                 prompt_ids=prompt_ids,
                 chunk_size=streamopd_chunk_size,
                 submit=submit_streamopd_chunk,
-                terminal_only_after_initial=streamopd_terminal_only_after_initial,
-                terminal_only=streamopd_terminal_only,
                 page_size=streamopd_page_size,
-                first_chunk_includes_prompt=streamopd_first_chunk_includes_prompt,
             )
             kv_transfer_params = dict(kv_transfer_params or {})
             kv_transfer_params.update(
@@ -957,6 +951,11 @@ class vLLMHttpServer:
                 extra_fields.update(
                     {key: value for key, value in response_kv_transfer_params.items() if key.startswith("streamopd_")}
                 )
+                extra_fields["transfer_queue_fields"] = {
+                    "streamopd_kv_path": response_kv_transfer_params["streamopd_kv_path"],
+                    "streamopd_policy_version": streamopd_publisher.key.policy_version,
+                    "streamopd_trajectory_id": request_id,
+                }
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:

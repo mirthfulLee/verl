@@ -35,6 +35,7 @@ class StreamOPDTaskScheduler:
         self.train_launch_width = 1
         self.shared_launch_target = 1
         self.teacher_turn_grace_seconds = 0.05
+        self.teacher_available = True
         self.teacher_queued = 0
         self.teacher_active = 0
         self.teacher_active_kv_tokens = 0
@@ -70,6 +71,8 @@ class StreamOPDTaskScheduler:
         self.concurrent_busy_seconds = 0.0
         self._concurrent_busy_started_at = 0.0
         self.training_units_since_teacher = 0
+        self.training_trajectories_started = 0
+        self.max_training_burst = 0
         self.last_training_finished_at = 0.0
         self.forced_teacher_turns = 0
         self.policy_started_at = 0.0
@@ -80,6 +83,7 @@ class StreamOPDTaskScheduler:
         expected_trajectories: int = 0,
         scheduler_policy: str = "adaptive",
         train_launch_width: int = 1,
+        teacher_available: bool = True,
     ) -> None:
         if self.teacher_pending or self.training_active or self.teacher_sessions or self.training_waiters:
             raise RuntimeError(
@@ -95,11 +99,12 @@ class StreamOPDTaskScheduler:
         if train_launch_width < 1:
             raise ValueError("train_launch_width must be positive")
         self.scheduler_policy = scheduler_policy
+        self.teacher_available = bool(teacher_available)
         self.train_launch_width = int(train_launch_width)
         self.expected_trajectories = int(expected_trajectories)
         self.shared_launch_target = min(
-            self.expected_trajectories or 2 * self.train_launch_width,
-            2 * self.train_launch_width,
+            self.expected_trajectories or self.train_launch_width,
+            self.train_launch_width,
         )
         self.terminal_trajectories = 0
         self.completed_teacher_trajectories = 0
@@ -131,6 +136,8 @@ class StreamOPDTaskScheduler:
         self.concurrent_busy_seconds = 0.0
         self._concurrent_busy_started_at = 0.0
         self.training_units_since_teacher = 0
+        self.training_trajectories_started = 0
+        self.max_training_burst = 0
         self.last_training_finished_at = 0.0
         self.forced_teacher_turns = 0
         self.policy_started_at = time.perf_counter()
@@ -221,6 +228,7 @@ class StreamOPDTaskScheduler:
             if not self.first_teacher_started_at:
                 self.first_teacher_started_at = self._teacher_busy_started_at
         if self.resources_overlap and self.training_units_since_teacher:
+            self.max_training_burst = max(self.max_training_burst, self.training_units_since_teacher)
             self.forced_teacher_turns += 1
             self.training_units_since_teacher = 0
         was_concurrent = bool(self.teacher_active and self.training_active)
@@ -237,25 +245,27 @@ class StreamOPDTaskScheduler:
         max_active_kv_tokens: int = 2**63 - 1,
     ) -> bool:
         self._check_version(policy_version)
-        shared_ready = bool(
-            not self.expected_trajectories
-            or self.completed_teacher_trajectories >= self.shared_launch_target
-            or self.terminal_trajectories == self.expected_trajectories
-        )
+        if not self.teacher_available:
+            return False
         teacher_turn_due = bool(
-            self.resources_overlap and self.training_units_since_teacher and not self.teacher_drained
+            self.resources_overlap
+            and self.training_units_since_teacher
+            and not self.teacher_drained
+            and not self.full_training_cohort_available
+        )
+        training_handoff_pending = bool(
+            self.resources_overlap
+            and self.scheduler_policy == "adaptive"
+            and self.training_units_since_teacher
+            and self.full_training_cohort_available
+            and time.perf_counter() - self.last_training_finished_at < self.teacher_turn_grace_seconds
         )
         adaptive_yield = bool(
             self.resources_overlap
             and self.scheduler_policy == "adaptive"
-            and self.training_waiters
-            and shared_ready
             and not teacher_turn_due
             and not self.should_drain_teacher_tail
-            and (
-                self.ready_training_trajectories >= self.train_launch_width
-                or self.terminal_trajectories == self.expected_trajectories
-            )
+            and (bool(self.training_waiters) or training_handoff_pending)
         )
         if (
             (self.resources_overlap and self.training_active)
@@ -280,6 +290,12 @@ class StreamOPDTaskScheduler:
         if self.teacher_active_kv_tokens < 0:
             raise RuntimeError("teacher active KV accounting became negative")
         self._transition_concurrency(was_concurrent)
+
+    def teacher_wake_completed(self, policy_version: int) -> None:
+        """Open Teacher admission after an asynchronous level-1 wake."""
+
+        self._check_version(policy_version)
+        self.teacher_available = True
 
     def teacher_cancelled(self, policy_version: int, kv_tokens: int = 0) -> None:
         del kv_tokens
@@ -342,13 +358,11 @@ class StreamOPDTaskScheduler:
                 all_rollouts_terminal = bool(
                     self.expected_trajectories and self.terminal_trajectories == self.expected_trajectories
                 )
-                if (
-                    self.expected_trajectories
-                    and self.completed_teacher_trajectories < self.shared_launch_target
-                    and not all_rollouts_terminal
-                ):
-                    return False
-                teacher_turn_due = self.training_units_since_teacher and not self.teacher_drained
+                teacher_turn_due = (
+                    self.training_units_since_teacher
+                    and not self.teacher_drained
+                    and not self.full_training_cohort_available
+                )
                 if teacher_turn_due:
                     if self.teacher_queued > teacher_queue_threshold:
                         return False
@@ -365,6 +379,7 @@ class StreamOPDTaskScheduler:
         if self.training_waiters:
             _, trajectory_count = self.training_waiters.pop(0)
             self.ready_training_trajectories -= trajectory_count
+            self.training_trajectories_started += trajectory_count
         if not self.first_training_started_at:
             self.first_training_started_at = time.perf_counter()
             self.teacher_completed_at_first_training = self.completed_teacher_trajectories
@@ -383,6 +398,7 @@ class StreamOPDTaskScheduler:
         self.training_active = 0
         if self.resources_overlap:
             self.training_units_since_teacher += 1
+            self.max_training_burst = max(self.max_training_burst, self.training_units_since_teacher)
             self.last_training_finished_at = time.perf_counter()
         self._transition_concurrency(was_concurrent)
 
@@ -399,6 +415,7 @@ class StreamOPDTaskScheduler:
             "completed_teacher_trajectories": self.completed_teacher_trajectories,
             "posthoc_ready": self.posthoc_ready,
             "teacher_pending": self.teacher_pending,
+            "teacher_available": self.teacher_available,
             "training_active": self.training_active,
             "training_waiters": len(self.training_waiters),
             "ready_training_trajectories": self.ready_training_trajectories,
@@ -418,6 +435,9 @@ class StreamOPDTaskScheduler:
             "teacher_busy_seconds": self.teacher_busy_seconds,
             "training_busy_seconds": self.training_busy_seconds,
             "training_units_since_teacher": self.training_units_since_teacher,
+            "training_trajectories_started": self.training_trajectories_started,
+            "training_backlog_trajectories": self.training_backlog_trajectories,
+            "max_training_burst": self.max_training_burst,
             "forced_teacher_turns": self.forced_teacher_turns,
         }
 
@@ -499,6 +519,8 @@ class StreamOPDTaskScheduler:
             "streamopd/scheduler_resources_overlap": float(self.resources_overlap),
             "streamopd/scheduler_train_launch_width": float(self.train_launch_width),
             "streamopd/scheduler_shared_launch_target": float(self.shared_launch_target),
+            "streamopd/scheduler_training_trajectories_started": float(self.training_trajectories_started),
+            "streamopd/scheduler_max_training_burst": float(self.max_training_burst),
             "streamopd/scheduler_forced_teacher_turns": float(self.forced_teacher_turns),
             "streamopd/scheduler_policy_seconds": policy_seconds,
         }
@@ -529,6 +551,16 @@ class StreamOPDTaskScheduler:
             return False
         remaining = self.expected_trajectories - self.completed_teacher_trajectories
         return 0 < remaining <= self.train_launch_width
+
+    @property
+    def training_backlog_trajectories(self) -> int:
+        """Teacher-complete trajectories not yet assigned to a reverse unit."""
+
+        return max(0, self.completed_teacher_trajectories - self.training_trajectories_started)
+
+    @property
+    def full_training_cohort_available(self) -> bool:
+        return self.training_backlog_trajectories >= self.train_launch_width
 
     def _check_version(self, policy_version: int) -> None:
         if self.policy_version is None:

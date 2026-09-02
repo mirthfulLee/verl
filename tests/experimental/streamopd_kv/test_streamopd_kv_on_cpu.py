@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,7 @@ from verl.experimental.streamopd_kv import (
     StreamingTeacherCoordinator,
     TeacherArtifactBuffer,
     TrajectoryKey,
+    cleanup_vllm_snapshot,
     exact_causal_attention,
     extract_vllm_nhd_token_range,
     extract_vllm_nhd_tokens,
@@ -42,8 +44,10 @@ from verl.experimental.streamopd_kv import (
     move_vllm_snapshot,
     prepare_streamopd_kv_config,
 )
+from verl.experimental.streamopd_kv.config import _auto_streamopd_runtime_profile
 from verl.experimental.streamopd_kv.fsdp_worker import (
     StreamOPDKVTrainingWorker,
+    _deferred_training_state_bytes,
     _dynamic_reverse_chunk_size,
     _fixed_reverse_slot_plan,
     _forward_kl_topk_sum,
@@ -52,6 +56,7 @@ from verl.experimental.streamopd_kv.fsdp_worker import (
     _partition_reverse_microbatches,
     _reverse_backward_calls,
 )
+from verl.experimental.streamopd_kv.host_slot_pool import HostKVSlotPool, cleanup_host_kv_pools
 from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
 from verl.experimental.streamopd_kv.snapshot_io import load_vllm_slot_snapshot
@@ -472,6 +477,7 @@ def test_vllm_worker_reports_and_resets_device_memory_stats(monkeypatch: pytest.
 
     class DeviceModule:
         reset_device = None
+        free_bytes = 31
 
         def reset_peak_memory_stats(self, device) -> None:
             self.reset_device = device
@@ -496,6 +502,13 @@ def test_vllm_worker_reports_and_resets_device_memory_stats(monkeypatch: pytest.
             assert device == 2
             return 22
 
+        def mem_get_info(self, device) -> tuple[int, int]:
+            assert device == 2
+            return self.free_bytes, 32
+
+        def empty_cache(self) -> None:
+            self.free_bytes = 32
+
     device_module = DeviceModule()
     monkeypatch.setattr(utils, "get_torch_device", lambda: device_module)
     worker = SimpleNamespace(device=2)
@@ -509,6 +522,13 @@ def test_vllm_worker_reports_and_resets_device_memory_stats(monkeypatch: pytest.
         "reserved_bytes": 12,
         "max_allocated_bytes": 21,
         "max_reserved_bytes": 22,
+        "free_bytes": 31,
+        "total_bytes": 32,
+    }
+    assert utils.vLLMColocateWorkerExtension.trim_device_memory(worker, minimum_free_bytes=32) == {
+        "freed_bytes": 1,
+        "free_before_bytes": 31,
+        "free_after_bytes": 32,
     }
 
 
@@ -529,8 +549,30 @@ def test_rollout_manager_aggregates_vllm_worker_memory_stats() -> None:
 
     manager = LLMServerManager.__new__(LLMServerManager)
     manager.server_handles = [
-        Server([{"allocated_bytes": 1, "reserved_bytes": 3, "max_allocated_bytes": 5, "max_reserved_bytes": 7}]),
-        Server([{"allocated_bytes": 2, "reserved_bytes": 4, "max_allocated_bytes": 6, "max_reserved_bytes": 8}]),
+        Server(
+            [
+                {
+                    "allocated_bytes": 1,
+                    "reserved_bytes": 3,
+                    "max_allocated_bytes": 5,
+                    "max_reserved_bytes": 7,
+                    "free_bytes": 11,
+                    "total_bytes": 16,
+                }
+            ]
+        ),
+        Server(
+            [
+                {
+                    "allocated_bytes": 2,
+                    "reserved_bytes": 4,
+                    "max_allocated_bytes": 6,
+                    "max_reserved_bytes": 8,
+                    "free_bytes": 9,
+                    "total_bytes": 16,
+                }
+            ]
+        ),
     ]
 
     assert manager.collect_device_memory_stats() == {
@@ -538,6 +580,8 @@ def test_rollout_manager_aggregates_vllm_worker_memory_stats() -> None:
         "reserved_bytes": 4,
         "max_allocated_bytes": 6,
         "max_reserved_bytes": 8,
+        "free_bytes": 9,
+        "total_bytes": 16,
     }
 
 
@@ -740,6 +784,87 @@ def test_streamed_vllm_snapshot_loader_assembles_contiguous_chunks(tmp_path) -> 
     torch.testing.assert_close(slot_snapshot.layers[0].key, packed[:, 0])
 
 
+def test_shared_host_kv_slot_pool_uses_fixed_backing_and_reuses_rows(tmp_path) -> None:
+    pool = HostKVSlotPool.create_or_open(
+        str(tmp_path),
+        tp_rank=0,
+        slot_count=2,
+        token_capacity=4,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=16,
+        dtype=torch.float32,
+    )
+    first = pool.acquire(request_id="backend-a", trajectory_id="trajectory-a", policy_version=3, prompt_length=1)
+    second = pool.acquire(request_id="backend-b", trajectory_id="trajectory-b", policy_version=3, prompt_length=1)
+    with pytest.raises(RuntimeError, match="pool is full"):
+        pool.acquire(request_id="backend-c", trajectory_id="trajectory-c", policy_version=3, prompt_length=1)
+
+    for layer_index in range(2):
+        key, value = pool.layer(0, layer_index)
+        key[:3].fill_(layer_index + 1)
+        value[:3].fill_(-(layer_index + 1))
+    pool.seal(
+        first,
+        request_id="backend-a",
+        trajectory_id="trajectory-a",
+        policy_version=3,
+        prompt_length=1,
+        token_ids=[4, 5, 6],
+        token_count=3,
+        streamed_tokens_before_eos=2,
+        streamed_chunks_before_eos=1,
+    )
+    snapshot = load_vllm_slot_snapshot(
+        first,
+        key=TrajectoryKey(3, "trajectory-a"),
+        tp_rank=0,
+        expected_tp_size=1,
+        expected_token_ids=[4, 5, 6],
+        expected_prompt_length=1,
+        pin_memory=False,
+    )
+    assert snapshot.layers[0].key.is_contiguous()
+    assert snapshot.streamed_tokens_before_eos == 2
+    torch.testing.assert_close(snapshot.layers[1].key, torch.full((3, 1, 2), 2.0))
+    torch.testing.assert_close(snapshot.layers[1].value, torch.full((3, 1, 2), -2.0))
+    with pytest.raises(RuntimeError, match="token identity"):
+        load_vllm_slot_snapshot(
+            first,
+            key=TrajectoryKey(3, "trajectory-a"),
+            tp_rank=0,
+            expected_tp_size=1,
+            expected_token_ids=[4, 5, 7],
+            expected_prompt_length=1,
+            pin_memory=False,
+        )
+
+    data_path = HostKVSlotPool.data_path(pool.root)
+    fixed_size = os.path.getsize(data_path)
+    cleanup_vllm_snapshot(first, tp_size=1)
+    pool.release(second)
+    reused = pool.acquire(
+        request_id="backend-c",
+        trajectory_id="trajectory-c",
+        policy_version=4,
+        prompt_length=1,
+    )
+    assert HostKVSlotPool.parse_slot_path(reused)[1] == 0
+    assert reused != first
+    assert os.path.getsize(data_path) == fixed_size
+    assert not list(tmp_path.glob("*.safetensors"))
+    with pytest.raises(RuntimeError, match="stale"):
+        pool.release(first)
+    assert pool.state_counts() == {"free": 1, "writing": 1, "sealed": 0}
+    with pytest.raises(RuntimeError, match="cannot clean active"):
+        cleanup_host_kv_pools(str(tmp_path))
+    pool.release(reused)
+    assert pool.state_counts() == {"free": 2, "writing": 0, "sealed": 0}
+    assert cleanup_host_kv_pools(str(tmp_path)) > fixed_size
+    assert not list(tmp_path.glob("host_kv_pool.tp0.*"))
+
+
 def test_vllm_range_extraction_copies_only_intersecting_blocks() -> None:
     cache = torch.arange(4 * 2 * 4 * 1 * 2).reshape(4, 2, 4, 1, 2)
     full = extract_vllm_nhd_tokens(cache, [3, 1, 2], block_size=4, num_tokens=12)
@@ -924,6 +1049,17 @@ def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
     assert (long.batch_size, long.token_capacity, long.chunk_size) == (4, 8192, 1024)
 
 
+def test_reverse_preflight_reserves_lazy_adam_state_and_gradients() -> None:
+    model = nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    optimizer = torch.optim.AdamW(model.parameters())
+    parameter_bytes = model.weight.numel() * model.weight.element_size()
+
+    assert _deferred_training_state_bytes(model, optimizer) == 3 * parameter_bytes
+    model.weight.grad = torch.zeros_like(model.weight)
+    optimizer.state[model.weight]["exp_avg"] = torch.zeros_like(model.weight)
+    assert _deferred_training_state_bytes(model, optimizer) == parameter_bytes
+
+
 def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
     worker = StreamOPDKVTrainingWorker.__new__(StreamOPDKVTrainingWorker)
     worker._gpu_kv_lease_active = True
@@ -1022,6 +1158,7 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
                 "nnodes": 1,
                 "streamopd_kv": {
                     "enabled": True,
+                    "runtime_profile": "manual",
                     "kv_handoff_dir": "/tmp/test-streamopd",
                     "micro_batch_size": 16,
                 },
@@ -1037,11 +1174,14 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
     connector = config.actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config
     assert connector.kv_connector == "StreamOPDKVConnector"
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
+    assert connector.kv_connector_extra_config.streamopd_host_slot_count == 128
+    assert connector.kv_connector_extra_config.streamopd_host_slot_tokens == 4096
     assert config.trainer.v1.streamopd_colocate.micro_batch_size == 128
     assert config.trainer.v1.streamopd_colocate.parameter_sync_step == 1
     assert config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
     assert config.algorithm.filter_groups.enable is False
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.backend == "nccl"
     assert config.distillation.streamopd_kv.reverse_slot_max_tokens == 4096
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
     assert config.distillation.streamopd_kv.reverse_batch_max_tokens == 128 * 4096
@@ -1106,6 +1246,245 @@ def test_prepare_config_installs_connector_only_for_dedicated_streamopd() -> Non
         prepare_streamopd_kv_config(baseline_placement_flag)
 
 
+def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
+    config = OmegaConf.create(
+        {
+            "data": {
+                "train_batch_size": 128,
+                "max_prompt_length": 1024,
+                "max_response_length": 3072,
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "nnodes": 1,
+                    "n_gpus_per_node": 2,
+                    "data_parallel_size": 1,
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "n": 1,
+                    "max_model_len": None,
+                    "max_num_seqs": 1024,
+                    "gpu_memory_utilization": 0.3,
+                    "checkpoint_engine": {"backend": "naive"},
+                }
+            },
+            "distillation": {
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
+                "teacher_models": {
+                    "teacher_model": {
+                        "inference": {
+                            "data_parallel_size": 1,
+                            "tensor_model_parallel_size": 1,
+                            "pipeline_model_parallel_size": 1,
+                            "max_model_len": None,
+                            "max_num_seqs": 1024,
+                            "max_num_batched_tokens": 8192,
+                            "gpu_memory_utilization": 0.5,
+                        }
+                    }
+                },
+                "streamopd_kv": {"trainer_placement": "teacher"},
+            },
+        }
+    )
+
+    resource_config = (
+        config.actor_rollout_ref.rollout.n_gpus_per_node,
+        config.actor_rollout_ref.rollout.nnodes,
+        config.actor_rollout_ref.rollout.tensor_model_parallel_size,
+        config.actor_rollout_ref.rollout.pipeline_model_parallel_size,
+        config.distillation.n_gpus_per_node,
+        config.distillation.nnodes,
+    )
+    plan = _auto_streamopd_runtime_profile(config)
+    assert plan == {
+        "profile": "auto",
+        "trajectory_tokens": 4096,
+        "token_chunk_size": 384,
+        "teacher_max_batched_tokens": 4096,
+        "teacher_gpu_memory_utilization": 0.25,
+        "teacher_max_num_seqs": 64,
+        "rollout_gpu_memory_utilization_ceiling": 0.9,
+        "rollout_max_num_seqs": 64,
+    }
+    assert config.actor_rollout_ref.rollout.nnodes == 1
+    assert config.actor_rollout_ref.rollout.tensor_model_parallel_size == 1
+    assert config.actor_rollout_ref.rollout.pipeline_model_parallel_size == 1
+    assert config.actor_rollout_ref.rollout.n == 1
+    assert resource_config == (
+        config.actor_rollout_ref.rollout.n_gpus_per_node,
+        config.actor_rollout_ref.rollout.nnodes,
+        config.actor_rollout_ref.rollout.tensor_model_parallel_size,
+        config.actor_rollout_ref.rollout.pipeline_model_parallel_size,
+        config.distillation.n_gpus_per_node,
+        config.distillation.nnodes,
+    )
+    assert config.actor_rollout_ref.rollout.max_model_len == 4097
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.backend == "host"
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 512
+    assert config.distillation.streamopd_kv.reverse_batch_size == 0
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 0
+    assert config.distillation.streamopd_kv.teacher_prefill_max_active_kv_tokens == 0
+    assert config.distillation.streamopd_kv.kv_handoff_dir.startswith("/dev/shm/verl-streamopd-kv-")
+
+    config.distillation.streamopd_kv.trainer_placement = "rollout"
+    shared_rollout_plan = _auto_streamopd_runtime_profile(config)
+    assert shared_rollout_plan["teacher_gpu_memory_utilization"] == 0.9
+    assert shared_rollout_plan["rollout_gpu_memory_utilization_ceiling"] == 0.9
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 128
+
+    config.data.train_batch_size = 256
+    config.data.max_response_length = 7168
+    config.actor_rollout_ref.rollout.n_gpus_per_node = 4
+    config.distillation.n_gpus_per_node = 4
+    config.distillation.streamopd_kv.trainer_placement = "dedicated"
+    long_context_plan = _auto_streamopd_runtime_profile(config)
+    assert long_context_plan["trajectory_tokens"] == 8192
+    assert long_context_plan["token_chunk_size"] == 896
+    assert long_context_plan["teacher_max_batched_tokens"] == 8192
+    assert long_context_plan["teacher_max_num_seqs"] == 64
+    assert long_context_plan["rollout_max_num_seqs"] == 64
+    assert long_context_plan["teacher_gpu_memory_utilization"] == 0.9
+    assert long_context_plan["rollout_gpu_memory_utilization_ceiling"] == 0.9
+
+
+def test_auto_runtime_profile_preserves_explicit_existing_options() -> None:
+    config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": 128, "max_prompt_length": 1024, "max_response_length": 3072},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "nnodes": 1,
+                    "n_gpus_per_node": 1,
+                    "data_parallel_size": 1,
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "n": 1,
+                    "max_model_len": 6000,
+                    "max_num_seqs": 48,
+                    "gpu_memory_utilization": 0.7,
+                    "checkpoint_engine": {"backend": "host", "update_weights_bucket_megabytes": 256},
+                }
+            },
+            "distillation": {
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
+                "teacher_models": {
+                    "teacher_model": {
+                        "inference": {
+                            "data_parallel_size": 1,
+                            "tensor_model_parallel_size": 1,
+                            "pipeline_model_parallel_size": 1,
+                            "max_model_len": 6000,
+                            "max_num_seqs": 24,
+                            "max_num_batched_tokens": 3072,
+                            "gpu_memory_utilization": 0.3,
+                        }
+                    }
+                },
+                "streamopd_kv": {"trainer_placement": "teacher", "token_chunk_size": 512},
+            },
+        }
+    )
+    explicit = {
+        "actor_rollout_ref.rollout.gpu_memory_utilization",
+        "actor_rollout_ref.rollout.max_num_seqs",
+        "distillation.teacher_models.teacher_model.inference.max_num_batched_tokens",
+        "distillation.streamopd_kv.token_chunk_size",
+    }
+
+    _auto_streamopd_runtime_profile(config, explicit_paths=explicit)
+
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.7
+    assert config.actor_rollout_ref.rollout.max_num_seqs == 48
+    assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 3072
+    assert config.distillation.streamopd_kv.token_chunk_size == 512
+    assert config.actor_rollout_ref.rollout.max_model_len == 4097
+    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.25
+
+
+def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None:
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "use_v1": True,
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
+                "v1": {
+                    "trainer_mode": "streamopd_colocate",
+                    "streamopd_colocate": {"micro_batch_size": 1, "parameter_sync_step": 1},
+                    "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
+                },
+            },
+            "data": {"train_batch_size": 128, "max_prompt_length": 1024, "max_response_length": 3072},
+            "algorithm": {"filter_groups": None},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "tensor_model_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "n": 1,
+                    "nnodes": 1,
+                    "n_gpus_per_node": 2,
+                    "max_model_len": None,
+                    "max_num_seqs": 1024,
+                    "gpu_memory_utilization": 0.5,
+                    "checkpoint_engine": {"backend": "naive", "update_weights_bucket_megabytes": 2048},
+                    "engine_kwargs": {},
+                },
+                "actor": {
+                    "strategy": "fsdp",
+                    "ppo_epochs": 1,
+                    "loss_agg_mode": "token-mean",
+                    "use_torch_compile": False,
+                },
+            },
+            "distillation": {
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
+                "teacher_models": {
+                    "teacher_model": {
+                        "inference": {
+                            "tensor_model_parallel_size": 1,
+                            "data_parallel_size": 1,
+                            "pipeline_model_parallel_size": 1,
+                            "max_model_len": None,
+                            "max_num_seqs": 1024,
+                            "max_num_batched_tokens": 8192,
+                            "gpu_memory_utilization": 0.5,
+                        }
+                    }
+                },
+                "streamopd_kv": {
+                    "enabled": True,
+                    "runtime_profile": "auto",
+                    "trainer_placement": "teacher",
+                    "kv_handoff_dir": "/tmp/test-streamopd-auto",
+                },
+                "distillation_loss": {
+                    "loss_mode": "forward_kl_topk",
+                    "use_policy_gradient": False,
+                    "use_task_rewards": False,
+                },
+            },
+        }
+    )
+
+    prepare_streamopd_kv_config(config)
+
+    assert config.distillation.streamopd_kv.runtime_profile == "auto"
+    assert config.distillation.streamopd_kv.token_chunk_size == 384
+    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.25
+    assert config.actor_rollout_ref.rollout.max_num_seqs == 64
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.backend == "host"
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.9
+    assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 4096
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 1024
+    assert config.distillation.streamopd_kv.reverse_batch_size == 128
+
+
 def test_prepare_config_does_not_mutate_sync_baseline() -> None:
     config = OmegaConf.create(
         {
@@ -1156,14 +1535,19 @@ def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
         scheduler.teacher_enqueued(8)
 
 
-def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(tmp_path) -> None:
+def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from verl.trainer.ppo.v1.trainer_streamopd_colocate import (
         _checkpoint_weight_bytes,
         _minimum_device_total_bytes,
+        _plan_host_kv_handoff,
+        _plan_rollout_memory,
         _plan_shared_rollout_memory,
         _plan_teacher_admission,
         _planned_local_reverse_width,
         _rollout_kv_bytes_per_token,
+        _shared_vllm_utilization_limit,
         _streamopd_batch_sizes,
     )
 
@@ -1220,6 +1604,28 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
         )
 
     assert _minimum_device_total_bytes([{"total_bytes": 80 * 1024**3}, [{"total_bytes": 79 * 1024**3}]]) == 79 * 1024**3
+    shared_limit = _shared_vllm_utilization_limit(
+        [
+            {"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3},
+            {"free_bytes": 68 * 1024**3, "total_bytes": 80 * 1024**3},
+        ],
+        rank_offset=1,
+        world_size=1,
+        required_free_bytes=28 * 1024**3,
+    )
+    assert shared_limit == {
+        "utilization_limit": 0.5,
+        "free_gib": 68.0,
+        "total_gib": 80.0,
+        "reverse_reserve_gib": 28.0,
+    }
+    with pytest.raises(ValueError, match="insufficient memory"):
+        _shared_vllm_utilization_limit(
+            [{"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3}],
+            rank_offset=0,
+            world_size=1,
+            required_free_bytes=20 * 1024**3,
+        )
     rollout_plan = _plan_shared_rollout_memory(
         total_memory_bytes=80 * 1024**3,
         weight_bytes=4 * 1024**3,
@@ -1230,7 +1636,17 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
     )
     assert 0.18 <= rollout_plan["gpu_memory_utilization"] < 0.25
     assert rollout_plan["kv_gib"] == 4.0
-    with pytest.raises(ValueError, match="cannot hold model"):
+    smaller_gpu_plan = _plan_shared_rollout_memory(
+        total_memory_bytes=40 * 1024**3,
+        weight_bytes=4 * 1024**3,
+        kv_bytes_per_token=128 * 1024,
+        max_num_seqs=32,
+        max_model_len=1024,
+        configured_utilization=1.0,
+    )
+    assert smaller_gpu_plan["gpu_memory_utilization"] > rollout_plan["gpu_memory_utilization"]
+    assert smaller_gpu_plan["required_gib"] == rollout_plan["required_gib"]
+    with pytest.raises(ValueError, match="cannot hold"):
         _plan_shared_rollout_memory(
             total_memory_bytes=80 * 1024**3,
             weight_bytes=4 * 1024**3,
@@ -1238,6 +1654,76 @@ def test_streamopd_schedule_triggers_at_reverse_capacity_then_uses_microbatches(
             max_num_seqs=32,
             max_model_len=1024,
             configured_utilization=0.1,
+        )
+
+    inferred_4k = _plan_rollout_memory(
+        total_memory_bytes=80 * 1024**3,
+        weight_bytes=4063479808,
+        kv_bytes_per_token=112 * 1024,
+        requested_max_num_seqs=128,
+        max_model_len=4096,
+        utilization_limit=0.9,
+        max_num_seqs_explicit=False,
+        utilization_explicit=False,
+    )
+    assert inferred_4k["max_num_seqs"] == 128
+    assert inferred_4k["gpu_memory_utilization"] == 0.9
+
+    inferred_8k = _plan_rollout_memory(
+        total_memory_bytes=80 * 1024**3,
+        weight_bytes=4063479808,
+        kv_bytes_per_token=112 * 1024,
+        requested_max_num_seqs=128,
+        max_model_len=8192,
+        utilization_limit=0.9,
+        max_num_seqs_explicit=False,
+        utilization_explicit=False,
+    )
+    assert inferred_8k["max_num_seqs"] == 64
+    assert inferred_8k["gpu_memory_utilization"] == 0.9
+
+    memory_capped_8k = _plan_rollout_memory(
+        total_memory_bytes=80 * 1024**3,
+        weight_bytes=4063479808,
+        kv_bytes_per_token=112 * 1024,
+        requested_max_num_seqs=128,
+        max_model_len=8192,
+        utilization_limit=0.5,
+        max_num_seqs_explicit=False,
+        utilization_explicit=True,
+    )
+    assert memory_capped_8k["max_num_seqs"] == 32
+    assert memory_capped_8k["gpu_memory_utilization"] == 0.5
+
+    with pytest.raises(ValueError, match="explicitly requested"):
+        _plan_rollout_memory(
+            total_memory_bytes=80 * 1024**3,
+            weight_bytes=4063479808,
+            kv_bytes_per_token=112 * 1024,
+            requested_max_num_seqs=128,
+            max_model_len=8192,
+            utilization_limit=0.5,
+            max_num_seqs_explicit=True,
+            utilization_explicit=True,
+        )
+
+    monkeypatch.setattr(
+        "verl.trainer.ppo.v1.trainer_streamopd_colocate.shutil.disk_usage",
+        lambda path: SimpleNamespace(total=200 * 1024**3, used=0, free=200 * 1024**3),
+    )
+    host_plan = _plan_host_kv_handoff(
+        handoff_dir=str(tmp_path / "handoff"),
+        global_batch_size=128,
+        max_model_len=4096,
+        kv_bytes_per_token=112 * 1024,
+    )
+    assert host_plan["host_kv_required_gib"] == 56.0
+    with pytest.raises(ValueError, match="host KV backing"):
+        _plan_host_kv_handoff(
+            handoff_dir=str(tmp_path / "handoff"),
+            global_batch_size=512,
+            max_model_len=8192,
+            kv_bytes_per_token=112 * 1024,
         )
 
     model_dir = tmp_path / "model"
@@ -1275,6 +1761,57 @@ def test_teacher_and_training_admission_are_mutually_exclusive() -> None:
     scheduler.end_policy(11)
 
 
+def test_teacher_admission_waits_for_asynchronous_wake() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(12, teacher_available=False)
+    scheduler.teacher_enqueued(12)
+
+    assert scheduler.try_teacher_started(12) is False
+    assert scheduler.snapshot()["teacher_available"] is False
+    scheduler.teacher_wake_completed(12)
+    assert scheduler.try_teacher_started(12) is True
+    scheduler.teacher_finished(12)
+    scheduler.end_policy(12)
+
+
+@pytest.mark.asyncio
+async def test_vllm_level_two_sleep_reuses_weight_backing_for_sync() -> None:
+    from verl.workers.rollout.replica import RolloutMode
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def sleep(self, *, level: int) -> None:
+            self.calls.append(("sleep", level))
+
+        async def wake_up(self, *, tags: list[str]) -> None:
+            self.calls.append(("wake_up", tuple(tags)))
+
+        async def reset_prefix_cache(self, **kwargs) -> None:
+            self.calls.append(("reset_prefix_cache", kwargs))
+
+    server = vLLMHttpServer.__new__(vLLMHttpServer)
+    server.node_rank = 0
+    server.config = SimpleNamespace(free_cache_engine=True)
+    server.rollout_mode = RolloutMode.STANDALONE
+    server.engine = FakeEngine()
+    server._sleeping_tags = set()
+    server._sleep_level = 0
+
+    await server.sleep(level=2)
+    await server.release_kv_cache()
+    await server.resume_kv_cache()
+
+    assert server.engine.calls[0] == ("sleep", 2)
+    assert server.engine.calls[1] == ("wake_up", ("weights",))
+    assert server.engine.calls[2] == ("wake_up", ("kv_cache",))
+    assert server.engine.calls[3][0] == "reset_prefix_cache"
+    assert server._sleeping_tags == set()
+    assert server._sleep_level == 0
+
+
 def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(14)
@@ -1288,27 +1825,49 @@ def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
     scheduler.end_policy(14)
 
 
-def test_adaptive_shared_scheduler_uses_hysteresis_and_teacher_quanta() -> None:
+def test_adaptive_shared_scheduler_uses_ready_backlog_hysteresis() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(20, expected_trajectories=12, scheduler_policy="adaptive", train_launch_width=4)
     scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
     scheduler.teacher_enqueued(20)
     for _ in range(4):
         scheduler.teacher_trajectory_completed(20)
-    assert scheduler.try_teacher_started(20) is True
-    scheduler.teacher_finished(20)
-    for _ in range(4):
-        scheduler.teacher_trajectory_completed(20)
-    scheduler.teacher_enqueued(20)
+
+    # A genuinely ready cohort starts immediately; no second cohort gate.
     assert scheduler.try_teacher_started(20) is False
     assert scheduler.try_training_started(20, teacher_queue_threshold=0) is True
     scheduler.training_finished(20)
+
+    for _ in range(4):
+        scheduler.teacher_trajectory_completed(20)
     scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
-    # One Teacher chunk gets priority after every reverse unit.
+    # The completed-but-unlaunched cohort keeps ownership on Trainer.
+    assert scheduler.try_teacher_started(20) is False
+    assert scheduler.try_training_started(20, teacher_queue_threshold=0) is True
+    scheduler.training_finished(20)
+
+    # Once Trainer catches up, pending Teacher work gets the next turn.
     assert scheduler.try_teacher_started(20) is True
     scheduler.teacher_finished(20)
-    scheduler.training_waiting_cancelled(20)
     assert scheduler.snapshot()["forced_teacher_turns"] == 1
+    assert scheduler.snapshot()["max_training_burst"] == 2
+
+
+def test_adaptive_shared_scheduler_bounds_next_training_handoff() -> None:
+    scheduler = StreamOPDTaskScheduler()
+    scheduler.begin_policy(25, expected_trajectories=12, scheduler_policy="adaptive", train_launch_width=4)
+    for _ in range(8):
+        scheduler.teacher_trajectory_completed(25)
+    scheduler.training_waiting(25, teacher_queue_threshold=0, trajectory_count=4)
+    assert scheduler.try_training_started(25, teacher_queue_threshold=0) is True
+    scheduler.training_finished(25)
+    scheduler.teacher_enqueued(25)
+
+    # Reserve a short controller handoff window for the next ready cohort.
+    assert scheduler.try_teacher_started(25) is False
+    scheduler.last_training_finished_at -= scheduler.teacher_turn_grace_seconds
+    assert scheduler.try_teacher_started(25) is True
+    scheduler.teacher_finished(25)
 
 
 def test_adaptive_shared_scheduler_resumes_training_after_teacher_grace() -> None:
@@ -1570,6 +2129,11 @@ def test_posthoc_config_rejects_initial_streaming_ablation() -> None:
             posthoc_ablation=True,
             teacher_terminal_only_after_initial=True,
         )
+
+
+def test_streamopd_runtime_profile_rejects_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="runtime_profile"):
+        StreamOPDKVConfig(runtime_profile="guess")
 
 
 def test_dapo_adapter_wraps_plain_prompt_as_chat_messages(monkeypatch) -> None:

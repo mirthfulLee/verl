@@ -214,6 +214,8 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._sleeping_tags: set[str] = set()
+        self._sleep_level = 0
         self._warned_missing_spec_decode_stats = False
 
         # used for http server
@@ -1055,33 +1057,59 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
+        wake_tags = tags or self._get_wake_up_tags()
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
-            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+            await self.engine.wake_up(tags=wake_tags)
             await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            await self.engine.wake_up(tags=self._get_wake_up_tags())
+            await self.engine.wake_up(tags=wake_tags)
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
             # is configured (vLLM scheduler treats it as such).
             await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.STANDALONE:
-            logger.info("skip wake_up in standalone mode")
+            if not self._sleeping_tags:
+                logger.info("skip wake_up in standalone mode")
+                return
+            await self.engine.wake_up(tags=wake_tags)
+            if "kv_cache" in wake_tags:
+                await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+        self._sleeping_tags.difference_update(wake_tags)
+        if not self._sleeping_tags:
+            self._sleep_level = 0
 
-    async def sleep(self):
+    async def sleep(self, level: int | None = None):
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
+        if level is not None and level not in {1, 2}:
+            raise ValueError("vLLM sleep level must be 1 or 2")
+        if self._sleeping_tags:
+            if level is None or level == self._sleep_level:
+                return
+            raise RuntimeError("cannot change vLLM sleep level before wake_up")
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            await self._sleep_hybrid()
+            resolved_level = level or self._resolve_sleep_level()
+            if level is None:
+                await self._sleep_hybrid()
+            else:
+                await self.engine.sleep(level=resolved_level)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=1)
+            resolved_level = level or 1
+            await self.engine.sleep(level=resolved_level)
         elif self.rollout_mode == RolloutMode.STANDALONE:
-            logger.info("skip sleep in standalone mode")
+            if level is None:
+                logger.info("skip sleep in standalone mode")
+                return
+            resolved_level = level
+            await self.engine.sleep(level=resolved_level)
+        self._sleep_level = resolved_level
+        self._sleeping_tags = {"weights", "kv_cache"}
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -1101,19 +1129,28 @@ class vLLMHttpServer:
         # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
-        if self.rollout_mode == RolloutMode.COLOCATED:
+        if self.rollout_mode == RolloutMode.COLOCATED and not self._sleeping_tags:
             return
-        await self.engine.sleep(level=self._resolve_sleep_level())
-        await self.engine.wake_up(tags=["weights"])
+        if not self._sleeping_tags:
+            self._sleep_level = self._resolve_sleep_level()
+            await self.engine.sleep(level=self._sleep_level)
+            self._sleeping_tags = {"weights", "kv_cache"}
+        if "weights" in self._sleeping_tags:
+            await self.engine.wake_up(tags=["weights"])
+            self._sleeping_tags.remove("weights")
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
-        if self.rollout_mode == RolloutMode.COLOCATED:
+        if self.rollout_mode == RolloutMode.COLOCATED and "kv_cache" not in self._sleeping_tags:
             return
-        await self.engine.wake_up(tags=["kv_cache"])
-        await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+        if "kv_cache" in self._sleeping_tags:
+            await self.engine.wake_up(tags=["kv_cache"])
+            self._sleeping_tags.remove("kv_cache")
+            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+        if not self._sleeping_tags:
+            self._sleep_level = 0
 
     def _should_profile(self) -> bool:
         """Whether this replica drives the engine profiler."""
@@ -1513,11 +1550,14 @@ class vLLMReplica(RolloutReplica):
             else f"{server_address}:{server_port}"
         )
 
-    async def sleep(self):
+    async def sleep(self, level: int | None = None):
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
-        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        if level is None:
+            await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        else:
+            await asyncio.gather(*[server.sleep.remote(level=level) for server in self.servers])
 
     async def abort_all_requests(self) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.

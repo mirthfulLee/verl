@@ -227,6 +227,13 @@ class StreamOPDKVConfig(BaseConfig):
     """
 
     enabled: bool = False
+    # ``auto`` resolves execution-only knobs from batch, sequence length, GPU
+    # allocation, and placement. ``manual`` preserves every advanced override
+    # for ablations and sensitivity studies.
+    runtime_profile: str = "auto"
+    # Populated from Hydra CLI overrides before automatic planning. Existing
+    # verl options remain the public constraints; this field is diagnostic.
+    planner_explicit_options: list[str] = field(default_factory=list)
     token_chunk_size: int = 256
     teacher_initial_chunk_size: int = 256
     teacher_first_chunk_includes_prompt: bool = True
@@ -241,8 +248,8 @@ class StreamOPDKVConfig(BaseConfig):
     trainer_placement: str = "teacher"
     # ``teacher_then_train`` is the work-conserving scheduler baseline: keep
     # streaming Teacher scoring, but delay all reverse units until Teacher
-    # drain. ``adaptive`` launches at one planned reverse width on dedicated
-    # resources and uses hysteresis plus Teacher turns on shared resources.
+    # drain. ``adaptive`` launches a genuinely ready reverse cohort and uses
+    # completed-trajectory backlog hysteresis on shared resources.
     scheduler_policy: str = "adaptive"
     # Zero values are resolved into static caps before worker startup.
     reverse_chunk_size: int = 0
@@ -261,6 +268,12 @@ class StreamOPDKVConfig(BaseConfig):
     scheduler_timeout_seconds: float = 600.0
     scheduler_actor_name: str = ""
     max_pending_teacher_chunks: int = 128
+    # Sleep is automatic only when another role can reuse the same GPU pool.
+    # Disable for controlled lifecycle ablations.
+    enable_pool_sleep: bool = True
+    # Level-2 Rollout sleep is opt-in: fixed reverse slots are planned while
+    # Rollout is resident, so released memory does not yet increase throughput.
+    enable_rollout_sleep_level2: bool = False
     # Optional preflight caps. Zero lets the scheduler derive stable values
     # from vLLM's profiled KV blocks and the reverse training-unit width.
     teacher_prefill_max_active_trajectories: int = 0
@@ -286,6 +299,8 @@ class StreamOPDKVConfig(BaseConfig):
     validation_atol: float = 1e-4
 
     def __post_init__(self) -> None:
+        if self.runtime_profile not in {"auto", "manual"}:
+            raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
         for name in (
             "token_chunk_size",
             "teacher_initial_chunk_size",

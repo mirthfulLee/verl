@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import queue
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ except ImportError:
 
 from verl.utils.device import get_torch_device
 
+from .host_slot_pool import HostKVSlotPool
 from .snapshot_io import extract_vllm_nhd_token_range
 
 if TYPE_CHECKING:
@@ -116,6 +118,10 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._chunk_size = int(self._kv_transfer_config.get_from_extra_config("streamopd_kv_chunk_size", 256))
         if self._chunk_size < 1:
             raise ValueError("streamopd_kv_chunk_size must be positive")
+        self._host_slot_count = int(self._kv_transfer_config.get_from_extra_config("streamopd_host_slot_count", 0))
+        self._host_slot_tokens = int(self._kv_transfer_config.get_from_extra_config("streamopd_host_slot_tokens", 0))
+        if (self._host_slot_count < 1) != (self._host_slot_tokens < 1):
+            raise ValueError("shared Host KV slot count and token capacity must be configured together")
         self._scheduler_paths: dict[str, str] = {}
         self._scheduler_states: dict[str, _SchedulerSaveState] = {}
         self._pending: list[_PendingSave] = []
@@ -127,10 +133,14 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
         self._device = get_torch_device()
         self._copy_stream: Any = None
+        self._writer_threads = int(self._kv_transfer_config.get_from_extra_config("streamopd_writer_threads", 4))
         self._executor = ThreadPoolExecutor(
-            max_workers=int(self._kv_transfer_config.get_from_extra_config("streamopd_writer_threads", 4)),
+            max_workers=self._writer_threads,
             thread_name_prefix="streamopd-kv-save",
         )
+        self._host_pool: HostKVSlotPool | None = None
+        self._staging_buffers: list[torch.Tensor] = []
+        self._staging_available: queue.Queue[int] = queue.Queue()
         self._lock_fds: dict[str, int] = {}
         self._copy_events: dict[str, Any] = {}
         self._manifest_futures: dict[str, Future] = {}
@@ -170,6 +180,54 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         missing = [name for name in self._layer_names if name not in self._layer_groups]
         if missing:
             raise RuntimeError(f"KV cache group mapping is missing layers: {missing[:3]}")
+        if self._host_slot_count:
+            sample = extract_vllm_nhd_token_range(
+                self._kv_caches[self._layer_names[0]],
+                [0],
+                self._block_size,
+                0,
+                1,
+            )
+            _, kv_axis, num_kv_heads, head_dim = sample.shape
+            if kv_axis != 2:
+                raise RuntimeError(f"invalid vLLM shared Host KV sample shape: {tuple(sample.shape)}")
+            self._host_pool = HostKVSlotPool.create_or_open(
+                self._storage_path,
+                tp_rank=self._tp_rank,
+                slot_count=self._host_slot_count,
+                token_capacity=self._host_slot_tokens,
+                num_layers=len(self._layer_names),
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=self._block_size,
+                dtype=sample.dtype,
+            )
+            staging_elements = len(self._layer_names) * self._chunk_size * 2 * num_kv_heads * head_dim
+            for index in range(self._writer_threads):
+                self._staging_buffers.append(
+                    torch.empty(staging_elements, dtype=sample.dtype, device="cpu", pin_memory=True)
+                )
+                self._staging_available.put(index)
+
+    def _get_host_pool(self) -> HostKVSlotPool | None:
+        if not self._host_slot_count:
+            return None
+        if self._host_pool is None:
+            self._host_pool = HostKVSlotPool.open_existing(self._storage_path, tp_rank=self._tp_rank)
+        return self._host_pool
+
+    def _staging_layer(self, staging_index: int, layer_index: int) -> torch.Tensor:
+        pool = self._get_host_pool()
+        if pool is None:
+            raise RuntimeError("shared Host KV staging requested without a slot pool")
+        layer_elements = self._chunk_size * 2 * pool.num_kv_heads * pool.head_dim
+        offset = layer_index * layer_elements
+        return self._staging_buffers[staging_index][offset : offset + layer_elements].view(
+            self._chunk_size,
+            2,
+            pool.num_kv_heads,
+            pool.head_dim,
+        )
 
     def start_load_kv(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -193,6 +251,8 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, StreamOPDKVConnectorMetadata):
             return
         for req_id, base_path in metadata.new_request_paths.items():
+            if HostKVSlotPool.is_slot_path(base_path):
+                continue
             if req_id in self._lock_fds:
                 continue
             filename = self._manifest_path(base_path, self._tp_rank)
@@ -226,6 +286,46 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             os.close(lock_fd)
 
+    def _commit_host_chunk(
+        self,
+        pool: HostKVSlotPool,
+        slot: int,
+        start: int,
+        end: int,
+        staging_index: int,
+        event: Any,
+    ) -> None:
+        try:
+            event.synchronize()
+            chunk_tokens = end - start
+            for layer_index in range(pool.num_layers):
+                staging = self._staging_layer(staging_index, layer_index)[:chunk_tokens]
+                key, value = pool.layer(slot, layer_index)
+                key[start:end].copy_(staging[:, 0])
+                value[start:end].copy_(staging[:, 1])
+        finally:
+            self._staging_available.put(staging_index)
+
+    @staticmethod
+    def _seal_host_slot(
+        prior_futures: list[Future],
+        pool: HostKVSlotPool,
+        pending: _PendingSave,
+    ) -> None:
+        for future in prior_futures:
+            future.result()
+        pool.seal(
+            pending.base_path,
+            request_id=pending.req_id,
+            trajectory_id=pending.trajectory_id,
+            policy_version=pending.policy_version,
+            prompt_length=pending.prompt_length,
+            token_ids=pending.token_ids,
+            token_count=pending.end,
+            streamed_tokens_before_eos=pending.streamed_tokens_before_eos,
+            streamed_chunks_before_eos=pending.streamed_chunks_before_eos,
+        )
+
     def _write_done(self, key: str, future: Future) -> None:
         self._futures.pop(key, None)
         if key.endswith(":manifest"):
@@ -235,6 +335,9 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
             logger.error("StreamOPD KV write failed for %s: %r", key, exception)
 
     def _submit_save(self, pending: _PendingSave) -> None:
+        if HostKVSlotPool.is_slot_path(pending.base_path):
+            self._submit_host_slot_save(pending)
+            return
         # Scheduler and worker connectors are separate objects. Ownership is
         # claimed again on the worker when the save metadata arrives.
         if pending.end < pending.start:
@@ -326,6 +429,74 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         manifest_future.add_done_callback(partial(self._write_done, manifest_key))
         self._copy_events[pending.req_id] = copied
 
+    def _submit_host_slot_save(self, pending: _PendingSave) -> None:
+        pool = self._get_host_pool()
+        if pool is None:
+            raise RuntimeError("shared Host KV slot descriptor received without a configured pool")
+        if not 0 <= pending.start <= pending.end <= pool.token_capacity:
+            raise RuntimeError("StreamOPD KV chunk is outside its shared Host slot")
+        chunk_tokens = pending.end - pending.start
+        if chunk_tokens > self._chunk_size:
+            raise RuntimeError("StreamOPD KV chunk exceeds the fixed Host staging capacity")
+        slot = pool.validate_writer(
+            pending.base_path,
+            request_id=pending.req_id,
+            trajectory_id=pending.trajectory_id,
+            policy_version=pending.policy_version,
+        )
+        request_futures = self._request_futures.setdefault(pending.req_id, [])
+        copied = None
+        if chunk_tokens:
+            staging_index = self._staging_available.get()
+            copy_stream = self._get_copy_stream()
+            ready = self._device.Event()
+            ready.record()
+            copy_stream.wait_event(ready)
+            try:
+                with self._device.stream(copy_stream):
+                    for layer_index, layer_name in enumerate(self._layer_names):
+                        group_index = self._layer_groups[layer_name]
+                        extracted = extract_vllm_nhd_token_range(
+                            self._kv_caches[layer_name],
+                            pending.block_ids_by_group[group_index],
+                            self._block_size,
+                            pending.start,
+                            pending.end,
+                        )
+                        staging = self._staging_layer(staging_index, layer_index)
+                        staging[:chunk_tokens].copy_(extracted, non_blocking=True)
+                copied = self._device.Event()
+                copied.record(copy_stream)
+            except BaseException:
+                self._staging_available.put(staging_index)
+                raise
+            chunk_future = self._executor.submit(
+                self._commit_host_chunk,
+                pool,
+                slot,
+                pending.start,
+                pending.end,
+                staging_index,
+                copied,
+            )
+            future_key = f"{pending.req_id}:{pending.chunk_index}"
+            self._futures[future_key] = chunk_future
+            request_futures.append(chunk_future)
+            chunk_future.add_done_callback(partial(self._write_done, future_key))
+
+        if not pending.terminal:
+            return
+        if pending.token_ids is None or pending.token_ids.numel() != pending.end:
+            raise RuntimeError("terminal StreamOPD KV chunk must carry the complete token identity")
+        seal_future = self._executor.submit(self._seal_host_slot, list(request_futures), pool, pending)
+        manifest_key = f"{pending.req_id}:manifest"
+        self._futures[manifest_key] = seal_future
+        self._manifest_futures[pending.req_id] = seal_future
+        request_futures.append(seal_future)
+        seal_future.add_done_callback(partial(self._write_done, manifest_key))
+        if copied is not None:
+            self._copy_events[pending.req_id] = copied
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         if self.has_connector_metadata():
             metadata = self._get_connector_metadata()
@@ -337,12 +508,9 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         done: set[str] = set()
         manifest_futures = getattr(self, "_manifest_futures", {})
         for req_id in list(self._finished_requests):
-            # The D2H event only means that host tensors are ready; the
-            # scheduler must keep the request's KV pages pinned until the
-            # terminal manifest is durable.  Otherwise vLLM can free and reuse
-            # those pages while a background safetensors write is still in
-            # flight, and a later finish callback may observe a missing
-            # request.
+            # The D2H event only means that staging is ready. Keep vLLM pages
+            # owned until the terminal control record is sealed after every
+            # shared-slot commit (or the legacy manifest write) completes.
             manifest_future = manifest_futures.get(req_id)
             # The final cohort request has no later model step on which to poll
             # the transfer.  Waiting on the manifest future here is bounded by
@@ -360,9 +528,8 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
                 if req_id not in newly_finished:
                     continue
                 # There may be no model step after the last request in a
-                # cohort.  Complete only the terminal seal here so vLLM can
-                # reclaim its pages immediately; all preceding range copies
-                # and chunk writes were already launched during generation.
+                # cohort. Complete the terminal seal here so vLLM can reclaim
+                # its pages immediately.
                 manifest_future.result()
             if manifest_future is not None:
                 manifest_future.result()
@@ -497,8 +664,17 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
             params = (extra_args or {}).get("kv_transfer_params") or {}
             if not params.get("streamopd_kv", False):
                 continue
-            safe_req_id = request.req_id.replace(os.sep, "_")
-            base_path = os.path.join(self._storage_path, safe_req_id)
+            pool = self._get_host_pool()
+            if pool is None:
+                safe_req_id = request.req_id.replace(os.sep, "_")
+                base_path = os.path.join(self._storage_path, safe_req_id)
+            else:
+                base_path = pool.acquire(
+                    request_id=request.req_id,
+                    trajectory_id=str(params["trajectory_id"]),
+                    policy_version=int(params["policy_version"]),
+                    prompt_length=int(params["prompt_length"]),
+                )
             self._scheduler_paths[request.req_id] = base_path
             self._scheduler_states[request.req_id] = _SchedulerSaveState(
                 req_id=request.req_id,
@@ -576,3 +752,6 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         for future in list(self._futures.values()):
             future.result()
         self._executor.shutdown(wait=True)
+        if self._host_pool is not None:
+            self._host_pool.close()
+            self._host_pool = None

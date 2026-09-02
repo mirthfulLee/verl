@@ -4,6 +4,11 @@ The end-to-end comparison uses this repository's V1 Native OPD as the sync basel
 placements: Trainer can share Teacher GPUs, share Rollout GPUs, span disjoint Teacher+Rollout subsets (`union`), or
 use dedicated GPUs. Teacher and Rollout remain separate resident model processes in every placement.
 
+The benchmark harness intentionally sets `distillation.streamopd_kv.runtime_profile=manual` so historical ablations
+remain exactly reproducible. This is not the normal user interface. The production example defaults to `auto` and
+reuses verl's existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count
+configuration; its only optional default-path topology setting is `trainer_placement`.
+
 ## Environment
 
 The measured environment uses Python 3.12.13, PyTorch 2.9.1+cu128, vLLM 0.15.1, transformers 4.57.6, and four
@@ -29,6 +34,53 @@ reverse width/chunk and Teacher session budget default to startup preflight plan
 `BASELINE_AGENT_LOOP_WORKERS`/`STREAMOPD_AGENT_LOOP_WORKERS` overrides so StreamOPD tuning cannot silently change the
 baseline denominator.
 
+The normal auto profile does not use a fixed Rollout utilization. It jointly solves `gpu_memory_utilization` and
+`max_num_seqs` from weights, KV bytes/token, maximum length, physical GPU memory, and any user-supplied constraint.
+The benchmark wrapper remains `runtime_profile=manual` because it intentionally pins these values for matched
+ablations; do not interpret its historical `0.65` value as the StreamOPD default.
+
+Reverse preflight also reserves rank-local gradients and optimizer tensors that are materialized by the first
+backward/update. This calculation and the selected slot batch/chunk are logged and frozen before the first policy
+version; the benchmark does not query the allocator or reshape kernels inside the policy loop.
+
+### Constraint-planner and sleep validation
+
+On A100-80GB with a 2-GPU shared Teacher/Trainer pool and one dedicated Rollout GPU, B128 auto planning selected
+Rollout128/0.90 for total length 4096 and Rollout64/0.90 for 8192. The 4096 stable step was 114.89s, versus 121.15s
+for the earlier manually capped Rollout0.50 run (5.16% lower). The 8192 one-step run was 350.74s, versus 381.08s for
+the safe manual Rollout32/reverse-B2 configuration (7.96% lower, or 6.36% lower per generated token). The 8192 run
+retained reverse B4/chunk1024; conditional Teacher cache trimming released up to 9.20 GiB and avoided the previous
+early-reverse OOM. Teacher level-1 sleep cost 0.41-0.43s, while the next-step wake exposed only 0.02-0.04s alongside
+Rollout startup.
+
+A separate two-step Rollout/Trainer-shared B16/1K ablation measured 15.58s with level-2 sleep and 15.47s without it.
+Level-2 released roughly 12.5 GiB more physical GPU memory but did not enlarge the already frozen reverse plan, so it
+remains an opt-in memory-pressure control rather than the auto throughput default.
+
+The shared-Rollout planner is also evaluated after fixed reverse slots are allocated. In a two-GPU `union` B128/4K
+run, the unconstrained 0.90/128 Rollout plan could not fit even the minimum reverse workspace. Joint preflight derived
+a 0.60 ceiling, selected 0.50/64 from model KV geometry, and completed without OOM. This is a startup calculation; no
+allocator query or kernel reshaping occurs in a policy step.
+
+### Shared Host KV slot transport
+
+The default connector uses one fixed shared mmap per TP shard instead of writing a safetensors file for every committed
+chunk and a second file at EOS. A fixed pinned staging ring performs rollout D2H; Trainer reads token-major K/V views
+directly from the shared rows. On A100-80GB, Qwen3-1.7B/4B, B32/2K, B4/C512, and the same deterministic requests, the
+three-step comparison is:
+
+| Transport | Stable step | Actor update | Host load/unit | H2D/unit |
+| --- | ---: | ---: | ---: | ---: |
+| chunk safetensors | 26.48 s | 10.36 s | 0.625 s | 0.032 s |
+| shared Host slots | 25.28 s | 9.06 s | 0.028 s | 0.095 s |
+
+Shared slots reduce Host loading by 95.4%, improve actor update by 14.3%, and improve the full step by 1.047x. The mmap
+source is pageable, so H2D grows by about 0.063 seconds per unit; this is much smaller than the removed deserialization
+and tensor assembly. Rollout remains effectively unchanged at 10.23 versus 10.20 seconds. Across all three policy
+versions the pool remains four fixed files (7.00 GiB logical data backing, 3.25 KiB control backing, descriptor, and
+lock), and ends with all 32 slots `FREE`. A final-policy smoke released a 1.75 GiB pool in 1.07ms and left its handoff
+directory empty.
+
 `verl-sync-opd` uses a 2-GPU student pool plus a separate 2-GPU teacher pool. `verl-colocate-opd` is a sync-baseline
 placement ablation configured by `distillation.colocate_teacher_with_student`; it does not enable any StreamOPD code.
 
@@ -47,9 +99,10 @@ deterministic.
 | 1024 | B8 / C256 (controlled cap) | 19.82 s | 19.17 s | 1.034x |
 | 2048 | B4 / C512 (controlled cap) | 32.51 s | 26.94 s | 1.207x |
 
-For the 2K case, adaptive starts at 8/32 completed trajectories and uses one-unit reverse quanta with Teacher turns
-between them. It reduces the stable step by 17.13%. The 1K case is short enough that hysteresis mostly converges to
-drain-first behavior, but it no longer regresses as the eager-switch prototype did.
+These measurements predate the backlog-adaptive update: the 2K scheduler starts at 8/32 completed trajectories and
+uses one-unit reverse quanta with Teacher turns between them. It reduces the stable step by 17.13%. The 1K case is
+short enough that hysteresis mostly converges to drain-first behavior, but it no longer regresses as the eager-switch
+prototype did.
 
 Automatic reverse planning was also checked on B32/1K without batch/chunk caps. The initial memory-first rule chose
 B32/C256: 7.0 GiB fixed backing, 10.58-second actor update, and a 58.32-second first step. Joint chunk-first planning
@@ -72,6 +125,35 @@ In `union`, Trainer needs both the Teacher and Rollout subsets. An interleaving 
 drain-first because no post-EOS compute can overlap; the scheduler now derives this from the resource topology and
 records `streamopd/scheduler_topology_fallback=1` while executing the drain-first policy. On Rollout-shared GPUs,
 preflight reserves full non-preemptible KV plus checkpoint buffers and caps the B32/2K reverse plan at B4/C1024.
+
+### Backlog-adaptive update
+
+The current scheduler starts from one genuinely ready reverse width and retains Trainer ownership while at least one
+more Teacher-complete width remains. If the controller has not registered that next unit within a bounded handoff
+window, Teacher resumes, so an inaccurate readiness prediction cannot leave the shared pool idle. The decision uses
+queue progress rather than model names, GPU types, or a user-tuned reverse quantum.
+
+On the same one-GPU Teacher/Trainer plus one-GPU Rollout topology, Qwen3-1.7B/4B, BF16, and deterministic ragged
+requests:
+
+| Batch / cap | Comparison | Step | Policy span | Pool idle | First train | Teacher turns |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| B32 / 2048 | previous adaptive | 26.94 s | 20.78 s | 7.39 s | 4.20 s | 1.5 |
+| B32 / 2048 | backlog-adaptive | 26.48 s | 20.73 s | 7.02 s | 4.20 s | 1.5 |
+| B128 / 4096 | drain-first | 174.92 s | 164.48 s | 52.15 s | 77.19 s | 0 |
+| B128 / 4096 | backlog-adaptive | 169.93 s | 159.34 s | 48.92 s | 14.63 s | 7 |
+
+The B32 case naturally makes eight trajectories ready together, so removing the old two-width gate changes little:
+the stable step improves by 1.76% and policy span by 0.25%. At B128, the matched Rollout terminal times are 59.63 and
+59.78 seconds; backlog-adaptive improves the step by 2.93% and the scheduler span by 3.23%. Its 64 reverse units form
+bursts of up to 12 units rather than forcing a Teacher turn after every unit. The remaining limit is resource
+allocation rather than admission: the one-GPU Trainer preflight selects B2/C1024, and its 81.93 seconds of reverse
+compute exceeds the 59.78-second Rollout path.
+
+With the same two physical GPUs assigned as `union`, startup planning selects Rollout64/0.50 and global reverse width
+4 (B2 per rank). The stable step is 148.28 seconds: Rollout terminal grows to 74.66 seconds, but reverse busy falls to
+50.70 seconds. This is 1.146x faster than the 169.93-second Teacher-shared placement. It also confirms the topology
+rule: once Trainer spans both pools, drain-first is preferable because no Teacher or Rollout compute can overlap it.
 
 ## Current 4K result
 

@@ -266,9 +266,12 @@ class RolloutReplica(ABC):
         """Wake up each rollout server."""
         await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
-    async def sleep(self):
+    async def sleep(self, level: int | None = None):
         """Sleep each rollout server."""
-        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        if level is None:
+            await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        else:
+            await asyncio.gather(*[server.sleep.remote(level=level) for server in self.servers])
 
     async def abort_all_requests(self):
         """Partial rollout: abort and save all unfinished requests in each rollout server."""

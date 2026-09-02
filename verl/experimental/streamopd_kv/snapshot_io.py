@@ -12,6 +12,7 @@ import fcntl
 import glob
 import json
 import os
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -19,7 +20,11 @@ from dataclasses import dataclass
 import torch
 from safetensors import safe_open
 
+from .host_slot_pool import HostKVSlotPool
 from .protocol import KVLayout, SealedKVSnapshot, TrajectoryKey
+
+_HOST_SLOT_POOLS: dict[str, HostKVSlotPool] = {}
+_HOST_SLOT_POOLS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,73 @@ class HostSlotKVSnapshot:
     handoff_seconds: float
     streamed_tokens_before_eos: int
     streamed_chunks_before_eos: int
+
+
+def _open_host_slot_pool(slot_path: str) -> HostKVSlotPool:
+    root, _, _ = HostKVSlotPool.parse_slot_path(slot_path)
+    with _HOST_SLOT_POOLS_LOCK:
+        pool = _HOST_SLOT_POOLS.get(root)
+        if pool is None:
+            pool = HostKVSlotPool.open_for_slot(slot_path)
+            _HOST_SLOT_POOLS[root] = pool
+        return pool
+
+
+def _load_host_slot_snapshot(
+    base_path: str,
+    *,
+    key: TrajectoryKey,
+    tp_rank: int,
+    expected_tp_size: int,
+    expected_token_ids: Sequence[int],
+    expected_prompt_length: int,
+    started: float,
+) -> HostSlotKVSnapshot:
+    root, _, _ = HostKVSlotPool.parse_slot_path(base_path)
+    if expected_tp_size != 1 or not root.endswith(f".tp{tp_rank}"):
+        raise RuntimeError("shared Host KV slot TP layout mismatch")
+    pool = _open_host_slot_pool(base_path)
+    metadata = pool.metadata(
+        base_path,
+        trajectory_id=key.trajectory_id,
+        policy_version=key.policy_version,
+        prompt_length=expected_prompt_length,
+        token_ids=expected_token_ids,
+    )
+    token_ids = tuple(int(token) for token in expected_token_ids)
+    if len(token_ids) != metadata["token_count"]:
+        raise RuntimeError("shared Host KV token identity length does not match the training trajectory")
+    slot = metadata["slot"]
+    layers = []
+    for layer_index in range(pool.num_layers):
+        key_view, value_view = pool.layer(slot, layer_index)
+        layers.append(
+            HostSlotLayerKV(
+                key_view[: metadata["token_count"]],
+                value_view[: metadata["token_count"]],
+            )
+        )
+    layout = KVLayout(
+        num_layers=pool.num_layers,
+        num_kv_heads=pool.num_kv_heads,
+        head_dim=pool.head_dim,
+        dtype=pool.dtype_name,
+        page_size=pool.page_size,
+        tp_size=expected_tp_size,
+        tp_rank=tp_rank,
+        axis_order="token_kv_head_dim",
+        rope_convention="post_rope_key",
+    )
+    return HostSlotKVSnapshot(
+        key=key,
+        token_ids=token_ids,
+        prompt_length=metadata["prompt_length"],
+        layout=layout,
+        layers=tuple(layers),
+        handoff_seconds=time.perf_counter() - started,
+        streamed_tokens_before_eos=metadata["streamed_tokens_before_eos"],
+        streamed_chunks_before_eos=metadata["streamed_chunks_before_eos"],
+    )
 
 
 def _pin_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
@@ -233,6 +305,16 @@ def load_vllm_slot_snapshot(
     """Load streamed vLLM KV directly in token-major fixed-slot staging layout."""
 
     started = time.perf_counter()
+    if HostKVSlotPool.is_slot_path(base_path):
+        return _load_host_slot_snapshot(
+            base_path,
+            key=key,
+            tp_rank=tp_rank,
+            expected_tp_size=expected_tp_size,
+            expected_token_ids=expected_token_ids,
+            expected_prompt_length=expected_prompt_length,
+            started=started,
+        )
     manifest = f"{base_path}.tp{tp_rank}.manifest.safetensors"
     if not os.path.exists(manifest + ".lock"):
         raise RuntimeError("fixed reverse slots require the streamed v2 KV snapshot format")
@@ -345,6 +427,36 @@ def load_vllm_snapshot(
     """
 
     started = time.perf_counter()
+    if HostKVSlotPool.is_slot_path(base_path):
+        if expected_token_ids is None or expected_prompt_length is None:
+            raise ValueError("shared Host KV snapshots require expected token ids and prompt length")
+        host = _load_host_slot_snapshot(
+            base_path,
+            key=key,
+            tp_rank=tp_rank,
+            expected_tp_size=expected_tp_size,
+            expected_token_ids=expected_token_ids,
+            expected_prompt_length=expected_prompt_length,
+            started=started,
+        )
+        layers = tuple(
+            (
+                layer.key.transpose(0, 1).unsqueeze(0),
+                layer.value.transpose(0, 1).unsqueeze(0),
+            )
+            for layer in host.layers
+        )
+        return SealedKVSnapshot(
+            key=host.key,
+            token_ids=host.token_ids,
+            prompt_length=host.prompt_length,
+            layout=host.layout,
+            layers=layers,
+            source="vllm-host-slot-v1",
+            handoff_seconds=host.handoff_seconds,
+            streamed_tokens_before_eos=host.streamed_tokens_before_eos,
+            streamed_chunks_before_eos=host.streamed_chunks_before_eos,
+        )
     manifest_lock = f"{base_path}.tp{tp_rank}.manifest.safetensors.lock"
     if os.path.exists(manifest_lock):
         return _load_streamed_vllm_snapshot(
@@ -460,6 +572,9 @@ def move_vllm_snapshot(
 
 
 def cleanup_vllm_snapshot(base_path: str, tp_size: int) -> None:
+    if HostKVSlotPool.is_slot_path(base_path):
+        _open_host_slot_pool(base_path).release(base_path)
+        return
     for rank in range(tp_size):
         filename = f"{base_path}.tp{rank}.safetensors"
         streamed = glob.glob(f"{base_path}.tp{rank}.chunk*.safetensors")

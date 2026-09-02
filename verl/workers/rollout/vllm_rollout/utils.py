@@ -303,11 +303,14 @@ class vLLMColocateWorkerExtension:
         """Return current and peak allocator bytes for this vLLM worker."""
 
         device_module = get_torch_device()
+        free_bytes, total_bytes = device_module.mem_get_info(self.device)
         return {
             "allocated_bytes": int(device_module.memory_allocated(self.device)),
             "reserved_bytes": int(device_module.memory_reserved(self.device)),
             "max_allocated_bytes": int(device_module.max_memory_allocated(self.device)),
             "max_reserved_bytes": int(device_module.max_memory_reserved(self.device)),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
         }
 
     def get_kv_cache_capacity(self) -> dict[str, int]:
@@ -321,6 +324,20 @@ class vLLMColocateWorkerExtension:
             "num_gpu_blocks": num_blocks,
             "block_size": block_size,
             "capacity_tokens": num_blocks * block_size,
+        }
+
+    def trim_device_memory(self, minimum_free_bytes: int = 0) -> dict[str, int]:
+        """Release inactive allocator cache at a scheduler-owned role switch."""
+
+        device_module = get_torch_device()
+        free_before, _ = device_module.mem_get_info(self.device)
+        if int(free_before) < int(minimum_free_bytes):
+            device_module.empty_cache()
+        free_after, _ = device_module.mem_get_info(self.device)
+        return {
+            "freed_bytes": max(0, int(free_after) - int(free_before)),
+            "free_before_bytes": int(free_before),
+            "free_after_bytes": int(free_after),
         }
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):

@@ -366,6 +366,7 @@ class PPOTrainer(ABC):
                         teacher_resource_pool,
                         split_size=[teacher_world_size, remaining],
                     )[0]
+            self._prepare_teacher_runtime()
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
@@ -406,6 +407,11 @@ class PPOTrainer(ABC):
             worker_group=None if dedicated_streamopd_rollout else self.actor_rollout_wg,
             rollout_resource_pool=None if dedicated_streamopd_rollout else actor_rollout_resource_pool,
         )
+
+    def _prepare_teacher_runtime(self) -> None:
+        """Hook for placement-aware trainers to resolve Teacher server limits."""
+
+        return
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""

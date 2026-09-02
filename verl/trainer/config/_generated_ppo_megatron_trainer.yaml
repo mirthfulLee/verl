@@ -917,6 +917,8 @@ distillation:
   streamopd_kv:
     _target_: verl.workers.config.StreamOPDKVConfig
     enabled: false
+    runtime_profile: auto
+    planner_explicit_options: []
     token_chunk_size: 256
     teacher_initial_chunk_size: 256
     teacher_first_chunk_includes_prompt: true
@@ -938,6 +940,8 @@ distillation:
     scheduler_timeout_seconds: 600.0
     scheduler_actor_name: ''
     max_pending_teacher_chunks: 128
+    enable_pool_sleep: true
+    enable_rollout_sleep_level2: false
     teacher_prefill_max_active_trajectories: 0
     teacher_prefill_max_active_kv_tokens: 0
     teacher_prefill_kv_page_size: 64

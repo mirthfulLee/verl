@@ -29,7 +29,7 @@ import ray
 from cachetools import LRUCache
 from omegaconf import DictConfig
 
-from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup, split_resource_pool
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
@@ -646,8 +646,17 @@ class LLMServerManager:
                 ]
             )
         elif self.colocate_without_worker_group:
+            replica_pools = split_resource_pool(self.rollout_resource_pool, split_size=rollout_world_size)
+            if len(replica_pools) != len(self.rollout_replicas):
+                raise RuntimeError(
+                    "colocated Rollout pool did not split into the planned replica count: "
+                    f"pools={len(replica_pools)}, replicas={len(self.rollout_replicas)}"
+                )
             await asyncio.gather(
-                *[server.init_colocated(self.rollout_resource_pool) for server in self.rollout_replicas]
+                *[
+                    server.init_colocated(resource_pool)
+                    for server, resource_pool in zip(self.rollout_replicas, replica_pools, strict=True)
+                ]
             )
         else:
             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
@@ -726,10 +735,13 @@ class LLMServerManager:
         worker_stats = [stats for response in responses for stats in (response or [])]
         if not worker_stats:
             raise RuntimeError("Rollout vLLM workers returned no device memory statistics")
-        return {
+        result = {
             key: max(int(stats[key]) for stats in worker_stats)
             for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
         }
+        result["free_bytes"] = min(int(stats["free_bytes"]) for stats in worker_stats)
+        result["total_bytes"] = min(int(stats["total_bytes"]) for stats in worker_stats)
+        return result
 
     @auto_await
     async def start_profile(self, **kwargs):

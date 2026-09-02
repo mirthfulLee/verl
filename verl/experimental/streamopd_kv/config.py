@@ -8,7 +8,194 @@
 
 from __future__ import annotations
 
+import os
+
 from omegaconf import DictConfig, OmegaConf, open_dict
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+_SHARED_TEACHER_MEMORY_FRACTION = 0.25
+_MAX_DEDICATED_VLLM_MEMORY_FRACTION = 0.90
+
+
+def _hydra_task_override_paths() -> set[str]:
+    """Return exact config paths supplied on the Hydra command line."""
+
+    try:
+        from hydra.core.hydra_config import HydraConfig
+
+        if not HydraConfig.initialized():
+            return set()
+        overrides = HydraConfig.get().overrides.task
+    except (AttributeError, ImportError, ValueError):
+        return set()
+    return {item.split("=", 1)[0].lstrip("+~") for item in overrides if "=" in item}
+
+
+def _is_explicit(path: str, explicit_paths: set[str]) -> bool:
+    return any(path == candidate or path.startswith(f"{candidate}.") for candidate in explicit_paths)
+
+
+def _set_derived(target, key: str, value, path: str, explicit_paths: set[str]) -> None:
+    if not _is_explicit(path, explicit_paths):
+        target[key] = value
+
+
+def _auto_streamopd_runtime_profile(
+    config: DictConfig,
+    *,
+    explicit_paths: set[str] | None = None,
+) -> dict[str, float | int | str]:
+    """Resolve execution-only knobs from the user-visible OPD configuration."""
+
+    explicit_paths = explicit_paths or set()
+    stream_config = config.distillation.streamopd_kv
+    rollout = config.actor_rollout_ref.rollout
+    teacher = next(iter(config.distillation.teacher_models.values())).inference
+    placement = str(stream_config.get("trainer_placement", "teacher"))
+    if placement not in {"teacher", "rollout", "union", "dedicated"}:
+        raise ValueError(f"unsupported StreamOPD trainer placement: {placement}")
+
+    global_batch = int(config.data.train_batch_size)
+    prompt_tokens = int(config.data.max_prompt_length)
+    response_tokens = int(config.data.max_response_length)
+    trajectory_tokens = prompt_tokens + response_tokens
+    if min(global_batch, prompt_tokens, response_tokens) < 1:
+        raise ValueError("automatic StreamOPD runtime planning requires positive batch and sequence lengths")
+
+    page_size = 64
+    response_chunk = min(1024, max(256, _ceil_div(_ceil_div(response_tokens, 8), page_size) * page_size))
+    teacher_max_batched_tokens = min(8192, max(2048, _ceil_div(trajectory_tokens, 256) * 256))
+
+    _set_derived(
+        rollout,
+        "max_model_len",
+        trajectory_tokens + 1,
+        "actor_rollout_ref.rollout.max_model_len",
+        explicit_paths,
+    )
+    rollout_world_size = int(rollout.n_gpus_per_node) * int(rollout.nnodes)
+    rollout_replica_size = (
+        int(rollout.tensor_model_parallel_size)
+        * int(rollout.data_parallel_size)
+        * int(rollout.pipeline_model_parallel_size)
+    )
+    rollout_replicas = max(1, rollout_world_size // rollout_replica_size)
+    _set_derived(
+        rollout,
+        "max_num_seqs",
+        _ceil_div(global_batch, rollout_replicas),
+        "actor_rollout_ref.rollout.max_num_seqs",
+        explicit_paths,
+    )
+    # This is only a ceiling. The controller derives the minimum sufficient
+    # fraction and, if necessary, a smaller stable concurrency from physical
+    # memory, model weights, and the non-preemptible KV footprint.
+    _set_derived(
+        rollout,
+        "gpu_memory_utilization",
+        _MAX_DEDICATED_VLLM_MEMORY_FRACTION,
+        "actor_rollout_ref.rollout.gpu_memory_utilization",
+        explicit_paths,
+    )
+    _set_derived(
+        rollout.checkpoint_engine,
+        "backend",
+        "host",
+        "actor_rollout_ref.rollout.checkpoint_engine.backend",
+        explicit_paths,
+    )
+    _set_derived(
+        rollout.checkpoint_engine,
+        "update_weights_bucket_megabytes",
+        128 if placement in {"rollout", "union"} else 512,
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
+        explicit_paths,
+    )
+
+    _set_derived(
+        teacher,
+        "max_model_len",
+        trajectory_tokens + 1,
+        "distillation.teacher_models.teacher_model.inference.max_model_len",
+        explicit_paths,
+    )
+    _set_derived(
+        teacher,
+        "max_num_batched_tokens",
+        teacher_max_batched_tokens,
+        "distillation.teacher_models.teacher_model.inference.max_num_batched_tokens",
+        explicit_paths,
+    )
+    teacher_world_size = int(config.distillation.n_gpus_per_node) * int(config.distillation.nnodes)
+    teacher_replica_size = (
+        int(teacher.get("tensor_model_parallel_size", 1))
+        * int(teacher.get("data_parallel_size", 1))
+        * int(teacher.get("pipeline_model_parallel_size", 1))
+    )
+    teacher_replicas = max(1, teacher_world_size // teacher_replica_size)
+    _set_derived(
+        teacher,
+        "max_num_seqs",
+        _ceil_div(global_batch, teacher_replicas),
+        "distillation.teacher_models.teacher_model.inference.max_num_seqs",
+        explicit_paths,
+    )
+    # Shared Teacher gets one conventional quarter of each GPU. Reverse
+    # preflight consumes the measured remainder; dedicated Teacher uses verl's
+    # standard half-GPU vLLM envelope.
+    _set_derived(
+        teacher,
+        "gpu_memory_utilization",
+        (_SHARED_TEACHER_MEMORY_FRACTION if placement in {"teacher", "union"} else _MAX_DEDICATED_VLLM_MEMORY_FRACTION),
+        "distillation.teacher_models.teacher_model.inference.gpu_memory_utilization",
+        explicit_paths,
+    )
+
+    derived_stream_values = {
+        "token_chunk_size": response_chunk,
+        "teacher_initial_chunk_size": response_chunk,
+        "reverse_chunk_size": 0,
+        "reverse_chunk_min_size": 0,
+        "reverse_page_size": page_size,
+        "reverse_batch_size": 0,
+        "reverse_batch_max_tokens": 0,
+        "reverse_fixed_slots": True,
+        "reverse_slot_max_tokens": 0,
+        "reverse_slot_reserve_gib": 4.0,
+        "micro_batch_size": min(32, global_batch),
+        "teacher_priority_threshold": 0,
+        "teacher_prefill_max_active_trajectories": 0,
+        "teacher_prefill_max_active_kv_tokens": 0,
+        "teacher_prefill_kv_page_size": page_size,
+        "kv_prefetch_depth": 1,
+        "kv_prefetch_workers": 4,
+        "kv_prefetch_pin_memory": True,
+        "release_stage1_kv_after_copy": True,
+        "kv_handoff_dir": f"/dev/shm/verl-streamopd-kv-{os.getpid()}",
+    }
+    for key, value in derived_stream_values.items():
+        _set_derived(
+            stream_config,
+            key,
+            value,
+            f"distillation.streamopd_kv.{key}",
+            explicit_paths,
+        )
+
+    return {
+        "profile": "auto",
+        "trajectory_tokens": trajectory_tokens,
+        "token_chunk_size": response_chunk,
+        "teacher_max_batched_tokens": teacher_max_batched_tokens,
+        "teacher_gpu_memory_utilization": float(teacher.gpu_memory_utilization),
+        "teacher_max_num_seqs": int(teacher.max_num_seqs),
+        "rollout_gpu_memory_utilization_ceiling": float(rollout.gpu_memory_utilization),
+        "rollout_max_num_seqs": int(rollout.max_num_seqs),
+    }
 
 
 def prepare_streamopd_kv_config(config: DictConfig) -> None:
@@ -22,6 +209,14 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         return
     if not config.trainer.use_v1 or trainer_mode != "streamopd_colocate":
         raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd_colocate")
+    runtime_profile = str(stream_config.get("runtime_profile", "auto"))
+    if runtime_profile not in {"auto", "manual"}:
+        raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
+    if runtime_profile == "auto":
+        explicit_paths = _hydra_task_override_paths()
+        with open_dict(config):
+            stream_config.planner_explicit_options = sorted(explicit_paths)
+            _auto_streamopd_runtime_profile(config, explicit_paths=explicit_paths)
     rollout = config.actor_rollout_ref.rollout
     if rollout.name != "vllm":
         raise NotImplementedError("StreamOPD-KV MVP supports the vLLM rollout backend only")
@@ -138,6 +333,8 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         "kv_connector_extra_config": {
             "streamopd_kv_handoff_dir": stream_config.kv_handoff_dir,
             "streamopd_kv_chunk_size": int(stream_config.get("token_chunk_size", 256)),
+            "streamopd_host_slot_count": int(config.data.train_batch_size),
+            "streamopd_host_slot_tokens": int(stream_config.reverse_slot_max_tokens),
             "streamopd_writer_threads": 4,
         },
     }

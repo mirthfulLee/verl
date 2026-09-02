@@ -110,6 +110,36 @@ def _reverse_memory_estimate(
     return kv_bytes, activation_bytes_per_token + lm_head_bytes_per_token
 
 
+def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> int:
+    """Estimate gradient and optimizer tensors materialized by the first update."""
+
+    if optimizer is None:
+        return 0
+    optimizer_name = type(optimizer).__name__.lower()
+    seen: set[int] = set()
+    reserve = 0
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if not parameter.requires_grad or id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            parameter_bytes = parameter.numel() * parameter.element_size()
+            if parameter.grad is None:
+                reserve += parameter_bytes
+
+            state = optimizer.state.get(parameter, {})
+            if "adam" in optimizer_name:
+                for name in ("exp_avg", "exp_avg_sq"):
+                    value = state.get(name)
+                    if not isinstance(value, torch.Tensor) or value.device.type != parameter.device.type:
+                        reserve += parameter_bytes
+            elif "sgd" in optimizer_name and float(group.get("momentum", 0.0)) > 0:
+                value = state.get("momentum_buffer")
+                if not isinstance(value, torch.Tensor) or value.device.type != parameter.device.type:
+                    reserve += parameter_bytes
+    return reserve
+
+
 def _memory_limited_reverse_batch_size(
     model: torch.nn.Module,
     *,
@@ -410,6 +440,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         }
         if bool(self.streamopd_config.reverse_fixed_slots) and self._reverse_slot_pool is None:
             model = self.engine.module
+            deferred_training_state_bytes = _deferred_training_state_bytes(model, self.engine.optimizer)
+            metrics["deferred_training_state_gib"] = deferred_training_state_bytes / (1024**3)
             parameter_dtype = next(model.parameters()).dtype
             forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
             page_size = int(self.streamopd_config.reverse_page_size)
@@ -430,6 +462,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 reserve_bytes=(
                     int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
                     + self._preflight_additional_reserve_bytes
+                    + deferred_training_state_bytes
                 ),
             )
             from .oomb_paged_attention import OOMBFixedSlotPool
@@ -457,6 +490,14 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                     "slot_token_capacity": float(self._reverse_slot_plan.token_capacity),
                     "slot_chunk_size": float(self._reverse_slot_plan.chunk_size),
                     "slot_gib": self._reverse_slot_plan.slot_bytes / (1024**3),
+                    "estimated_workspace_gib": self._reverse_slot_plan.estimated_workspace_bytes / (1024**3),
+                    "runtime_required_free_gib": (
+                        self._reverse_slot_plan.estimated_workspace_bytes
+                        + deferred_training_state_bytes
+                        + int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
+                        + self._preflight_additional_reserve_bytes
+                    )
+                    / (1024**3),
                 }
             )
         return metrics
@@ -664,10 +705,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         paths_to_cleanup = [str(sample["streamopd_kv_path"]) for sample in samples]
         step_succeeded = False
         finalize = accumulation_step == accumulation_steps - 1
-        # Read sealed KV into host memory ahead of the reverse unit.  This
+        # Map sealed Host KV slots ahead of the reverse unit. This
         # queue is intentionally bounded by reverse units rather than
         # trajectories: the trainer still owns at most one GPU KV lease, while
-        # the next unit's disk reads can run during the current reverse kernel.
+        # the next unit's control lookup can run during the current reverse kernel.
         prefetch_depth = int(self.streamopd_config.kv_prefetch_depth)
         snapshot_specs: dict[int, tuple[str, TrajectoryKey, tuple[int, ...], int]] = {}
         for sample_idx, sample in enumerate(samples):
@@ -921,8 +962,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                         future.result()
                     except BaseException:
                         # The training exception, if any, is the actionable
-                        # error.  Futures are joined before snapshot cleanup so
-                        # no background reader can race file deletion.
+                        # error. Futures are joined before slot release so no
+                        # background reader can race row reuse.
                         pass
             model.train(was_training)
             if self.streamopd_config.cleanup_after_step or not step_succeeded:

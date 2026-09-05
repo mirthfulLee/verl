@@ -18,6 +18,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from statistics import fmean, stdev
 
 METRICS = (
     "timing_s/step",
@@ -289,6 +290,22 @@ def parse_steps(path: Path) -> list[dict[str, float]]:
     return steps
 
 
+def summarize_step_metrics(steps: list[dict[str, float]], warmup_steps: int = 1) -> dict:
+    """Report all measured steps, excluding startup, without selecting the fastest step."""
+    if warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    measured = steps[warmup_steps:]
+    keys = set.intersection(*(set(step) for step in measured)) if measured else set()
+    stable = {key: fmean(step[key] for step in measured) for key in keys if key != "step"}
+    durations = [step["timing_s/step"] for step in measured if "timing_s/step" in step]
+    return {
+        "stable_step": stable,
+        "measured_steps": len(measured),
+        "warmup_steps": warmup_steps,
+        "step_time_stddev": stdev(durations) if len(durations) > 1 else None,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("result_dir", type=Path)
@@ -300,6 +317,8 @@ def main() -> None:
         help="Additional result directories containing baseline .log files.",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--warmup-steps", type=int, default=1)
+    parser.add_argument("--expected-steps", type=int, help="Mark runs with fewer logged steps as partial")
     args = parser.parse_args()
 
     runs: dict[str, dict] = {}
@@ -317,6 +336,8 @@ def main() -> None:
             mode = match.group("mode")
             batch = match.group("batch")
             microbatch = match.group("microbatch")
+            summary = summarize_step_metrics(steps, args.warmup_steps)
+            incomplete = args.expected_steps is not None and len(steps) < args.expected_steps
             runs[path.stem] = {
                 "mode": mode,
                 "total_trajectory_tokens": int(match.group("tokens")),
@@ -324,14 +345,22 @@ def main() -> None:
                 # Legacy baseline files carried an mb32 suffix even though
                 # sync paths never consumed the StreamOPD trainer microbatch.
                 "micro_batch_size": (int(microbatch) if mode.startswith("streamopd") and microbatch else None),
-                "status": "partial" if steps and failed else "ok" if steps else "failed",
+                "status": (
+                    "failed"
+                    if not steps
+                    else "partial"
+                    if failed or incomplete
+                    else "ok"
+                    if summary["measured_steps"]
+                    else "warmup"
+                ),
                 "steps": steps,
-                "stable_step": steps[-1] if steps else {},
+                **summary,
                 "source_dir": str(directory),
             }
 
     for run in runs.values():
-        if run["status"] == "failed":
+        if run["status"] != "ok":
             continue
         step = run["stable_step"].get("timing_s/step")
         baseline_candidates = (
@@ -340,7 +369,7 @@ def main() -> None:
             if candidate["mode"] == "verl-sync-opd"
             and candidate["total_trajectory_tokens"] == run["total_trajectory_tokens"]
             and candidate["batch_size"] == run["batch_size"]
-            and candidate["status"] in {"ok", "partial"}
+            and candidate["status"] == "ok"
         )
         baseline = min(
             baseline_candidates,

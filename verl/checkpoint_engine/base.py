@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -506,98 +505,65 @@ class CheckpointEngineManager:
         """
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
+    def create_rollout_worker_group(self) -> RayWorkerGroup:
+        """Create the temporary receiver group used by a weight synchronization."""
+        workers = [worker for replica in self.replicas for worker in replica.workers]
+        return RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+
+    def finalize_workers(self, rollout: RayWorkerGroup) -> None:
+        """Release the checkpoint transport on all senders and receivers."""
+        actor_wg = self.actor_wg
+        ray.get(
+            actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
+            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+        )
+
     @auto_await
-    async def update_weights(self, global_steps: int = None, phase_exclusive: bool = False):
+    async def update_weights(self, global_steps: int = None):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
             global_steps: The global steps of the actor worker group.
-            phase_exclusive: Serialize host publication and Rollout loading so
-                Trainer and Rollout model weights never occupy a shared pool.
         """
 
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
-            if phase_exclusive:
-                raise ValueError("phase-exclusive weight sync requires a cross-process checkpoint backend")
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
             return {}
-        if phase_exclusive and self.backend != "host":
-            raise ValueError("phase-exclusive weight sync currently requires checkpoint_engine.backend=host")
 
         # 1. abort and save all unfinished requests for partial rollout
-        if not phase_exclusive:
-            await self.abort_replicas()
+        await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
-        workers = []
-        for replica in self.replicas:
-            workers.extend(replica.workers)
-        rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+        rollout = self.create_rollout_worker_group()
         actor_wg = self.actor_wg
 
-        # 3. A shared pool releases the complete Rollout before the Trainer
-        # materializes weights. Other layouts retain weights and release KV.
-        phase_metrics = {}
-        transition_started = time.perf_counter()
-        if phase_exclusive:
-            await self.sleep_replicas(level=2)
-            phase_metrics["checkpoint/phase_exclusive_rollout_sleep_seconds"] = time.perf_counter() - transition_started
-        else:
-            await self.release_kv_cache_replicas()
+        # 3. release kv_cache before weight sync (weights stay in place)
+        await self.release_kv_cache_replicas()
 
         # 4. build process group
         self.build_process_group(rollout)
 
-        # 5. A host checkpoint is durable, so shared pools can publish it with
-        # Rollout fully asleep, release Trainer memory, then wake only Rollout
-        # weights for loading. Dedicated pools keep the concurrent fast path.
-        if phase_exclusive:
-            sender_started = time.perf_counter()
-            sender_results = ray.get(actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
-            phase_metrics["checkpoint/phase_exclusive_publish_seconds"] = time.perf_counter() - sender_started
-            trainer_release_started = time.perf_counter()
-            actor_wg.release_streamopd_allocator_cache()
-            phase_metrics["checkpoint/phase_exclusive_trainer_release_seconds"] = (
-                time.perf_counter() - trainer_release_started
-            )
-            weights_wake_started = time.perf_counter()
-            await self.release_kv_cache_replicas()
-            phase_metrics["checkpoint/phase_exclusive_weights_wake_seconds"] = (
-                time.perf_counter() - weights_wake_started
-            )
-            receiver_started = time.perf_counter()
-            receiver_results = ray.get(rollout.update_weights(global_steps=global_steps))
-            phase_metrics["checkpoint/phase_exclusive_receive_seconds"] = time.perf_counter() - receiver_started
-            results = sender_results + receiver_results
-        else:
-            results = ray.get(
-                actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-                + rollout.update_weights(global_steps=global_steps)
-            )
+        # 5. update weights of all workers
+        results = ray.get(
+            actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+            + rollout.update_weights(global_steps=global_steps)
+        )
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}
         for result in results[: actor_wg.world_size]:
             if isinstance(result, dict):
                 sync_metrics.update(result)
-        sync_metrics.update(phase_metrics)
 
         # 6. finalize all workers
-        ray.get(
-            actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
-            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        )
+        self.finalize_workers(rollout)
 
         # 7. restore kv_cache after weight sync
-        kv_wake_started = time.perf_counter()
         await self.resume_kv_cache_replicas()
-        if phase_exclusive:
-            sync_metrics["checkpoint/phase_exclusive_kv_wake_seconds"] = time.perf_counter() - kv_wake_started
 
         # 8. resume all unfinished requests for partial rollout
-        if not phase_exclusive:
-            await self.resume_generation_replicas()
+        await self.resume_generation_replicas()
 
         return sync_metrics
 

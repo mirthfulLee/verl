@@ -14,17 +14,11 @@
 
 import os
 
-from verl.utils.dataset.rl_dataset import RLHFDataset
+from examples.on_policy_distillation_trainer.dapo_math_dataset import DAPOMathDataset as _DAPOMathDataset
 
 
-class DAPOMathDataset(RLHFDataset):
-    """Adapt DAPO's plain-string prompt column to verl's chat-message contract."""
-
-    def _build_messages(self, example: dict, key: str) -> list[dict]:
-        prompt = example[key]
-        if isinstance(prompt, str):
-            return [{"role": "user", "content": prompt}]
-        return super()._build_messages(example, key)
+class DAPOMathDataset(_DAPOMathDataset):
+    """Add optional ragged response caps for controlled benchmark workloads."""
 
     def __getitem__(self, item):
         row = super().__getitem__(item)

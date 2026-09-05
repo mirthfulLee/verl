@@ -810,7 +810,7 @@ distillation:
   enabled: false
   colocate_teacher_with_student: false
   streamopd_kv:
-    _target_: verl.workers.config.StreamOPDKVConfig
+    _target_: verl.experimental.streamopd_kv.config.StreamOPDKVConfig
     enabled: false
     runtime_profile: auto
     planner_explicit_options: []
@@ -849,7 +849,7 @@ distillation:
     loss_max_clamp: null
     log_prob_min_clamp: null
     use_chunked_topk: false
-    chunked_topk_chunk_size: 512
+    chunked_topk_chunk_size: 4096
     use_policy_gradient: false
     policy_loss_mode: vanilla
     clip_ratio: 0.2

@@ -151,3 +151,48 @@ def test_weight_split_casts_only_floating_wire_tensors() -> None:
     assert [meta.dtype for meta, _ in chunks] == [torch.bfloat16, torch.int64]
     assert [meta.chunk_size for meta, _ in chunks] == [16, 32]
     torch.testing.assert_close(chunks[0][1].view(torch.bfloat16), torch.arange(8, dtype=torch.bfloat16))
+
+
+def _send_fsdp1_shards(rank, rendezvous, directory, session_dir):
+    from datetime import timedelta
+
+    from torch.distributed._shard.sharded_tensor import Shard, init_from_local_shards
+    from torch.distributed._shard.sharding_spec import ShardMetadata
+
+    from verl.checkpoint_engine import host_checkpoint_engine
+
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        host_checkpoint_engine.get_device_id = lambda: torch.device("cpu")
+        local = torch.arange(rank * 5, (rank + 1) * 5, dtype=torch.float32)
+        shard = Shard(local, ShardMetadata([rank * 5], [5], f"rank:{rank}/cpu"))
+        weight = init_from_local_shards([shard], 10)
+        engine = HostCheckpointEngine(bucket_size=8, directory=directory, rollout_dtype="bfloat16")
+        engine.init_process_group("sender" if rank == 0 else "participant", session_dir, actor_world_size=2)
+        asyncio.run(engine.send_weights(iter([("sharded", weight), ("dense", torch.tensor([11.0]))])))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_host_checkpoint_gathers_fsdp1_shards_with_matching_participant_buckets(tmp_path):
+    """Both ranks must cross each gather/barrier; only rank 0 publishes payloads."""
+    sender = HostCheckpointEngine(bucket_size=8, directory=str(tmp_path), is_master=True)
+    session_dir = sender.prepare().session_dir
+    torch.multiprocessing.spawn(
+        _send_fsdp1_shards,
+        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), session_dir),
+        nprocs=2,
+    )
+    receiver = HostCheckpointEngine(bucket_size=8, directory=str(tmp_path))
+    receiver.init_process_group("receiver", session_dir, actor_world_size=2)
+
+    async def receive():
+        return {name: tensor.clone() async for name, tensor in receiver.receive_weights()}
+
+    actual = asyncio.run(receive())
+    torch.testing.assert_close(actual["sharded"], torch.arange(10, dtype=torch.bfloat16))
+    torch.testing.assert_close(actual["dense"], torch.tensor([11.0], dtype=torch.bfloat16))
+    sender.init_process_group("sender", session_dir, actor_world_size=2)
+    sender.finalize()

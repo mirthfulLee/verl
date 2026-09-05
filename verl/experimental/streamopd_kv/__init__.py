@@ -8,18 +8,25 @@
 
 """Experimental strict on-policy distillation with streamed rollout KV."""
 
-from .config import prepare_streamopd_kv_config
-from .protocol import CommittedTokenChunk, TrajectoryKey
-from .publisher import CommittedChunkPublisher
-from .qwen3 import Qwen3ReverseTrainer, ReverseTrainingResult
-from .streaming_teacher import StreamingTeacherCoordinator
+from importlib import import_module
 
-__all__ = [
-    "CommittedChunkPublisher",
-    "CommittedTokenChunk",
-    "Qwen3ReverseTrainer",
-    "ReverseTrainingResult",
-    "StreamingTeacherCoordinator",
-    "TrajectoryKey",
-    "prepare_streamopd_kv_config",
-]
+_EXPORTS = {
+    "CommittedChunkPublisher": ("publisher", "CommittedChunkPublisher"),
+    "CommittedTokenChunk": ("protocol", "CommittedTokenChunk"),
+    "Qwen3ReverseTrainer": ("qwen3", "Qwen3ReverseTrainer"),
+    "ReverseTrainingResult": ("qwen3", "ReverseTrainingResult"),
+    "StreamingTeacherCoordinator": ("streaming_teacher", "StreamingTeacherCoordinator"),
+    "TrajectoryKey": ("protocol", "TrajectoryKey"),
+    "prepare_streamopd_kv_config": ("config", "prepare_streamopd_kv_config"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = _EXPORTS[name]
+    value = getattr(import_module(f".{module_name}", __name__), attribute)
+    globals()[name] = value
+    return value

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.distributed._shard.sharded_tensor import ShardedTensor
 
 from verl.checkpoint_engine.base import (
     CheckpointEngine,
@@ -34,6 +35,8 @@ from verl.checkpoint_engine.base import (
     merge_weight_chunks,
     split_weight_chunks,
 )
+from verl.utils.device import get_device_id
+from verl.workers.rollout.utils import ensure_async_iterator
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -187,6 +190,23 @@ class HostCheckpointEngine(CheckpointEngine):
         )
         os.replace(temporary_metadata_path, metadata_path)
 
+    async def _materialize_weights(self, weights):
+        """Gather FSDP1 shards only for this backend's single-sender protocol.
+
+        Participants drive the same gathers and bucket barriers, but need only
+        tensor metadata. Other transports retain the engine's original output.
+        """
+        async for name, param in ensure_async_iterator(weights):
+            if isinstance(param, ShardedTensor):
+                full = (
+                    torch.empty(param.size(), dtype=param.dtype, device=get_device_id())
+                    if self.role == "sender"
+                    else None
+                )
+                param.gather(dst=0, out=full)
+                param = full if full is not None else torch.empty(param.size(), dtype=param.dtype, device="meta")
+            yield name, param
+
     @torch.no_grad()
     async def send_weights(
         self,
@@ -194,6 +214,7 @@ class HostCheckpointEngine(CheckpointEngine):
         global_steps: int | None = None,
     ) -> dict[str, float]:
         del global_steps
+        weights = self._materialize_weights(weights)
         if self.role == "participant":
             await self._participate(weights)
             return {}

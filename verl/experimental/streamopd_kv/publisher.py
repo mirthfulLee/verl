@@ -79,18 +79,8 @@ class CommittedChunkPublisher:
             if terminal:
                 break
 
-        if terminal and self._emitted < len(self._accepted):
+        if terminal and not terminal_sent:
             await self._emit(len(self._accepted), terminal=True)
-        elif terminal and not terminal_sent:
-            await self.submit(
-                CommittedTokenChunk(
-                    key=self.key,
-                    start=self._emitted,
-                    token_ids=(),
-                    terminal=True,
-                    prompt_ids=self.prompt_ids if self._emitted == 0 else (),
-                )
-            )
         self._terminal = terminal
 
     async def _emit(self, end: int, *, terminal: bool) -> None:

@@ -43,17 +43,6 @@ class StreamOPDActorWorker(ActorRolloutRefWorker):
         get_torch_device().reset_peak_memory_stats()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_streamopd_device_memory_stats(self) -> dict[str, int]:
-        device = get_torch_device()
-        free_bytes, total_bytes = device.mem_get_info()
-        return {
-            "free_bytes": int(free_bytes),
-            "total_bytes": int(total_bytes),
-            "allocated_bytes": int(device.memory_allocated()),
-            "reserved_bytes": int(device.memory_reserved()),
-        }
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def release_streamopd_allocator_cache(self) -> None:
         """Return inactive Trainer allocations before the next Teacher wake."""
 

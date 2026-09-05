@@ -182,6 +182,8 @@ if [[ $MODE == streamopd* && $STREAMOPD_RUNTIME_PROFILE == auto ]]; then
 fi
 
 bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
+  trainer.v1.trainer_mode="$TRAINER_MODE" \
+  distillation.streamopd_kv.enabled="$STREAMOPD_KV_ENABLED" \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
   actor_rollout_ref.rollout.n=1 \
@@ -193,6 +195,7 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh \
   +actor_rollout_ref.model.override_config.attn_implementation="$ATTN_IMPLEMENTATION" \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.enforce_eager="$ROLLOUT_ENFORCE_EAGER" \
   +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.host.rollout_dtype="$CHECKPOINT_HOST_ROLLOUT_DTYPE" \
+  data.custom_cls.path=benchmarks/streamopd_kv/dapo_math_dataset.py \
   data.dataloader_num_workers=0 \
   distillation.teacher_models.teacher_model.inference.dtype=bfloat16 \
   distillation.teacher_models.teacher_model.inference.enforce_eager="$TEACHER_ENFORCE_EAGER" \

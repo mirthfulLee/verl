@@ -77,10 +77,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
-                streamopd_enabled=(
-                    bool(self.config.get("distillation", {}).get("streamopd_kv", {}).get("enabled", False))
-                    and not kwargs.get("_streamopd_validate", False)
-                ),
+                **kwargs.get("_rollout_kwargs", {}),
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1

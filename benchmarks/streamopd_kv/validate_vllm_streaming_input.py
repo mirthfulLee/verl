@@ -61,14 +61,9 @@ async def validate(args: argparse.Namespace) -> None:
     )
     patch_result = await engine.collective_rpc(method="enable_streaming_prompt_logprobs")
 
-    # Importing the server after engine construction avoids initializing CUDA
-    # in the parent before vLLM selects its worker multiprocessing method.
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+    from verl.experimental.streamopd_kv.vllm_teacher import StreamingTeacherServer
 
-    server = vLLMHttpServer.__new__(vLLMHttpServer)
-    server.engine = engine
-    server._is_teacher_model = True
-    server._teacher_input_streams = {}
+    server = StreamingTeacherServer(engine)
     sequence = list(range(100, 100 + args.sequence_length))
     prompt_length = args.prompt_length
     boundaries = list(range(prompt_length + args.response_chunk, len(sequence), args.response_chunk))
@@ -218,6 +213,15 @@ async def validate(args: argparse.Namespace) -> None:
         }
     )
     engine.shutdown()
+    if args.assert_match:
+        if server._teacher_input_streams:
+            raise AssertionError("Teacher sessions remain open after EOS")
+        for fragments in all_streamed:
+            # The native teacher API has a dummy final row without a target.
+            ids = torch.cat([item["prompt_ids"] for item in fragments])[:-1]
+            logprobs = torch.cat([item["prompt_logprobs"] for item in fragments])[:-1]
+            torch.testing.assert_close(ids, full_ids, rtol=0, atol=0)
+            torch.testing.assert_close(logprobs, full_logprobs, rtol=0, atol=0)
 
 
 def main() -> None:
@@ -225,7 +229,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
-    parser.add_argument("--max-model-len", type=int, default=128)
+    parser.add_argument("--max-model-len", type=int, default=4097)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -234,6 +238,7 @@ def main() -> None:
     parser.add_argument("--response-chunk", type=int, default=1066)
     parser.add_argument("--topk", type=int, default=4)
     parser.add_argument("--num-sessions", type=int, default=1)
+    parser.add_argument("--assert-match", action="store_true", help="Fail on any supervised top-k/logprob mismatch")
     parser.add_argument("--cuda-graphs", action="store_true")
     parser.add_argument("--exclusive-gpu-memory", action="store_true")
     parser.add_argument("--report-sleep-memory", action="store_true")

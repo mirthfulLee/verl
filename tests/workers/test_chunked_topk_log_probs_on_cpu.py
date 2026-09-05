@@ -176,8 +176,8 @@ def test_rejects_non_positive_chunk_size():
         )
 
 
-def test_memory_bound_chunk_config_has_safe_default_and_validates():
-    assert DistillationLossConfig().chunked_topk_chunk_size == 512
+def test_memory_bound_chunk_config_preserves_upstream_default_and_validates():
+    assert DistillationLossConfig().chunked_topk_chunk_size == 4096
     with pytest.raises(ValueError, match="must be positive"):
         DistillationLossConfig(chunked_topk_chunk_size=0)
 

@@ -15,20 +15,18 @@ documentation.
 
 ## Environment
 
-The development benchmark environment uses Python 3.12, PyTorch with CUDA 12.8, vLLM 0.15.1, FlashAttention 2,
-Liger, and A800-80GB GPUs. The environment is created and maintained with `uv`.
-Activate the CUDA environment for the driver and Ray workers:
+Use the repository's current Python 3.12 / vLLM / FSDP environment for new runs:
 
 ```bash
-export PATH="$PWD/.venv-cu128/bin:$PATH"
-export VIRTUAL_ENV="$PWD/.venv-cu128"
-export VERL_USE_UV=0
+uv sync --extra vllm --extra fsdp
+source .venv/bin/activate
 ```
 
-vLLM 0.15.1 currently constrains Transformers to 4.x while the repository metadata requires Transformers 5.x.
-The validated benchmark environment keeps Transformers 4.57.6 for vLLM runtime compatibility; `uv pip check` will
-report this single metadata conflict. Do not let project-level `uv run --all-packages` replace `.venv-cu128` with an
-unvalidated CUDA/Transformers solve when reproducing these results.
+The earlier development measurements used CUDA 12.8, vLLM 0.15.1, Transformers 4.57.6, FlashAttention 2, and A800-80GB
+GPUs. That optional legacy environment has a Transformers metadata conflict with this repository; it should not be
+used as evidence for the current dependency stack. Record package versions for every new comparison. StreamOPD's
+legacy Teacher patch is scoped to 0.15.1; vLLM 0.24.0 provides the required Teacher artifacts natively. The default
+`eos_host` Rollout uses the legacy model runner for its cross-layer KV layout, selected inside its own server process.
 
 The benchmark and production example default to `distillation.streamopd_kv.runtime_profile=auto` and reuse verl's
 existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count configuration;
@@ -38,7 +36,8 @@ The auto profile gives each Rollout and Teacher vLLM instance exclusive ownershi
 active phase. Each vLLM worker sizes its byte budget from the free memory measured after CUDA and NCCL initialization,
 reserves one measured activation peak for runtime and each configured CUDA graph mode plus deterministic sampler and
 StreamOPD workspaces, and preserves vLLM's native 150 MiB profiling-error allowance before reporting the KV blocks it
-actually allocated. No model-size heuristic or
+actually allocated. Allocation never exceeds the worst-case KV footprint of the entire global batch on each
+replica. No model-size heuristic or
 `gpu_memory_utilization` tier is used. A shared Rollout uses a durable two-phase Host checkpoint so Trainer state is
 offloaded before Rollout weights are woken for publication. A dedicated Trainer selects reverse shape at startup; a
 shared Trainer selects it once after its inference pools first enter level-2 sleep, so retained process allocations
@@ -56,7 +55,7 @@ Run the factor-covering Qwen3-1.7B/4B and Qwen3-4B/14B benchmark at 4096/8192 to
 128/256 with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 TOTAL_TRAINING_STEPS=2 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 TOTAL_TRAINING_STEPS=3 \
   bash benchmarks/streamopd_kv/run_colocate_matrix.sh
 ```
 
@@ -85,10 +84,8 @@ Gradient checkpointing is likewise applied uniformly to every matrix case and bo
 `ENABLE_GRADIENT_CHECKPOINTING=False` for a matrix-wide ablation; the runner never selects it from a model name.
 Teacher `max_num_seqs` is also matched at 32 by default and can be changed for both sides with
 `MATCHED_TEACHER_MAX_NUM_SEQS`. Rollout and Teacher model-length, batch-token, and sequence limits are passed through
-one common override list, so StreamOPD auto planning cannot silently drift from the baseline controls. A paired
-batch-128 check found less than 0.3% full-step difference between Teacher limits 32 and 64, so matching this
-low-impact scheduler bound removes an unnecessary configuration difference without tuning either method to the
-tested model.
+one common override list, so StreamOPD auto planning cannot silently drift from the baseline controls. Record any changes to these controls with the result; old development measurements are not a
+performance guarantee for the current code or dependency versions.
 
 ### Attribution boundary
 
@@ -110,17 +107,14 @@ Required pool mechanics are timed and reported, but are not presented as algorit
 the auto profile does not modify common Trainer kernel choices; the benchmark runner applies such choices to both
 implementations.
 
-Within the streaming-Teacher path, prompt-logprob LM-head projection and FP32 normalization use a bounded 1024-row
+Within the vLLM 0.15.1 streaming-Teacher compatibility patch, prompt-logprob LM-head projection and FP32 normalization use a bounded 1024-row
 tile. This matches the auto profile's maximum fragment size and has a runtime free-memory fallback for larger manual
-fragments; it does not select a tile from a model name, GPU type, batch size, or token limit. Cross-request LM-head
-batching is intentionally absent: paired measurements found no gain, while it added a second request aggregation
-layer on top of vLLM's scheduler.
+fragments; it does not select a tile from a model name, GPU type, batch size, or token limit. The legacy compatibility patch does not add another cross-request batching layer on top of vLLM's scheduler.
 
 The sync baseline retains its native bounded Rollout allocation. Giving that Rollout the StreamOPD
 `exclusive_free` policy is not valid: the decode phase can consume the measured free memory, but native weight sync
-tries to restore the KV allocation while actor/training state is still resident. The batch-128 Qwen3-1.7B/4B check
-failed at that wake with a CUDA OOM. StreamOPD can use `exclusive_free` because its phase-exclusive Host checkpoint
-releases Trainer state before waking Rollout. This is a measured architectural constraint and is reported as pool
+tries to restore the KV allocation while actor/training state is still resident. This can fail at wake with a CUDA OOM. StreamOPD can use `exclusive_free` because its phase-exclusive Host checkpoint
+releases Trainer state before waking Rollout. This lifecycle difference is reported as pool
 mechanics, not attributed to streaming Teacher scoring or reverse backward.
 
 The default matrix compares two topologies. `union` uses four physical GPUs: Teacher 2 + Rollout 2, followed by
@@ -148,7 +142,7 @@ For an isolated same-workload Rollout KV export A/B, use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN \
-  .venv-cu128/bin/python benchmarks/streamopd_kv/benchmark_vllm_kv_export.py \
+  uv run --active --no-sync python benchmarks/streamopd_kv/benchmark_vllm_kv_export.py \
   --model /nasdata/Model/Qwen3-4B --mode eos_host \
   --batch-size 128 --max-num-seqs 64 --max-total-tokens 4096 \
   --chunk-size 2048 --writer-threads 4 --warmup-batches 1
@@ -162,15 +156,20 @@ are the default bounded double-buffering pool; increasing it also increases pers
 Generate a local machine-readable summary with:
 
 ```bash
-python benchmarks/streamopd_kv/summarize_colocate_matrix.py <result-dir>
+python benchmarks/streamopd_kv/summarize_colocate_matrix.py <result-dir> --warmup-steps 1 --expected-steps 3
 ```
+
+The summary excludes the first step by default and averages all subsequent steps, reporting the number of measured
+steps and the sample standard deviation of step time. Use `--expected-steps` to reject incomplete runs as performance
+comparisons. Warmup-only and failed/partial runs never receive speedup ratios. Preserve all per-step values when
+comparing a cleanup against an earlier revision; selecting only the last or fastest step can hide a regression.
 
 ## Teacher StreamingInput validation
 
 Validate resumable Teacher sessions independently with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 .venv-cu128/bin/python \
+CUDA_VISIBLE_DEVICES=0 uv run --active --no-sync python \
   benchmarks/streamopd_kv/validate_vllm_streaming_input.py \
   --model /nasdata/Model/Qwen3-4B --num-sessions 16 \
   --max-model-len 4097 --max-num-batched-tokens 2048 \
@@ -178,7 +177,8 @@ CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 .venv-cu128/bin/python \
   --skip-tokenizer-init --attention-backend FLASH_ATTN
 ```
 
-For a bitwise full-request oracle, add `VLLM_BATCH_INVARIANT=1` to the environment. Normal high-throughput
+For a bitwise full-request oracle, add `VLLM_BATCH_INVARIANT=1` and `--assert-match`. This checks every session
+and exits nonzero for any supervised row mismatch; the native API's unused final dummy row is excluded. Normal high-throughput
 FlashAttention is sensitive to prefill partition shape, so its full-vs-streamed top-k comparison is a numerical
 stability measurement rather than an exact session-alignment test. The validator reports per-fragment and boundary
 metrics plus `-1/0/+1` row-offset matches to distinguish kernel drift from an indexing error.
@@ -195,7 +195,7 @@ overlapped transfer counters, when attributing training wall time.
 Run a two-GPU numerical and stage-timing check with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. .venv-cu128/bin/python \
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. uv run --active --no-sync python \
   benchmarks/streamopd_kv/benchmark_qwen3.py \
   --student /nasdata/Model/Qwen3-4B \
   --teacher /nasdata/Model/Qwen3-14B \

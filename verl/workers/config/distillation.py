@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from verl.base_config import BaseConfig
+from verl.experimental.streamopd_kv.config import StreamOPDKVConfig
 from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
@@ -77,7 +78,7 @@ class DistillationLossConfig(BaseConfig):
     # Tokens per chunk along (B*T) when ``use_chunked_topk=True``. Larger
     # chunks reduce recomputation/launch overhead but increase the bounded
     # forward/backward workspace; smaller chunks reduce peak memory.
-    chunked_topk_chunk_size: int = 512
+    chunked_topk_chunk_size: int = 4096
 
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
@@ -217,126 +218,6 @@ class DistillationTeacherModelConfig(BaseConfig):
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
                 )
-
-
-@dataclass
-class StreamOPDKVConfig(BaseConfig):
-    """Experimental placement-aware strict OPD execution settings.
-
-    This flag is fail-closed. The initial backend supports text-only,
-    single-teacher Qwen3 jobs with exact dense attention and vLLM KV export.
-    """
-
-    enabled: bool = False
-    # ``auto`` resolves execution-only knobs from batch, sequence length, GPU
-    # allocation, and placement. ``manual`` preserves every advanced override
-    # for ablations and sensitivity studies.
-    runtime_profile: str = "auto"
-    # Populated from Hydra CLI overrides before automatic planning. Existing
-    # verl options remain the public constraints; this field is diagnostic.
-    planner_explicit_options: list[str] = field(default_factory=list)
-    token_chunk_size: int = 256
-    # Export complete trajectories after EOS. ``eos_host`` copies vLLM's
-    # physical pages directly and performs the layout transform on CPU.
-    rollout_kv_export_strategy: str = "eos_host"
-    # Rollout export is independent of Teacher streaming granularity. Zero
-    # resolves to a bounded 2048-token staging chunk before vLLM starts.
-    rollout_kv_export_chunk_size: int = 0
-    # This also bounds persistent pinned Host staging to one buffer per writer.
-    rollout_kv_writer_threads: int = 4
-    # Physical GPU allocation is user-controlled. ``teacher`` colocates the
-    # fixed-topology trainer with Teacher vLLM; ``rollout`` colocates separate
-    # rollout processes on Trainer GPUs; ``union`` spans disjoint Teacher and
-    # Rollout subsets; ``dedicated`` gives each role its own pool.
-    trainer_placement: str = "union"
-    # Zero values are resolved into static caps before worker startup.
-    reverse_chunk_size: int = 0
-    reverse_chunk_min_size: int = 0
-    reverse_page_size: int = 64
-    reverse_batch_size: int = 0
-    reverse_batch_max_tokens: int = 0
-    # Persistent K/V/dK/dV rows planned and allocated before policy version 0.
-    # A zero token limit is resolved from data.max_prompt/response_length.
-    reverse_slot_max_tokens: int = 0
-    reverse_slot_reserve_gib: float = 4.0
-    scheduler_poll_interval_ms: int = 10
-    scheduler_timeout_seconds: float = 600.0
-    scheduler_actor_name: str = ""
-    max_pending_teacher_chunks: int = 128
-    # Optional preflight caps. Zero lets the scheduler derive stable values
-    # from vLLM's profiled KV blocks and the reverse training-unit width.
-    teacher_prefill_max_active_trajectories: int = 0
-    # Optional global Teacher KV admission cap. Effective live-session count
-    # is this budget divided by the configured trajectory length.
-    teacher_prefill_max_active_kv_tokens: int = 0
-    teacher_prefill_kv_page_size: int = 64
-    # Host-side KV prefetch is overlapped with the current reverse unit.  The
-    # GPU lease remains limited to one reverse microbatch; depth only controls
-    # how many sealed host snapshots may be in flight.
-    kv_prefetch_depth: int = 1
-    kv_prefetch_workers: int = 4
-    kv_handoff_dir: str = "/tmp/verl-streamopd-kv"
-    require_same_tokenizer: bool = True
-    validate_teacher_artifacts: bool = False
-    validate_full_forward_loss: bool = False
-    validation_atol: float = 1e-4
-
-    def __post_init__(self) -> None:
-        if self.runtime_profile not in {"auto", "manual"}:
-            raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
-        if self.rollout_kv_export_strategy not in {"eos_host", "eos_triton", "incremental_triton"}:
-            raise ValueError(
-                "streamopd_kv.rollout_kv_export_strategy must be eos_host, eos_triton, or incremental_triton"
-            )
-        for name in (
-            "token_chunk_size",
-            "rollout_kv_writer_threads",
-            "reverse_page_size",
-            "scheduler_poll_interval_ms",
-            "max_pending_teacher_chunks",
-            "teacher_prefill_kv_page_size",
-            "kv_prefetch_depth",
-            "kv_prefetch_workers",
-        ):
-            if getattr(self, name) < 1:
-                raise ValueError(f"streamopd_kv.{name} must be positive")
-        if not self.kv_handoff_dir:
-            raise ValueError("streamopd_kv.kv_handoff_dir must be non-empty")
-        for name in (
-            "rollout_kv_export_chunk_size",
-            "reverse_chunk_size",
-            "reverse_chunk_min_size",
-            "reverse_batch_size",
-            "reverse_batch_max_tokens",
-        ):
-            if getattr(self, name) < 0:
-                raise ValueError(f"streamopd_kv.{name} must be non-negative")
-        if self.reverse_chunk_size and self.reverse_chunk_min_size > self.reverse_chunk_size:
-            raise ValueError("streamopd_kv.reverse_chunk_min_size must not exceed reverse_chunk_size")
-        if self.reverse_page_size < 16 or self.reverse_page_size & (self.reverse_page_size - 1):
-            raise ValueError("streamopd_kv.reverse_page_size must be a power of two and at least 16")
-        if self.teacher_prefill_kv_page_size & (self.teacher_prefill_kv_page_size - 1):
-            raise ValueError("streamopd_kv.teacher_prefill_kv_page_size must be a power of two")
-        if (self.reverse_chunk_size and self.reverse_chunk_size % self.reverse_page_size) or (
-            self.reverse_chunk_min_size and self.reverse_chunk_min_size % self.reverse_page_size
-        ):
-            raise ValueError("StreamOPD reverse chunk sizes must be divisible by reverse_page_size")
-        if self.reverse_slot_max_tokens < 0:
-            raise ValueError("streamopd_kv.reverse_slot_max_tokens must be non-negative")
-        if self.reverse_slot_reserve_gib < 0:
-            raise ValueError("streamopd_kv.reverse_slot_reserve_gib must be non-negative")
-        if self.validation_atol < 0:
-            raise ValueError("streamopd_kv.validation_atol must be non-negative")
-        if self.teacher_prefill_max_active_trajectories < 0:
-            raise ValueError("streamopd_kv.teacher_prefill_max_active_trajectories must be non-negative")
-        if self.teacher_prefill_max_active_kv_tokens < 0:
-            raise ValueError("streamopd_kv.teacher_prefill_max_active_kv_tokens must be non-negative")
-        if self.scheduler_timeout_seconds <= 0:
-            raise ValueError("streamopd_kv.scheduler_timeout_seconds must be positive")
-        if self.trainer_placement not in {"teacher", "rollout", "union", "dedicated"}:
-            raise NotImplementedError(
-                "streamopd_kv.trainer_placement supports 'teacher', 'rollout', 'union', and 'dedicated'"
-            )
 
 
 @dataclass

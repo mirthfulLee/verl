@@ -2,7 +2,12 @@
 
 **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
 
-Last updated: 05/26/2026.
+Last updated: 09/05/2026.
+
+StreamOPD is an experimental V1 execution mode for strict direct on-policy distillation. It streams committed
+student tokens to a frozen Teacher and reuses Rollout KV during reverse training, with one optimizer update per
+policy batch. It is opt-in and currently supports text-only Qwen3 students with vLLM and FSDP/FSDP2. See the
+[StreamOPD guide](../../verl/experimental/streamopd_kv/README.md) for its supported envelope and example.
 
 ## Background
 

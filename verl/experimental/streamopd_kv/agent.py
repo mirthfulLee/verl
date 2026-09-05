@@ -14,8 +14,12 @@ from typing import Any
 import ray
 import torch
 
+from verl.experimental.teacher_loop.teacher_manager import _get_teacher_sampling_params
+
+from .config import get_streamopd_teacher
 from .protocol import CommittedTokenChunk, TrajectoryKey
 from .streaming_teacher import StreamingTeacherCoordinator
+from .teacher_client import StreamingTeacherClient
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +27,7 @@ logger = logging.getLogger(__name__)
 class StreamOPDAgentSession:
     """StreamOPD integration owned by one generic AgentLoop worker."""
 
-    def __init__(self, config, rollout_config, tokenizer, model_type, teacher_manager, callback) -> None:
+    def __init__(self, config, rollout_config, tokenizer, model_type, teacher_manager) -> None:
         stream_config = config.distillation.streamopd_kv
         if rollout_config.agent.default_agent_loop != "single_turn_agent":
             raise NotImplementedError("StreamOPD supports the single_turn_agent loop only")
@@ -32,7 +36,7 @@ class StreamOPDAgentSession:
         if stream_config.require_same_tokenizer:
             from transformers import AutoTokenizer
 
-            teacher_model = next(iter(config.distillation.teacher_models.values()))
+            teacher_model = get_streamopd_teacher(config.distillation)[1]
             teacher_tokenizer = AutoTokenizer.from_pretrained(
                 teacher_model.model_path,
                 trust_remote_code=bool(config.data.get("trust_remote_code", False)),
@@ -42,6 +46,12 @@ class StreamOPDAgentSession:
 
         self.config = stream_config
         self.teacher_manager = teacher_manager
+        teacher_key, teacher_config = get_streamopd_teacher(teacher_manager.distillation_config)
+        client = teacher_manager.teacher_client[teacher_key]
+        self._teacher_client = StreamingTeacherClient(config=config, load_balancer_handle=client._load_balancer)
+        self._teacher_sampling_params = _get_teacher_sampling_params(
+            teacher_config, teacher_manager.distillation_loss_config
+        )
         scheduler_name = str(stream_config.scheduler_actor_name)
         scheduler = ray.get_actor(scheduler_name) if scheduler_name else None
         self.coordinator = StreamingTeacherCoordinator(
@@ -53,16 +63,20 @@ class StreamOPDAgentSession:
             kv_page_size=int(stream_config.teacher_prefill_kv_page_size),
             kv_reservation_tokens=int(rollout_config.prompt_length + rollout_config.response_length),
         )
-        callback.streamopd_callback = ray.get_runtime_context().current_actor
-        callback.streamopd_chunk_size = int(stream_config.token_chunk_size)
-        callback.streamopd_page_size = int(stream_config.teacher_prefill_kv_page_size)
+        self.rollout_kwargs = {
+            "streamopd_callback": ray.get_runtime_context().current_actor,
+            "streamopd_chunk_size": int(stream_config.token_chunk_size),
+            "streamopd_page_size": int(stream_config.teacher_prefill_kv_page_size),
+        }
 
     async def _score(self, token_ids: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        return await self.teacher_manager.compute_teacher_logprobs_streaming(
+        output = await self._teacher_client.stream_teacher_chunk(
             token_ids=token_ids,
             request_id=request_id,
             terminal=terminal,
+            sampling_params=self._teacher_sampling_params,
         )
+        return torch.as_tensor(output["prompt_ids"], dtype=torch.int32), torch.as_tensor(output["prompt_logprobs"])
 
     async def submit(self, value: dict[str, Any]) -> None:
         await self.coordinator.submit(CommittedTokenChunk.from_dict(value))
@@ -90,10 +104,15 @@ class StreamOPDAgentSession:
                 sequence_ids=prompt_ids + response_ids,
                 routing_key=routing_key,
             )
-            if not torch.equal(teacher_ids, expected_ids):
-                mismatched = int((teacher_ids != expected_ids).sum().item())
+            # The ordinary teacher API pads its final row with zeros: no
+            # next-token target consumes it. StreamingInput returns a real
+            # sampled distribution there. Compare only supervised positions.
+            if teacher_ids.shape != expected_ids.shape or teacher_logprobs.shape != expected_logprobs.shape:
+                raise RuntimeError("streamed Teacher artifact shapes differ from reference scoring")
+            if not torch.equal(teacher_ids[:-1], expected_ids[:-1]):
+                mismatched = int((teacher_ids[:-1] != expected_ids[:-1]).sum().item())
                 raise RuntimeError(f"streamed Teacher token ids differ from reference scoring at {mismatched} entries")
-            error = float((teacher_logprobs - expected_logprobs).abs().max().item())
+            error = float((teacher_logprobs[:-1] - expected_logprobs[:-1]).abs().max().item())
             if error > self.config.validation_atol:
                 raise RuntimeError(
                     "streamed Teacher logprobs differ from reference scoring: "

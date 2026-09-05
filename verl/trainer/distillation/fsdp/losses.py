@@ -139,7 +139,7 @@ def compute_forward_kl_topk(
         student_topk_log_probs = _chunked_topk_log_probs(
             student_logits,
             teacher_topk_ids,
-            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 512),
+            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
         )
     else:
         student_log_probs = F.log_softmax(student_logits, dim=-1)

@@ -118,51 +118,26 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
-        request_id: Optional[str] = None,
-        prompt_logprobs_start: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
+        output_kwargs = {"prompt_logprobs_as_tensors": True} if teacher_model_config.inference.name == "vllm" else {}
         teacher_output = await client.generate(
-            request_id=request_id or uuid4().hex,
+            request_id=uuid4().hex,
             prompt_ids=sequence_ids,
             sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
-            prompt_logprobs_start=prompt_logprobs_start,
-            prompt_logprobs_as_tensors=True,
+            **output_kwargs,
         )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
         teacher_ids = torch.as_tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.as_tensor(teacher_output.extra_fields["prompt_logprobs"])
-        expected_rows = len(sequence_ids) - prompt_logprobs_start
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == expected_rows
-        return teacher_ids, teacher_logprobs
-
-    async def compute_teacher_logprobs_streaming(
-        self,
-        token_ids: list[int],
-        request_id: str,
-        terminal: bool,
-        routing_key: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Score one new token fragment while retaining the teacher's vLLM KV."""
-        teacher_key = self._resolve_teacher_key(routing_key)
-        teacher_model_config = self.teacher_model_configs[teacher_key]
-        teacher_output = await self.teacher_client[teacher_key].stream_teacher_chunk(
-            request_id=request_id,
-            token_ids=token_ids,
-            sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
-            terminal=terminal,
-        )
-        teacher_ids = torch.as_tensor(teacher_output["prompt_ids"], dtype=torch.int32)
-        teacher_logprobs = torch.as_tensor(teacher_output["prompt_logprobs"])
-        if teacher_ids.shape[0] != len(token_ids) or teacher_logprobs.shape[0] != len(token_ids):
-            raise RuntimeError("resumable teacher returned an incomplete token fragment")
+        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs

@@ -217,10 +217,6 @@ class LLMServerClient:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        # A resumable teacher request owns one load-balancer lease for its
-        # whole KV lifetime. Counting only individual fragment RPCs can pack
-        # all resident sessions onto one replica after those RPCs return.
-        self._teacher_stream_servers: dict[str, tuple[str, ray.actor.ActorHandle]] = {}
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -239,36 +235,6 @@ class LLMServerClient:
         if getattr(self.config.actor_rollout_ref.rollout, "full_determinism", False):
             return request_id
         return uuid4().hex
-
-    async def stream_teacher_chunk(
-        self,
-        request_id: str,
-        *,
-        token_ids: list[int],
-        sampling_params: dict[str, Any],
-        terminal: bool,
-    ) -> dict[str, Any]:
-        """Append tokens to one sticky vLLM StreamingInput teacher session."""
-        resident = self._teacher_stream_servers.get(request_id)
-        if resident is None:
-            resident = await self._acquire_server(request_id)
-            self._teacher_stream_servers[request_id] = resident
-        server_id, server = resident
-        try:
-            result = await server.stream_teacher_chunk.remote(
-                request_id=request_id,
-                token_ids=token_ids,
-                sampling_params=sampling_params,
-                terminal=terminal,
-            )
-        except BaseException:
-            self._teacher_stream_servers.pop(request_id, None)
-            self._release_server(server_id)
-            raise
-        if terminal:
-            self._teacher_stream_servers.pop(request_id, None)
-            self._release_server(server_id)
-        return result
 
     @rollout_trace_op
     async def generate(
@@ -295,15 +261,6 @@ class LLMServerClient:
         """
         server_id, server = await self._acquire_server(request_id)
         try:
-            streamopd_enabled = bool(kwargs.pop("streamopd_enabled", False))
-            if streamopd_enabled:
-                callback = getattr(self, "streamopd_callback", None)
-                chunk_size = getattr(self, "streamopd_chunk_size", None)
-                if callback is None or chunk_size is None:
-                    raise RuntimeError("StreamOPD-KV client callback was not configured")
-                kwargs["streamopd_callback"] = callback
-                kwargs["streamopd_chunk_size"] = chunk_size
-                kwargs["streamopd_page_size"] = getattr(self, "streamopd_page_size", 1)
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data
@@ -709,89 +666,6 @@ class LLMServerManager:
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""
         return self.rollout_replicas
-
-    @auto_await
-    async def reset_device_memory_stats(self) -> None:
-        await asyncio.gather(
-            *(server.collective_rpc.remote("reset_device_memory_stats") for server in self.server_handles)
-        )
-
-    @auto_await
-    async def collect_device_memory_stats(self) -> dict[str, int]:
-        responses = await asyncio.gather(
-            *(server.collective_rpc.remote("get_device_memory_stats") for server in self.server_handles)
-        )
-        worker_stats = [stats for response in responses for stats in (response or [])]
-        if not worker_stats:
-            raise RuntimeError("Rollout vLLM workers returned no device memory statistics")
-        result = {
-            key: max(int(stats[key]) for stats in worker_stats)
-            for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
-        }
-        result["free_bytes"] = min(int(stats["free_bytes"]) for stats in worker_stats)
-        result["total_bytes"] = min(int(stats["total_bytes"]) for stats in worker_stats)
-        return result
-
-    @auto_await
-    async def collect_kv_cache_capacity_tokens(self) -> int:
-        """Return total logical KV capacity across Rollout replicas."""
-
-        responses = await asyncio.gather(
-            *(server.collective_rpc.remote("get_kv_cache_capacity") for server in self.server_handles)
-        )
-        replica_capacities = []
-        for response in responses:
-            worker_capacities = [int(stats["capacity_tokens"]) for stats in (response or [])]
-            if not worker_capacities:
-                raise RuntimeError("Rollout vLLM workers returned no KV cache capacity")
-            replica_capacities.append(min(worker_capacities))
-        if not replica_capacities:
-            raise RuntimeError("StreamOPD Rollout has no vLLM replicas")
-        return sum(replica_capacities)
-
-    @auto_await
-    async def reset_streamopd_kv_transfer_stats(self) -> None:
-        await asyncio.gather(
-            *(server.collective_rpc.remote("reset_streamopd_kv_transfer_stats") for server in self.server_handles)
-        )
-
-    @auto_await
-    async def collect_streamopd_kv_transfer_stats(self) -> dict[str, float]:
-        responses = await asyncio.gather(
-            *(server.collective_rpc.remote("get_streamopd_kv_transfer_stats") for server in self.server_handles)
-        )
-        worker_stats = [stats for response in responses for stats in (response or []) if stats]
-        if not worker_stats:
-            raise RuntimeError("Rollout vLLM workers returned no StreamOPD KV transfer statistics")
-        sum_keys = (
-            "copy_chunks",
-            "copy_bytes",
-            "copy_calls",
-            "block_runs",
-            "staging_wait_seconds",
-            "copy_enqueue_seconds",
-            "gpu_gather_seconds",
-            "gpu_d2h_seconds",
-            "gpu_copy_seconds",
-            "d2h_wait_seconds",
-            "host_commit_seconds",
-            "terminal_wait_seconds",
-        )
-        max_keys = ("max_staging_wait_seconds", "max_outstanding_writes")
-        return {
-            **{key: sum(float(stats[key]) for stats in worker_stats) for key in sum_keys},
-            **{key: max(float(stats[key]) for stats in worker_stats) for key in max_keys},
-        }
-
-    @auto_await
-    async def wait_for_streamopd_kv_transfers(self) -> float:
-        """Wait until every Rollout worker has sealed its Host KV slots."""
-
-        responses = await asyncio.gather(
-            *(server.collective_rpc.remote("wait_for_streamopd_kv_transfers") for server in self.server_handles)
-        )
-        waits = [float(value) for response in responses for value in (response or [])]
-        return max(waits, default=0.0)
 
     @auto_await
     async def start_profile(self, **kwargs):

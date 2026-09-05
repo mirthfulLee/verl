@@ -11,6 +11,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+TRANSFER_SUM_KEYS = (
+    "copy_chunks",
+    "copy_bytes",
+    "copy_calls",
+    "block_runs",
+    "staging_wait_seconds",
+    "copy_enqueue_seconds",
+    "gpu_gather_seconds",
+    "gpu_d2h_seconds",
+    "gpu_copy_seconds",
+    "d2h_wait_seconds",
+    "host_commit_seconds",
+    "terminal_wait_seconds",
+)
+TRANSFER_MAX_KEYS = ("max_staging_wait_seconds", "max_outstanding_writes")
+
 
 @dataclass(frozen=True, order=True)
 class TrajectoryKey:

@@ -509,7 +509,6 @@ class AgentLoopWorker:
                     self.tokenizer,
                     self.hf_model_type,
                     self.teacher_server_manager,
-                    self.llm_client,
                 )
             else:
                 self._streamopd = None
@@ -687,7 +686,8 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             run_kwargs = dict(kwargs)
-            run_kwargs["_streamopd_validate"] = trajectory["validate"]
+            if getattr(self, "_streamopd", None) is not None:
+                run_kwargs["_rollout_kwargs"] = {} if trajectory["validate"] else self._streamopd.rollout_kwargs
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -49,7 +50,8 @@ class _FakeServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
-        del request_id, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs, kwargs
+        self.last_kwargs = kwargs
+        del request_id, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs
         # Return a short, deterministic "generation" for testing.
         return TokenOutput(token_ids=prompt_ids[-1:] + [11, 12, 13], log_probs=[0.0, 0.0, 0.0, 0.0])
 
@@ -177,13 +179,15 @@ def test_agent_loop_output_as_dict_promotes_transfer_queue_fields():
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeypatch):
+@pytest.mark.parametrize(("streaming", "validate"), [(False, False), (True, False), (True, True)])
+async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeypatch, streaming, validate):
     captured_kwargs: dict[str, Any] = {}
     expected_output = object()
+    run_kwargs = {}
 
     class _FakeAgentLoop:
         async def run(self, sampling_params: dict[str, Any], **kwargs):
-            del sampling_params, kwargs
+            run_kwargs.update(kwargs)
             return expected_output
 
     def fake_instantiate(*, config, **kwargs):
@@ -203,6 +207,7 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
     worker.hf_model_type = "qwen2_5_vl"
     worker.dataset_cls = RLHFDataset
     worker.tools = []
+    worker._streamopd = SimpleNamespace(rollout_kwargs={"streamopd_callback": "callback"}) if streaming else None
 
     async def passthrough_postprocess(output, validate, **kwargs):
         del validate, kwargs
@@ -211,7 +216,7 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
     worker._agent_loop_postprocess = passthrough_postprocess
     result = await worker._run_agent_loop(
         {},
-        {"step": 0, "sample_index": 0, "rollout_n": 0, "validate": False},
+        {"step": 0, "sample_index": 0, "rollout_n": 0, "validate": validate},
         agent_name="scalar_model_type_test",
     )
 
@@ -219,6 +224,10 @@ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeyp
     assert captured_kwargs["hf_model_type"] == "qwen2_5_vl"
     assert isinstance(captured_kwargs["hf_model_type"], str)
     assert "hf_config" not in captured_kwargs
+    if streaming:
+        assert run_kwargs["_rollout_kwargs"] == ({} if validate else worker._streamopd.rollout_kwargs)
+    else:
+        assert "_rollout_kwargs" not in run_kwargs
 
 
 def _pad_1d(ids: list[int], *, length: int, pad_id: int = 0) -> list[int]:
@@ -273,7 +282,8 @@ def _to_internal(
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
+@pytest.mark.parametrize("rollout_kwargs", [{}, {"streamopd_callback": "callback", "streamopd_chunk_size": 64}])
+async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(rollout_kwargs):
     # Minimal config surface used by the agent loops.
     config = OmegaConf.create(
         {
@@ -309,7 +319,8 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     raw_prompt = [{"role": "user", "content": "hi"}]
     sampling_params: dict[str, Any] = {}
 
-    out = await single_turn.run(sampling_params=sampling_params, raw_prompt=raw_prompt)
+    out = await single_turn.run(sampling_params=sampling_params, raw_prompt=raw_prompt, _rollout_kwargs=rollout_kwargs)
+    assert server_manager.last_kwargs == {"priority": 0, **rollout_kwargs}
 
     # Agent loop outputs should always contain these fields with consistent types.
     assert out.extra_fields["turn_scores"] == []

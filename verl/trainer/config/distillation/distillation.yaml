@@ -13,14 +13,14 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
-# Generic sync-baseline placement option. StreamOPD uses its own two-pool
-# topology and does not read this setting.
+# Generic sync-baseline placement option. StreamOPD uses its own Trainer placement
+# setting and does not read this setting.
 colocate_teacher_with_student: false
 
-# Two-pool strict OPD with committed-token teacher streaming and rollout KV reuse.
+# Placement-aware strict OPD with committed-token teacher streaming and rollout KV reuse.
 # The MVP is opt-in and supports text-only, single-teacher Qwen3 jobs on vLLM.
 streamopd_kv:
-  _target_: verl.workers.config.StreamOPDKVConfig
+  _target_: verl.experimental.streamopd_kv.config.StreamOPDKVConfig
   enabled: false
   # Default user path. Use manual only for ablations and sensitivity studies.
   runtime_profile: auto
@@ -84,7 +84,7 @@ distillation_loss:
   use_chunked_topk: false
 
   # Token rows per normalized-vocabulary chunk when use_chunked_topk is enabled.
-  chunked_topk_chunk_size: 512
+  chunked_topk_chunk_size: 4096
 
   # Whether to incorporate distillation loss as a reward.
   use_policy_gradient: false

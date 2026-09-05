@@ -49,6 +49,7 @@ except ImportError:
 from verl.utils.device import get_torch_device
 
 from .host_slot_pool import HostKVSlotPool
+from .protocol import TRANSFER_MAX_KEYS, TRANSFER_SUM_KEYS
 from .snapshot_io import extract_vllm_nhd_token_range, gather_vllm_cross_layers_nhd_into
 
 if TYPE_CHECKING:
@@ -59,26 +60,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_TRANSFER_SUM_KEYS = (
-    "copy_chunks",
-    "copy_bytes",
-    "copy_calls",
-    "block_runs",
-    "staging_wait_seconds",
-    "copy_enqueue_seconds",
-    "gpu_gather_seconds",
-    "gpu_d2h_seconds",
-    "gpu_copy_seconds",
-    "d2h_wait_seconds",
-    "host_commit_seconds",
-    "terminal_wait_seconds",
-)
-_TRANSFER_MAX_KEYS = ("max_staging_wait_seconds", "max_outstanding_writes")
 _EXPORT_STRATEGIES = {"eos_host", "eos_triton", "incremental_triton"}
 
 
 def _empty_transfer_stats() -> dict[str, float]:
-    return {key: 0.0 for key in (*_TRANSFER_SUM_KEYS, *_TRANSFER_MAX_KEYS)}
+    return {key: 0.0 for key in (*TRANSFER_SUM_KEYS, *TRANSFER_MAX_KEYS)}
 
 
 def _layer_sort_key(name: str) -> tuple[int, str]:
@@ -120,6 +106,7 @@ class _SchedulerSaveState:
 class StreamOPDKVConnectorMetadata(KVConnectorMetadata):
     pending_saves: list[_PendingSave] = field(default_factory=list)
     has_model_work: bool = True
+    preempted_req_ids: set[str] = field(default_factory=set)
 
 
 class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
@@ -242,11 +229,10 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._export_strategy == "eos_host":
-            logger.warning(
+            raise RuntimeError(
                 "StreamOPD eos_host requires vLLM's uniform cross-layer cache; "
-                "falling back to eos_triton for this model"
+                "select eos_triton explicitly so preflight reserves its GPU gather workspace"
             )
-            self._export_strategy = "eos_triton"
         self._tp_rank = get_tensor_model_parallel_rank()
         self._tp_size = get_tensor_model_parallel_world_size()
         self._kv_caches = dict(kv_caches)
@@ -393,9 +379,13 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         pass
 
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+    def handle_preemptions(self, metadata: StreamOPDKVConnectorMetadata | set[str]) -> None:
         """Drain earlier incremental copies before vLLM reuses their pages."""
 
+        # Newer vLLM passes the connector metadata, while 0.15.1 passes ids.
+        preempted_req_ids = (
+            metadata.preempted_req_ids if isinstance(metadata, StreamOPDKVConnectorMetadata) else metadata
+        )
         for req_id in preempted_req_ids:
             for future in self._request_futures.get(req_id, ()):
                 future.result()
@@ -916,7 +906,7 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         capacity = min(len(group) * self._block_size for group in state.block_ids_by_group)
         if committed_end > capacity:
             raise RuntimeError(f"StreamOPD KV progress {committed_end} exceeds allocated block capacity {capacity}")
-        if getattr(self, "_export_strategy", "incremental_triton") != "incremental_triton" and not terminal:
+        if self._export_strategy != "incremental_triton" and not terminal:
             return
         published_before_terminal = state.published_tokens
         chunks_before_terminal = state.next_chunk_index
@@ -1025,6 +1015,7 @@ class StreamOPDKVConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = StreamOPDKVConnectorMetadata(
             pending_saves=list(self._pending),
             has_model_work=bool(scheduler_output.num_scheduled_tokens),
+            preempted_req_ids=set(scheduler_output.preempted_req_ids or ()),
         )
         self._pending.clear()
         return metadata

@@ -218,7 +218,7 @@ class MultiTeacherModelManager:
     async def sleep(self, level: int | None = None) -> None:
         await asyncio.gather(
             *(
-                replica.sleep(level=level)
+                (replica.sleep() if level is None else replica.sleep(level=level))
                 for manager in self.teacher_model_managers.values()
                 for replica in manager.rollout_replicas
             )
@@ -233,73 +233,3 @@ class MultiTeacherModelManager:
                 for replica in manager.rollout_replicas
             )
         )
-
-    @auto_await
-    async def reset_device_memory_stats(self) -> None:
-        await asyncio.gather(
-            *(
-                server.collective_rpc.remote("reset_device_memory_stats")
-                for manager in self.teacher_model_managers.values()
-                for server in manager.server_handles
-            )
-        )
-
-    @auto_await
-    async def collect_device_memory_stats(self) -> dict[str, int]:
-        responses = await asyncio.gather(
-            *(
-                server.collective_rpc.remote("get_device_memory_stats")
-                for manager in self.teacher_model_managers.values()
-                for server in manager.server_handles
-            )
-        )
-        worker_stats = [stats for response in responses for stats in (response or [])]
-        if not worker_stats:
-            raise RuntimeError("Teacher vLLM workers returned no device memory statistics")
-        result = {
-            key: max(int(stats[key]) for stats in worker_stats)
-            for key in ("allocated_bytes", "reserved_bytes", "max_allocated_bytes", "max_reserved_bytes")
-        }
-        result["free_bytes"] = min(int(stats["free_bytes"]) for stats in worker_stats)
-        result["total_bytes"] = min(int(stats["total_bytes"]) for stats in worker_stats)
-        return result
-
-    @auto_await
-    async def collect_kv_cache_capacity_tokens(self) -> int:
-        """Return total resumable-request KV capacity across Teacher replicas."""
-
-        responses = await asyncio.gather(
-            *(
-                server.collective_rpc.remote("get_kv_cache_capacity")
-                for manager in self.teacher_model_managers.values()
-                for server in manager.server_handles
-            )
-        )
-        replica_capacities = []
-        for response in responses:
-            worker_capacities = [int(stats["capacity_tokens"]) for stats in (response or [])]
-            if not worker_capacities:
-                raise RuntimeError("Teacher vLLM workers returned no KV cache capacity")
-            # TP workers shard bytes, but expose the same logical token capacity.
-            replica_capacities.append(min(worker_capacities))
-        if not replica_capacities:
-            raise RuntimeError("StreamOPD Teacher has no vLLM replicas")
-        return sum(replica_capacities)
-
-    @auto_await
-    async def trim_device_memory(self, minimum_free_bytes: int = 0) -> dict[str, int]:
-        """Release inactive Teacher allocator cache without touching live KV."""
-
-        responses = await asyncio.gather(
-            *(
-                server.collective_rpc.remote("trim_device_memory", args=(int(minimum_free_bytes),))
-                for manager in self.teacher_model_managers.values()
-                for server in manager.server_handles
-            )
-        )
-        stats = [stats for response in responses for stats in (response or [])]
-        return {
-            "freed_bytes": min((int(item["freed_bytes"]) for item in stats), default=0),
-            "free_before_bytes": min((int(item["free_before_bytes"]) for item in stats), default=0),
-            "free_after_bytes": min((int(item["free_after_bytes"]) for item in stats), default=0),
-        }

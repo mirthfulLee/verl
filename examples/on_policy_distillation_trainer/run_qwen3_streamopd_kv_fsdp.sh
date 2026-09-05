@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-STUDENT_MODEL=${STUDENT_MODEL:-/nasdata/Model/Qwen3-1.7B}
-TEACHER_MODEL=${TEACHER_MODEL:-/nasdata/Model/Qwen3-4B}
-DATASET=${DATASET:-/nasdata/Model/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet}
+STUDENT_MODEL=${STUDENT_MODEL:-Qwen/Qwen3-1.7B}
+TEACHER_MODEL=${TEACHER_MODEL:-Qwen/Qwen3-4B}
+DATASET=${DATASET:?Set DATASET to a training parquet file}
 # Aliases for verl's existing resource-pool options.
 TEACHER_GPUS=${TEACHER_GPUS:-2}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
@@ -13,6 +13,10 @@ USE_NO_SYNC_FOR_GRADIENT_ACCUMULATION=${USE_NO_SYNC_FOR_GRADIENT_ACCUMULATION:-T
 TRAINER_PLACEMENT=${TRAINER_PLACEMENT:-union}
 if [[ $TRAINER_PLACEMENT == union ]]; then
   STUDENT_GPUS=${STUDENT_GPUS:-$((TEACHER_GPUS + ROLLOUT_GPUS))}
+elif [[ $TRAINER_PLACEMENT == teacher ]]; then
+  STUDENT_GPUS=${STUDENT_GPUS:-$TEACHER_GPUS}
+elif [[ $TRAINER_PLACEMENT == rollout ]]; then
+  STUDENT_GPUS=${STUDENT_GPUS:-$ROLLOUT_GPUS}
 else
   STUDENT_GPUS=${STUDENT_GPUS:-2}
 fi
@@ -22,12 +26,7 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}
 
-# Compatibility hooks used by the matched baseline harness. Normal StreamOPD
-# runs leave these defaults unchanged; advanced studies use Hydra overrides.
-DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT=${DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT:-False}
-TRAINER_MODE=${TRAINER_MODE:-streamopd}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
-STREAMOPD_KV_ENABLED=${STREAMOPD_KV_ENABLED:-True}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-streamopd_kv_qwen3}
 
 if (( MAX_PROMPT_LENGTH < 1 || MAX_RESPONSE_LENGTH < 1 )); then
@@ -55,7 +54,7 @@ fi
   data.max_prompt_length="$MAX_PROMPT_LENGTH" \
   data.max_response_length="$MAX_RESPONSE_LENGTH" \
   data.filter_overlong_prompts=False \
-  data.custom_cls.path=benchmarks/streamopd_kv/dapo_math_dataset.py \
+  data.custom_cls.path=examples/on_policy_distillation_trainer/dapo_math_dataset.py \
   data.custom_cls.name=DAPOMathDataset \
   actor_rollout_ref.model.path="$STUDENT_MODEL" \
   actor_rollout_ref.model.use_remove_padding=True \
@@ -74,7 +73,7 @@ fi
   actor_rollout_ref.rollout.n_gpus_per_node="$ROLLOUT_GPUS" \
   actor_rollout_ref.rollout.nnodes=1 \
   trainer.use_v1=True \
-  trainer.v1.trainer_mode="$TRAINER_MODE" \
+  trainer.v1.trainer_mode=streamopd \
   trainer.n_gpus_per_node="$STUDENT_GPUS" \
   trainer.nnodes=1 \
   trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
@@ -85,7 +84,6 @@ fi
   trainer.save_freq=-1 \
   trainer.logger=console \
   distillation.enabled=True \
-  distillation.colocate_teacher_with_student="$DISTILLATION_COLOCATE_TEACHER_WITH_STUDENT" \
   distillation.n_gpus_per_node="$TEACHER_GPUS" \
   distillation.nnodes=1 \
   distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL" \
@@ -94,7 +92,7 @@ fi
   distillation.distillation_loss.topk=32 \
   distillation.distillation_loss.use_task_rewards=False \
   distillation.distillation_loss.use_policy_gradient=False \
-  distillation.streamopd_kv.enabled="$STREAMOPD_KV_ENABLED" \
+  distillation.streamopd_kv.enabled=True \
   distillation.streamopd_kv.trainer_placement="$TRAINER_PLACEMENT" \
   "${RAY[@]}" \
   "$@"

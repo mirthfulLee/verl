@@ -23,6 +23,7 @@ existing verl resource options; StreamOPD does not introduce parallel GPU-count
 settings:
 
 ```bash
+DATASET=/path/to/train.parquet \
 TRAINER_PLACEMENT=union TEACHER_GPUS=2 ROLLOUT_GPUS=2 \
   bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh
 ```
@@ -39,7 +40,9 @@ checkpoint transport, and zero-valued reverse-plan sentinels from the global bat
 allocation, and placement. Existing verl options explicitly supplied as Hydra overrides are hard constraints rather
 than values for auto mode to replace. Auto mode never derives, rewrites, or passes `gpu_memory_utilization`. Each
 phase-exclusive vLLM worker sizes KV from the actual free bytes after CUDA/NCCL setup, activation/CUDA-graph profiling,
-and deterministic workspace reservations. It reserves no simultaneously active Trainer workspace because vLLM enters
+and deterministic workspace reservations. KV allocation is capped at the page-aligned worst case for the entire
+global policy batch on each replica, without assuming even routing or reducing feasible session concurrency.
+This avoids allocating unusable cache capacity for small jobs. It reserves no simultaneously active Trainer workspace because vLLM enters
 level-2 sleep before Trainer state and reverse slots are loaded. A worst-case Host KV backing check also runs before
 Rollout starts; auto mode uses
 `/dev/shm`, while an explicitly selected path fails closed if it lacks capacity. Teacher session admission is refined
@@ -55,7 +58,8 @@ model-name rule, so an infeasible chunk or batch width is rejected before the fi
 Set `distillation.streamopd_kv.runtime_profile=manual` only for ablations or
 parameter-sensitivity studies. Manual mode preserves every low-level setting,
 including engine utilization, chunk/page/group sizes, fixed-slot reserve,
-Teacher session caps, and prefetch depth. The resolved auto
+Teacher session caps, and prefetch depth. Zero-valued planning sentinels are still resolved; manual mode does not
+disable validation or the streaming Teacher protocol. The resolved auto
 values are logged under `streamopd/runtime_profile_*`.
 
 ## Supported envelope
@@ -75,13 +79,56 @@ The implementation fails closed outside the following configuration:
 The default `union` placement runs Teacher and Rollout on disjoint pools, then lends both pools to Trainer after
 their inference phases finish. `dedicated` keeps a separate Trainer pool for overlap experiments.
 
+## Runtime compatibility
+
+Use the repository's Python 3.12 / vLLM / FSDP environment (`uv sync --extra vllm --extra fsdp`).
+vLLM 0.24.0 supports the Teacher StreamingInput artifacts natively. The experimental `vllm_patch.py` also retains
+a narrowly scoped compatibility patch for vLLM 0.15.1; it is installed only on StreamOPD Teacher workers.
+The older CUDA 12.8 development environment is optional and is not the repository's default dependency stack.
+
+The default `eos_host` exporter requires vLLM's uniform cross-layer cache. Its Rollout server selects
+`VLLM_USE_V2_MODEL_RUNNER=0` before creating the engine; the selection is local to that server and its children.
+An explicit incompatible runner selection fails before startup. The `eos_triton` and `incremental_triton` exporters
+remain available for controlled ablations and other supported cache layouts. Select them explicitly so the memory
+planner reserves their GPU gather workspace; `eos_host` never silently switches to a GPU gather implementation.
+Only `eos_host` is used by the default EOS-only pipeline described below.
+
+For `trainer_placement=rollout` or `union`, `checkpoint_engine.backend=host` is required because Trainer publication
+must finish and offload before Rollout wakes. Other placements can use a cross-process checkpoint backend.
+The configured reverse slot must cover the complete prompt/response upper bounds. Invalid page sizes, missing or
+multiple effective teachers, non-vLLM teachers, and incomplete GPU replica allocations are rejected during config
+preparation, before starting model workers. Named teachers follow verl's existing convention: adding a custom teacher
+entry replaces the `teacher_model` template, and auto mode preserves overrides using the custom entry's actual path.
+
+## Code ownership
+
+| Component | Responsibility |
+| --- | --- |
+| `config.py`, `planning.py`, `placement.py` | Configuration schema, startup validation, memory plans, and GPU placement |
+| `publisher.py`, `streaming_teacher.py`, `scheduler.py` | Committed token coverage, Teacher sessions, and policy barriers |
+| `vllm_connector.py`, `host_slot_pool.py`, `snapshot_io.py` | KV export, generation-checked Host slots, and tensor views |
+| `qwen3.py`, `reverse_attention.py`, `fsdp_worker.py`, `ray_worker.py` | Reverse chain rule, fixed GPU slots, and actor worker |
+| `teacher_client.py`, `vllm_teacher.py` | Sticky Teacher leases and resumable vLLM input/output sessions |
+| `replica_group.py` | Shared Teacher/Rollout telemetry, capacity accounting, and KV export barriers |
+| `checkpoint.py` | Serialized weight handoff for shared Trainer/Rollout pools |
+| `vllm_patch.py` | Opt-in, version-specific vLLM integration |
+| `verl/trainer/ppo/v1/trainer_streamopd.py` | V1 trainer registration and orchestration through base trainer hooks |
+
+The public `verl.workers.config.StreamOPDKVConfig` import remains an alias for the experimental schema. General V1
+trainer hooks retain their baseline defaults. The ordinary LLM client has no streaming-session state; the Teacher
+RPC lazily constructs its experimental service. The standard checkpoint manager retains its concurrent update
+sequence, while `checkpoint.py` reuses its worker-group and finalization methods for shared-pool handoff. FSDP1
+single-sender shard gathering belongs to the Host checkpoint backend, leaving the FSDP engine's parameter export
+unchanged from upstream. The example's DAPO adapter lives beside the example; benchmark-only
+ragged response controls extend that adapter in `benchmarks/streamopd_kv`.
+
 ## Streaming path
 
 1. `CommittedChunkPublisher` observes cumulative vLLM output and publishes committed token ranges to Teacher during
    generation. The first teacher input budget includes the complete prompt plus the initial response prefix; later
    resumable chunks contain only newly committed response tokens. Rollout KV export is deliberately independent of
    this path and starts only after the complete trajectory reaches EOS.
-2. `StreamingTeacherCoordinator` submits chunks to the central scheduler. vLLM 0.15.1 resumable `StreamingInput`
+2. `StreamingTeacherCoordinator` submits chunks to the central scheduler. vLLM resumable `StreamingInput`
    sessions retain causal teacher KV across fragments. Contiguous queued fragments may be coalesced without changing
    token coverage. A session reservation is held until EOS; releasing it immediately permits another trajectory to
    use the bounded teacher KV capacity.
@@ -126,7 +173,8 @@ their inference phases finish. `dedicated` keeps a separate Trainer pool for ove
    Reverse candidates maximize the useful `batch * chunk` token tile. Equal tiles avoid a singleton batch and then
    prefer the longer chunk. The hot path performs no allocator query, OOM retry, tensor growth, or kernel-shape
    adaptation.
-8. Raw gradients accumulate across the complete global batch. Parameters stay at `theta_k` until all rollout,
+8. Raw gradients accumulate across the complete global batch. After the final optimizer step their storage is released
+   before inference wakes; intermediate units retain gradients. Parameters stay at `theta_k` until all rollout,
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
 9. When Trainer shares the Rollout pool, Host checkpoint publication is phase-exclusive: Rollout enters level-2 sleep,
@@ -200,3 +248,24 @@ different prefill partitioning. `VLLM_BATCH_INVARIANT=1` with an explicitly sele
 bitwise correctness oracle for StreamingInput tests; it is not a production default because its deterministic GEMM
 and attention paths reduce Teacher throughput. In batch-invariant mode, multi-fragment Teacher artifacts match the
 full request exactly, including across fragment boundaries.
+
+## Validation
+
+Tests are organized by component under `tests/experimental/streamopd_kv`. Run CPU protocol/config/transport tests with:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run --no-sync pytest -q tests/experimental/streamopd_kv
+```
+
+GPU tests compare reverse loss and gradients against a full-sequence Qwen3 forward and check fixed-slot page reuse
+and prefetch. They build a small Qwen3 model locally by default, so no checkpoint download is required:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync pytest -q tests/experimental/streamopd_kv/test_qwen3_reverse_on_gpu.py
+```
+
+Set `STREAMOPD_TEST_MODEL_PATH=/path/to/Qwen3` to repeat the numerical comparison with a local pretrained model.
+Runtime Teacher artifact validation compares every supervised row; the final native-API dummy row has no target
+and is excluded. For Teacher fragment-boundary validation and end-to-end benchmark commands, see
+[the benchmark guide](../../../benchmarks/streamopd_kv/README.md). These numerical and smoke checks do not establish
+throughput gains; performance comparisons require matched resource allocations and execution settings.

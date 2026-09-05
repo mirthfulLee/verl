@@ -14,6 +14,14 @@ This trainer jointly trains a student model with policy-gradient on-policy rollo
 Override `STUDENT_MODEL` and `TEACHER_MODEL` via env vars to swap model pairs in
 the single-teacher scripts. The MOPD script exposes per-teacher overrides.
 
+## Experimental StreamOPD
+
+`run_qwen3_streamopd_kv_fsdp.sh` runs strict direct `forward_kl_topk` distillation using the V1 StreamOPD trainer.
+It streams committed student tokens to one Teacher and reuses exported Rollout KV for reverse training.
+Set `DATASET` to a training parquet file and use `STUDENT_MODEL` / `TEACHER_MODEL` for local paths or Hugging Face IDs.
+See the [StreamOPD guide](../../verl/experimental/streamopd_kv/README.md) for supported placements, dependencies,
+configuration, and tests. The benchmark comparison controls live in `benchmarks/streamopd_kv`.
+
 ## Key Flags
 
 - `distillation.enabled=True`

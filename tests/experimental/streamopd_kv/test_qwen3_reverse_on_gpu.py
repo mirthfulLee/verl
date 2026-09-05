@@ -19,7 +19,7 @@ from verl.experimental.streamopd_kv import Qwen3ReverseTrainer
 from verl.experimental.streamopd_kv.reverse_attention import ReverseKVSlotPool
 from verl.experimental.streamopd_kv.snapshot_io import HostSlotLayerKV
 
-MODEL_PATH = os.environ.get("STREAMOPD_TEST_MODEL_PATH", "/models/store/Qwen/Qwen3-0.6B")
+MODEL_PATH = os.environ.get("STREAMOPD_TEST_MODEL_PATH")
 
 
 def _capture_host_kv(model, input_ids: torch.Tensor) -> list[HostSlotLayerKV]:
@@ -59,20 +59,34 @@ class _CrossEntropy:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not os.path.isdir(MODEL_PATH), reason="local Qwen3 model is unavailable")
+@pytest.mark.skipif(
+    bool(MODEL_PATH) and not os.path.isdir(MODEL_PATH), reason="requested local Qwen3 model is unavailable"
+)
 def test_qwen3_fixed_slot_wavefront_matches_full_sequence() -> None:
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
     torch.manual_seed(23)
-    baseline = (
-        AutoModelForCausalLM.from_pretrained(
+    if MODEL_PATH:
+        baseline = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH,
             dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
-        .cuda()
-        .eval()
-    )
+    else:
+        # Keep the chain-rule test runnable in GPU CI without a model download.
+        config = Qwen3Config(
+            vocab_size=256,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            max_position_embeddings=256,
+        )
+        config._attn_implementation = "sdpa"
+        baseline = Qwen3ForCausalLM(config).to(dtype=torch.bfloat16)
+    baseline = baseline.cuda().eval()
     reverse = copy.deepcopy(baseline).cuda().eval()
     tokens = [
         torch.arange(1, 67, device="cuda").unsqueeze(0),

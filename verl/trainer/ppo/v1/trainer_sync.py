@@ -26,35 +26,26 @@ def _stage_timing_metrics_from_tags(
     tags: list[dict], *, policy_started_at: float, training_seconds: float
 ) -> dict[str, float]:
     tags = [tag for tag in tags if not tag.get("is_padding", False)]
-    rollout_tags = [tag for tag in tags if "_stage_rollout_started_at" in tag and "_stage_rollout_completed_at" in tag]
     metrics = {"stage/training_seconds": float(training_seconds)}
-    if rollout_tags:
-        rollout_started_at = min(float(tag["_stage_rollout_started_at"]) for tag in rollout_tags)
-        rollout_completed_at = max(float(tag["_stage_rollout_completed_at"]) for tag in rollout_tags)
-        request_seconds = [float(tag["_stage_rollout_request_seconds"]) for tag in rollout_tags]
+    completed = {}
+    for stage in ("rollout", "teacher"):
+        start_key, end_key = f"_stage_{stage}_started_at", f"_stage_{stage}_completed_at"
+        stage_tags = [tag for tag in tags if start_key in tag and end_key in tag]
+        if not stage_tags:
+            continue
+        started = min(float(tag[start_key]) for tag in stage_tags)
+        completed[stage] = max(float(tag[end_key]) for tag in stage_tags)
+        durations = [float(tag[f"_stage_{stage}_request_seconds"]) for tag in stage_tags]
         metrics.update(
             {
-                "stage/rollout_span_seconds": max(0.0, rollout_completed_at - rollout_started_at),
-                "stage/rollout_makespan_seconds": max(0.0, rollout_completed_at - policy_started_at),
-                "stage/rollout_request_seconds/mean": sum(request_seconds) / len(request_seconds),
-                "stage/rollout_request_seconds/max": max(request_seconds),
+                f"stage/{stage}_span_seconds": max(0.0, completed[stage] - started),
+                f"stage/{stage}_makespan_seconds": max(0.0, completed[stage] - policy_started_at),
+                f"stage/{stage}_request_seconds/mean": sum(durations) / len(durations),
+                f"stage/{stage}_request_seconds/max": max(durations),
             }
         )
-    teacher_tags = [tag for tag in tags if "_stage_teacher_started_at" in tag and "_stage_teacher_completed_at" in tag]
-    if teacher_tags:
-        teacher_started_at = min(float(tag["_stage_teacher_started_at"]) for tag in teacher_tags)
-        teacher_completed_at = max(float(tag["_stage_teacher_completed_at"]) for tag in teacher_tags)
-        request_seconds = [float(tag["_stage_teacher_request_seconds"]) for tag in teacher_tags]
-        metrics.update(
-            {
-                "stage/teacher_span_seconds": max(0.0, teacher_completed_at - teacher_started_at),
-                "stage/teacher_makespan_seconds": max(0.0, teacher_completed_at - policy_started_at),
-                "stage/teacher_request_seconds/mean": sum(request_seconds) / len(request_seconds),
-                "stage/teacher_request_seconds/max": max(request_seconds),
-            }
-        )
-        if rollout_tags:
-            metrics["stage/teacher_tail_seconds"] = max(0.0, teacher_completed_at - rollout_completed_at)
+    if "teacher" in completed and "rollout" in completed:
+        metrics["stage/teacher_tail_seconds"] = max(0.0, completed["teacher"] - completed["rollout"])
     return metrics
 
 

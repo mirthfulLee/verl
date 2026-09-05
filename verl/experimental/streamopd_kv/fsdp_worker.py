@@ -974,5 +974,9 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 metrics["streamopd/full_forward_validation_loss"] - metrics["loss"]
             )
         if finalize:
-            self._reset_accumulation(zero_grad=False)
+            # Accumulation spans controller units, so the train context cannot
+            # clear gradients on every exit. Once the optimizer has stepped,
+            # release them explicitly: FSDP1 parameter offload does not move
+            # gradient storage, which would otherwise occupy a shared vLLM pool.
+            self._reset_accumulation(zero_grad=True)
         return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

@@ -185,13 +185,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset",
-        default=(
-            "/data1/models/hf/datasets--open-r1--DAPO-Math-17k-Processed/snapshots/"
-            "31dd309567e3da778038cc87d868b6097a3ccf68/en/train-00000-of-00001.parquet"
-        ),
+        default="/nasdata/Model/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet",
     )
-    parser.add_argument("--student", default="/models/store/Qwen/Qwen3-1.7B")
-    parser.add_argument("--teacher", default="/models/store/Qwen/Qwen3-4B")
+    parser.add_argument("--student", default="/nasdata/Model/Qwen3-1.7B")
+    parser.add_argument("--teacher", default="/nasdata/Model/Qwen3-4B")
     parser.add_argument("--student-device", default="cuda:0")
     parser.add_argument("--teacher-device", default="cuda:1")
     parser.add_argument("--student-dtype", choices=DTYPES, default="bfloat16")

@@ -26,8 +26,10 @@ streamopd_kv:
   runtime_profile: auto
   planner_explicit_options: []
   token_chunk_size: 256
-  trainer_placement: teacher
-  scheduler_policy: adaptive
+  rollout_kv_export_strategy: eos_host
+  rollout_kv_export_chunk_size: 0
+  rollout_kv_writer_threads: 4
+  trainer_placement: union
   # Zero selects the largest shape admitted by preflight memory planning.
   reverse_chunk_size: 0
   reverse_chunk_min_size: 0
@@ -77,6 +79,12 @@ distillation_loss:
 
   # Optional min clamp value for log probabilities for stability, e.g., log q - log p where p or q are very close to zero.
   log_prob_min_clamp: null
+
+  # Bound forward_kl_topk normalization memory by recomputing vocabulary chunks in backward.
+  use_chunked_topk: false
+
+  # Token rows per normalized-vocabulary chunk when use_chunked_topk is enabled.
+  chunked_topk_chunk_size: 512
 
   # Whether to incorporate distillation loss as a reward.
   use_policy_gradient: false

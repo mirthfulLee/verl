@@ -19,7 +19,7 @@ from verl.experimental.streamopd_kv import Qwen3ReverseTrainer
 from verl.experimental.streamopd_kv.reverse_attention import ReverseKVSlotPool
 from verl.experimental.streamopd_kv.snapshot_io import HostSlotLayerKV
 
-MODEL_PATH = "/models/store/Qwen/Qwen3-0.6B"
+MODEL_PATH = os.environ.get("STREAMOPD_TEST_MODEL_PATH", "/models/store/Qwen/Qwen3-0.6B")
 
 
 def _capture_host_kv(model, input_ids: torch.Tensor) -> list[HostSlotLayerKV]:
@@ -97,13 +97,13 @@ def test_qwen3_fixed_slot_wavefront_matches_full_sequence() -> None:
         num_layers=len(sources[0]),
         num_kv_heads=first.key.shape[1],
         head_dim=first.key.shape[-1],
-        page_size=16,
+        page_size=8,
         dtype=torch.bfloat16,
         device="cuda",
     )
     slots.prepare_next(sources, [sequence.shape[1] for sequence in sequences], padded_lengths)
     slots.activate_next()
-    result = Qwen3ReverseTrainer(reverse, chunk_size=16, page_size=16).backward(
+    result = Qwen3ReverseTrainer(reverse, chunk_size=16, page_size=8).backward(
         sequences,
         losses,
         state=slots.state(),
@@ -115,6 +115,8 @@ def test_qwen3_fixed_slot_wavefront_matches_full_sequence() -> None:
     assert result.chunks == 8
     assert result.backward_calls == 5
     assert result.lm_head_tokens < result.dense_lm_head_tokens
+    assert result.dense_lm_head_tokens == 120
+    assert result.padded_model_tokens == 128
     parameter_name = "model.layers.0.self_attn.q_proj.weight"
     expected = dict(baseline.named_parameters())[parameter_name].grad.float()
     actual = dict(reverse.named_parameters())[parameter_name].grad.float()
@@ -158,7 +160,6 @@ def test_reverse_slot_reuses_released_pages_without_reallocation() -> None:
         (layer.key.data_ptr(), layer.value.data_ptr(), layer.key_grad.data_ptr(), layer.value_grad.data_ptr())
         for layer in pool.layers
     ]
-
     pool.prepare_next(following, [48, 64], [48, 64])
     for active, start, end in (([0], 48, 64), ([0], 32, 48), ([0, 1], 16, 32), ([0, 1], 0, 16)):
         pool.release_current_range(active, start, end)
@@ -174,3 +175,131 @@ def test_reverse_slot_reuses_released_pages_without_reallocation() -> None:
     for row, trajectory in enumerate(following):
         for layer_idx, trace in enumerate(trajectory):
             torch.testing.assert_close(pool.layers[layer_idx].key[row, : trace.length], trace.key.cuda())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_reverse_slot_prefetches_one_chunk_group_into_inactive_kv() -> None:
+    torch.manual_seed(30)
+
+    def sources(lengths: list[int]) -> list[list[HostSlotLayerKV]]:
+        return [
+            [
+                HostSlotLayerKV(
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16, pin_memory=True),
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16, pin_memory=True),
+                )
+                for _ in range(2)
+            ]
+            for length in lengths
+        ]
+
+    current = sources([64, 32])
+    following = sources([48, 64])
+    pool = ReverseKVSlotPool(
+        batch_size=2,
+        token_capacity=64,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=16,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device="cuda",
+        prefetch_kv=True,
+    )
+    pool.prepare_next(current, [64, 32], [64, 32])
+    pool.activate_next()
+    active_addresses = [
+        (layer.key.data_ptr(), layer.value.data_ptr(), layer.key_grad.data_ptr(), layer.value_grad.data_ptr())
+        for layer in pool.layers
+    ]
+    assert pool._inactive_layers is not None
+    inactive_addresses = [(layer.key.data_ptr(), layer.value.data_ptr()) for layer in pool._inactive_layers]
+
+    pool.prepare_next(following, [48, 64], [48, 64])
+    for active, start, end in (([0], 48, 64), ([0], 32, 48), ([0, 1], 16, 32), ([0, 1], 0, 16)):
+        pool.release_current_range(active, start, end)
+    pool.finish_current()
+    pool.activate_next()
+
+    assert inactive_addresses == [(layer.key.data_ptr(), layer.value.data_ptr()) for layer in pool.layers]
+    assert [(key_grad, value_grad) for _, _, key_grad, value_grad in active_addresses] == [
+        (layer.key_grad.data_ptr(), layer.value_grad.data_ptr()) for layer in pool.layers
+    ]
+    assert pool.slot_bytes == pool.kv_pair_bytes * 3
+    assert pool.next_loaded_pages == 7
+    assert pool.copy_cuda_seconds(reused_only=True) > 0
+    for row, trajectory in enumerate(following):
+        for layer_idx, trace in enumerate(trajectory):
+            torch.testing.assert_close(pool.layers[layer_idx].key[row, : trace.length], trace.key.cuda())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_reverse_slot_reuses_one_pinned_group_for_pageable_sources() -> None:
+    torch.manual_seed(31)
+
+    def sources(lengths: list[int]) -> list[list[HostSlotLayerKV]]:
+        return [
+            [
+                HostSlotLayerKV(
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16),
+                    torch.randn((length, 2, 16), dtype=torch.bfloat16),
+                )
+                for _ in range(2)
+            ]
+            for length in lengths
+        ]
+
+    first = sources([64, 32])
+    following = sources([48, 64])
+    pool = ReverseKVSlotPool(
+        batch_size=2,
+        token_capacity=64,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=16,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    pool.prepare_next(first, [64, 32], [64, 32])
+    pool.activate_next()
+    pinned_addresses = [(layer.key.data_ptr(), layer.value.data_ptr()) for layer in pool._pinned_layers or ()]
+    assert pinned_addresses
+    assert pool.pinned_staging_groups == 1
+
+    pool.prepare_next(following, [48, 64], [48, 64])
+    for active, start, end in (([0], 48, 64), ([0], 32, 48), ([0, 1], 16, 32), ([0, 1], 0, 16)):
+        pool.release_current_range(active, start, end)
+    pool.finish_current()
+    pool.activate_next()
+
+    assert pinned_addresses == [(layer.key.data_ptr(), layer.value.data_ptr()) for layer in pool._pinned_layers or ()]
+    assert pool.pinned_staging_groups == 2
+    assert pool.pinned_staging_bytes == (64 + 32 + 48 + 64) * 2 * 2 * 16 * 2 * 2
+    assert pool.pinned_staging_capacity_bytes == pool.slot_bytes // 2
+    for row, trajectory in enumerate(following):
+        for layer_idx, trace in enumerate(trajectory):
+            torch.testing.assert_close(pool.layers[layer_idx].key[row, : trace.length], trace.key.cuda())
+
+    pool.release_current_range([0], 0, 48)
+    pool.release_current_range([1], 0, 64)
+    pool.finish_current()
+    pool.copy_executor.shutdown(wait=True)
+    pinned_layers = pool.detach_pinned_layers()
+    replacement = ReverseKVSlotPool(
+        batch_size=2,
+        token_capacity=64,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=16,
+        page_size=16,
+        dtype=torch.bfloat16,
+        device="cuda",
+        pinned_layers=pinned_layers,
+    )
+    replacement.prepare_next(first, [64, 32], [64, 32])
+    replacement.activate_next()
+    assert pinned_addresses == [
+        (layer.key.data_ptr(), layer.value.data_ptr()) for layer in replacement._pinned_layers or ()
+    ]
+    assert replacement.pinned_staging_allocation_seconds == 0

@@ -23,16 +23,12 @@ from transfer_queue import KVBatchMeta
 from verl.experimental.streamopd_kv.host_slot_pool import cleanup_host_kv_pools
 from verl.experimental.streamopd_kv.placement import TrainerPlacement
 from verl.experimental.streamopd_kv.planning import (
-    checkpoint_weight_bytes,
     kv_bytes_per_token,
-    minimum_device_total_bytes,
     partition_training_units,
     plan_host_kv,
     plan_teacher_admission,
-    plan_vllm_memory,
-    planned_reverse_required_free_gib,
+    plan_training_unit_size,
     planned_reverse_width,
-    shared_vllm_utilization_limit,
 )
 from verl.experimental.streamopd_kv.ray_worker import StreamOPDActorWorker
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
@@ -64,27 +60,18 @@ class PPOTrainerStreamOPD(PPOTrainer):
         self._scheduler = None
         self._policy_version: int | None = None
         self._training_unit_size = 1
+        self._reverse_wave_size = 1
+        self._teacher_replicas = 1
         self._teacher_admission_plan: dict[str, int] = {}
         self._teacher_memory_plan: dict[str, float] = {}
         self._rollout_memory_plan: dict[str, float] = {}
-        self._shared_reverse_batch_cap: int | None = None
-        self._shared_reverse_reserve_gib = 0.0
-        self._early_reverse_plan_result = None
-        self._reverse_runtime_required_free_gib = 0.0
+        self._shared_rollout_sleeping = False
+        self._trainer_state_offloaded = self.placement is not TrainerPlacement.DEDICATED
+        self._reverse_plan_result = None
         self._teacher_sleeping = False
         self._teacher_wake_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="streamopd-teacher-wake")
         self._teacher_wake_future: Future | None = None
         self._policy_lifecycle_metrics: dict[str, float] = {}
-        self._last_trimmed_teacher_chunks = -1
-
-    def _effective_scheduler_policy(self) -> str:
-        configured = str(self.config.distillation.streamopd_kv.scheduler_policy)
-        # Union Trainer work cannot begin before Rollout EOS and then shares
-        # the remaining Teacher resource. No compute overlap is possible, so
-        # interleaving only adds switches to an otherwise serial tail.
-        if configured == "adaptive" and self.placement is TrainerPlacement.UNION:
-            return "teacher_then_train"
-        return configured
 
     def _init_resource_pool_mgr(self) -> None:
         """Replace only the actor and placement mappings built by PPOTrainer."""
@@ -102,6 +89,10 @@ class PPOTrainerStreamOPD(PPOTrainer):
         if self.placement.shares_teacher:
             self.mapping[Role.TeacherModel] = "global_pool"
             resource_pool_spec.pop("teacher_pool", None)
+        if not self.placement.shares_rollout:
+            resource_pool_spec["rollout_pool"] = [int(self.config.actor_rollout_ref.rollout.n_gpus_per_node)] * int(
+                self.config.actor_rollout_ref.rollout.nnodes
+            )
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def _is_teacher_colocated(self) -> bool:
@@ -127,7 +118,6 @@ class PPOTrainerStreamOPD(PPOTrainer):
 
     def _create_llm_server_manager(self, actor_rollout_resource_pool) -> LLMServerManager:
         shared_rollout = self.placement.shares_rollout
-        stream_config = self.config.distillation.streamopd_kv
         rollout = self.config.actor_rollout_ref.rollout
         rollout_world_size = int(rollout.n_gpus_per_node) * int(rollout.nnodes)
         replica_world_size = (
@@ -144,73 +134,21 @@ class PPOTrainerStreamOPD(PPOTrainer):
             math.ceil(int(self.config.data.train_batch_size) / num_replicas),
         )
         auto_profile = str(self.config.distillation.streamopd_kv.runtime_profile) == "auto"
-        explicit_options = set(stream_config.get("planner_explicit_options", []))
-        configured_utilization = float(rollout.gpu_memory_utilization)
         rollout_offset = (
             int(self.config.distillation.n_gpus_per_node) if self.placement is TrainerPlacement.UNION else 0
         )
-
-        if shared_rollout:
-            checkpoint_config = rollout.checkpoint_engine
-            original_bucket_mb = int(checkpoint_config.update_weights_bucket_megabytes)
-            shared_bucket_mb = min(original_bucket_mb, 128)
-            sync_reserve_gib = max(1.0, 2 * shared_bucket_mb / 1024)
-            with open_dict(rollout):
-                checkpoint_config.update_weights_bucket_megabytes = shared_bucket_mb
-            slot_tokens = int(stream_config.reverse_slot_max_tokens)
-            max_group_tokens = min(8192, int(stream_config.reverse_batch_max_tokens))
-            max_rows = max(1, max_group_tokens // slot_tokens)
-            self._shared_reverse_batch_cap = 1 << (max_rows.bit_length() - 1)
-            self._shared_reverse_reserve_gib = sync_reserve_gib
-            self.actor_rollout_wg.configure_streamopd_reverse_preflight(
-                batch_cap=self._shared_reverse_batch_cap,
-                additional_reserve_gib=self._shared_reverse_reserve_gib,
-            )
-            self._early_reverse_plan_result = self.actor_rollout_wg.prepare_streamopd_reverse_plan()
-            self._reverse_runtime_required_free_gib = planned_reverse_required_free_gib(self._early_reverse_plan_result)
-
-        device_memory = self.actor_rollout_wg.get_streamopd_device_memory_stats()
-        total_memory = minimum_device_total_bytes(device_memory)
-        utilization_limit = configured_utilization
-        shared_limit: dict[str, float] = {}
-        if shared_rollout:
-            shared_limit = shared_vllm_utilization_limit(
-                device_memory,
-                rank_offset=rollout_offset,
-                world_size=rollout_world_size,
-                required_free_bytes=math.ceil(self._reverse_runtime_required_free_gib * 1024**3),
-            )
-            utilization_limit = min(utilization_limit, shared_limit["utilization_limit"])
 
         model_path = str(self.actor_model_config.local_path or self.actor_model_config.path)
         max_model_len = int(
             rollout.max_model_len or (self.config.data.max_prompt_length + self.config.data.max_response_length + 1)
         )
-        if auto_profile or shared_rollout:
-            utilization_path = "actor_rollout_ref.rollout.gpu_memory_utilization"
-            max_num_seqs_path = "actor_rollout_ref.rollout.max_num_seqs"
-            utilization_explicit = auto_profile and utilization_path in explicit_options
-            max_num_seqs_explicit = auto_profile and max_num_seqs_path in explicit_options
-            self._rollout_memory_plan = plan_vllm_memory(
-                total_memory_bytes=total_memory,
-                weight_bytes=checkpoint_weight_bytes(model_path),
-                kv_bytes_per_token=kv_bytes_per_token(model_path, str(rollout.dtype)),
-                requested_max_num_seqs=effective_max_num_seqs,
-                max_model_len=max_model_len,
-                utilization_limit=utilization_limit,
-                max_num_seqs_explicit=max_num_seqs_explicit,
-                utilization_explicit=utilization_explicit,
-            )
-            effective_max_num_seqs = int(self._rollout_memory_plan["max_num_seqs"])
-            self._rollout_memory_plan.update(
-                {
-                    "configured_max_num_seqs": float(configured_max_num_seqs),
-                    "configured_gpu_memory_utilization": configured_utilization,
-                    **{f"shared_{name}": value for name, value in shared_limit.items()},
-                }
-            )
+        self._rollout_memory_plan = {
+            "configured_max_num_seqs": float(configured_max_num_seqs),
+            "max_num_seqs": float(effective_max_num_seqs),
+            "exclusive_pool_memory": float(auto_profile),
+        }
+        if auto_profile:
             with open_dict(rollout):
-                rollout.gpu_memory_utilization = self._rollout_memory_plan["gpu_memory_utilization"]
                 rollout.max_num_seqs = effective_max_num_seqs
 
         self._rollout_memory_plan.update(
@@ -225,13 +163,16 @@ class PPOTrainerStreamOPD(PPOTrainer):
         if not shared_rollout:
             if self._rollout_memory_plan:
                 logger.info("StreamOPD dedicated Rollout memory preflight: %s", self._rollout_memory_plan)
-            return super()._create_llm_server_manager(actor_rollout_resource_pool)
+            return LLMServerManager.create(
+                config=self.config,
+                worker_group=None,
+                rollout_resource_pool=self.resource_pool_manager.resource_pool_dict["rollout_pool"],
+                colocate_without_worker_group=True,
+            )
 
         self._rollout_memory_plan.update(
             {
-                "checkpoint_bucket_mb": float(shared_bucket_mb),
-                "checkpoint_sync_reserve_gib": sync_reserve_gib,
-                "reverse_batch_cap": float(self._shared_reverse_batch_cap),
+                "checkpoint_bucket_mb": float(rollout.checkpoint_engine.update_weights_bucket_megabytes),
             }
         )
         if rollout_offset or rollout_world_size < actor_rollout_resource_pool.world_size:
@@ -255,82 +196,49 @@ class PPOTrainerStreamOPD(PPOTrainer):
         )
 
     def _prepare_teacher_runtime(self) -> None:
-        if self.placement.shares_teacher or str(self.config.distillation.streamopd_kv.runtime_profile) != "auto":
-            return
         teacher_model = next(iter(self.config.distillation.teacher_models.values()))
         inference = teacher_model.inference
-        total_memory = minimum_device_total_bytes(self.actor_rollout_wg.get_streamopd_device_memory_stats())
-        tp_size = int(inference.tensor_model_parallel_size)
+        teacher_world_size = int(self.config.distillation.n_gpus_per_node) * int(self.config.distillation.nnodes)
         replica_size = (
-            tp_size
+            int(inference.tensor_model_parallel_size)
             * int(inference.get("data_parallel_size", 1))
             * int(inference.get("pipeline_model_parallel_size", 1))
         )
-        teacher_world_size = int(self.config.distillation.n_gpus_per_node) * int(self.config.distillation.nnodes)
-        replicas = max(1, teacher_world_size // replica_size)
-        requested_max_num_seqs = min(
-            int(inference.max_num_seqs),
-            math.ceil(int(self.config.data.train_batch_size) / replicas),
-        )
-        explicit_options = set(self.config.distillation.streamopd_kv.get("planner_explicit_options", []))
-        utilization_path = "distillation.teacher_models.teacher_model.inference.gpu_memory_utilization"
-        max_num_seqs_path = "distillation.teacher_models.teacher_model.inference.max_num_seqs"
-        model_path = str(teacher_model.model_path)
-        self._teacher_memory_plan = plan_vllm_memory(
-            total_memory_bytes=total_memory,
-            weight_bytes=math.ceil(checkpoint_weight_bytes(model_path) / tp_size),
-            kv_bytes_per_token=kv_bytes_per_token(model_path, str(inference.dtype), tp_size),
-            requested_max_num_seqs=requested_max_num_seqs,
-            max_model_len=int(inference.max_model_len),
-            utilization_limit=float(inference.gpu_memory_utilization),
-            max_num_seqs_explicit=max_num_seqs_path in explicit_options,
-            utilization_explicit=utilization_path in explicit_options,
-        )
-        self._teacher_memory_plan.update(
-            {
-                "configured_max_num_seqs": float(inference.max_num_seqs),
-                "configured_gpu_memory_utilization": float(inference.gpu_memory_utilization),
-            }
-        )
-        with open_dict(inference):
-            inference.max_num_seqs = int(self._teacher_memory_plan["max_num_seqs"])
-            inference.gpu_memory_utilization = self._teacher_memory_plan["gpu_memory_utilization"]
-        logger.info("StreamOPD dedicated Teacher memory preflight: %s", self._teacher_memory_plan)
+        self._teacher_replicas = max(1, teacher_world_size // replica_size)
+        auto_profile = str(self.config.distillation.streamopd_kv.runtime_profile) == "auto"
+        self._teacher_memory_plan = {
+            "max_num_seqs": float(inference.max_num_seqs),
+            "exclusive_pool_memory": float(auto_profile),
+        }
+        topology = "shared" if self.placement.shares_teacher else "dedicated"
+        logger.info("StreamOPD %s Teacher launch plan: %s", topology, self._teacher_memory_plan)
 
     def on_init_end(self):
-        # All shape and memory plans are frozen before the first policy version.
-        if self._early_reverse_plan_result is None:
-            if self._shared_reverse_batch_cap is not None:
-                self.actor_rollout_wg.configure_streamopd_reverse_preflight(
-                    batch_cap=self._shared_reverse_batch_cap,
-                    additional_reserve_gib=self._shared_reverse_reserve_gib,
-                )
+        train_batch_size = int(self.config.data.train_batch_size)
+        if self.placement is TrainerPlacement.DEDICATED:
             plan_result = self.actor_rollout_wg.prepare_streamopd_reverse_plan()
+            self._configure_reverse_plan(plan_result)
+            self.actor_rollout_wg.allocate_streamopd_reverse_slots()
         else:
-            plan_result = self._early_reverse_plan_result
-        logger.info("StreamOPD reverse preflight: %s", plan_result)
-        self._reverse_runtime_required_free_gib = planned_reverse_required_free_gib(plan_result)
-        fallback = int(self.config.distillation.streamopd_kv.reverse_batch_size)
-        local_width = planned_reverse_width(plan_result, fallback)
-        try:
-            dp_mapping = self.actor_rollout_wg._query_dispatch_info("actor")
-            dp_size = max(dp_mapping) + 1
-        except (AttributeError, ValueError):
-            dp_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
-        self._training_unit_size = min(int(self.config.data.train_batch_size), local_width * dp_size)
-        self.parameter_sync_step = len(
-            partition_training_units(int(self.config.data.train_batch_size), self._training_unit_size)
-        )
+            # Sleeping vLLM processes retain CUDA contexts and graph pools.
+            # Plan after the first handoff against that real training headroom.
+            self._training_unit_size = train_batch_size
+            self.parameter_sync_step = 1
+
         stream_config = self.config.distillation.streamopd_kv
         teacher_config = next(iter(self.config.distillation.teacher_models.values())).inference
+        teacher_capacity_tokens = int(self.teacher_model_manager.collect_kv_cache_capacity_tokens())
+        rollout_capacity_tokens = int(self.llm_server_manager.collect_kv_cache_capacity_tokens())
+        self._teacher_memory_plan["vllm_capacity_tokens"] = float(teacher_capacity_tokens)
+        self._rollout_memory_plan["vllm_capacity_tokens"] = float(rollout_capacity_tokens)
         self._teacher_admission_plan = plan_teacher_admission(
-            expected_trajectories=int(self.config.data.train_batch_size),
+            expected_trajectories=train_batch_size,
             trajectory_tokens=int(stream_config.reverse_slot_max_tokens),
-            vllm_capacity_tokens=int(self.teacher_model_manager.collect_kv_cache_capacity_tokens()),
+            vllm_capacity_tokens=teacher_capacity_tokens,
             page_size=int(stream_config.teacher_prefill_kv_page_size),
             max_batched_tokens=int(teacher_config.max_num_batched_tokens or teacher_config.max_model_len),
             initial_chunk_tokens=int(stream_config.token_chunk_size),
-            train_launch_width=self._training_unit_size,
+            teacher_replicas=self._teacher_replicas,
             trajectory_cap=int(stream_config.teacher_prefill_max_active_trajectories),
             token_cap=int(stream_config.teacher_prefill_max_active_kv_tokens),
         )
@@ -343,22 +251,56 @@ class PPOTrainerStreamOPD(PPOTrainer):
         self.actor_rollout_wg.reset_streamopd_memory_stats()
         self.teacher_model_manager.reset_device_memory_stats()
         self.llm_server_manager.reset_device_memory_stats()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        self.llm_server_manager.reset_streamopd_kv_transfer_stats()
+        self._publish_initial_weights()
+
+    def _configure_reverse_plan(self, plan_result) -> None:
+        """Freeze one reverse shape plan for the complete training run."""
+
+        self._reverse_plan_result = plan_result
+        logger.info("StreamOPD reverse preflight: %s", plan_result)
+        fallback = int(self.config.distillation.streamopd_kv.reverse_batch_size)
+        local_width = planned_reverse_width(plan_result, fallback)
+        try:
+            dp_mapping = self.actor_rollout_wg._query_dispatch_info("actor")
+            dp_size = max(dp_mapping) + 1
+        except (AttributeError, ValueError):
+            dp_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        train_batch_size = int(self.config.data.train_batch_size)
+        self._reverse_wave_size = min(train_batch_size, local_width * dp_size)
+        self._training_unit_size = plan_training_unit_size(
+            train_batch_size=train_batch_size,
+            reverse_wave_size=self._reverse_wave_size,
+            resources_overlap=self.placement is not TrainerPlacement.DEDICATED,
+            kv_prefetch_depth=int(self.config.distillation.streamopd_kv.kv_prefetch_depth),
+        )
+        self.parameter_sync_step = len(partition_training_units(train_batch_size, self._training_unit_size))
+
+    def _publish_initial_weights(self) -> None:
+        # FSDP state-dict materialization uses every Trainer rank. Release the
+        # Teacher first; the phase-exclusive host checkpoint path also sleeps
+        # Rollout while Trainer publishes, then wakes Rollout to receive it.
+        if self.placement.shares_teacher:
+            self._maybe_sleep_teacher({"teacher_drained": True})
+        self.checkpoint_manager.update_weights(
+            self.global_steps,
+            phase_exclusive=self.placement.shares_rollout,
+        )
+        self.actor_rollout_wg.release_streamopd_allocator_cache()
 
     def prepare_step(self) -> dict:
         self._policy_version = self.global_steps - 1
         self._policy_lifecycle_metrics = {}
-        self._last_trimmed_teacher_chunks = -1
         reset_started = time.perf_counter()
         self.actor_rollout_wg.reset_streamopd_memory_stats()
         self.teacher_model_manager.reset_device_memory_stats()
         self.llm_server_manager.reset_device_memory_stats()
+        self.llm_server_manager.reset_streamopd_kv_transfer_stats()
         reset_seconds = time.perf_counter() - reset_started
         ray.get(
             self._scheduler.begin_policy.remote(
                 self._policy_version,
                 int(self.config.data.train_batch_size),
-                self._effective_scheduler_policy(),
                 self._training_unit_size,
                 not self._teacher_sleeping,
             )
@@ -378,6 +320,7 @@ class PPOTrainerStreamOPD(PPOTrainer):
         metrics = super().prepare_step()
         metrics["streamopd/rollout_dispatch_seconds"] = time.perf_counter() - dispatch_started
         metrics["streamopd/memory_stats_reset_seconds"] = reset_seconds
+        metrics["streamopd/training_unit_size"] = float(self._training_unit_size)
         metrics.update(
             {f"streamopd/teacher_plan_{name}": float(value) for name, value in self._teacher_admission_plan.items()}
         )
@@ -395,18 +338,17 @@ class PPOTrainerStreamOPD(PPOTrainer):
             "trajectory_tokens": int(self.config.distillation.streamopd_kv.reverse_slot_max_tokens),
             "token_chunk_size": int(self.config.distillation.streamopd_kv.token_chunk_size),
             "teacher_max_batched_tokens": int(teacher_runtime.max_num_batched_tokens),
-            "teacher_gpu_memory_utilization": float(teacher_runtime.gpu_memory_utilization),
+            "teacher_exclusive_pool_memory": float(self._teacher_memory_plan.get("exclusive_pool_memory", 0.0)),
+            "teacher_vllm_capacity_tokens": float(self._teacher_memory_plan.get("vllm_capacity_tokens", 0.0)),
             "teacher_max_num_seqs": int(teacher_runtime.max_num_seqs),
-            "rollout_gpu_memory_utilization": float(self.config.actor_rollout_ref.rollout.gpu_memory_utilization),
+            "rollout_exclusive_pool_memory": float(self._rollout_memory_plan.get("exclusive_pool_memory", 0.0)),
+            "rollout_vllm_capacity_tokens": float(self._rollout_memory_plan.get("vllm_capacity_tokens", 0.0)),
             "rollout_max_num_seqs": int(self.config.actor_rollout_ref.rollout.max_num_seqs),
         }
         metrics["streamopd/runtime_profile_auto"] = float(
             str(self.config.distillation.streamopd_kv.runtime_profile) == "auto"
         )
         metrics.update({f"streamopd/runtime_profile_{name}": float(value) for name, value in runtime_profile.items()})
-        metrics["streamopd/scheduler_topology_fallback"] = float(
-            self._effective_scheduler_policy() != str(self.config.distillation.streamopd_kv.scheduler_policy)
-        )
         return metrics
 
     def _check_teacher_wake(self, *, wait: bool = False) -> None:
@@ -421,42 +363,47 @@ class PPOTrainerStreamOPD(PPOTrainer):
             return 0.0
         self._check_teacher_wake(wait=True)
         started = time.perf_counter()
-        self.teacher_model_manager.sleep()
+        # Teacher servers are standalone vLLM replicas. Their default sleep()
+        # is intentionally a no-op, so request level 2 explicitly before the
+        # next Trainer/Teacher role transition. Reverse preflight accounts for
+        # any process allocations retained after sleep.
+        self.teacher_model_manager.sleep(level=2)
         elapsed = time.perf_counter() - started
         self._teacher_sleeping = True
         self._policy_lifecycle_metrics["streamopd/teacher_sleep_seconds"] = elapsed
         return elapsed
 
-    def _trim_teacher_before_training(self, state: dict) -> tuple[float, float]:
-        if (
-            not self.placement.shares_teacher
-            or self._teacher_sleeping
-            or bool(state["teacher_drained"])
-            or int(state["teacher_chunks"]) == self._last_trimmed_teacher_chunks
-        ):
-            return 0.0, 0.0
+    def _offload_trainer_state(self) -> float:
+        if self.placement is TrainerPlacement.DEDICATED or self._trainer_state_offloaded:
+            return 0.0
         started = time.perf_counter()
-        trim_result = self.teacher_model_manager.trim_device_memory(
-            int(self._reverse_runtime_required_free_gib * 1024**3)
-        )
-        self._last_trimmed_teacher_chunks = int(state["teacher_chunks"])
-        self._policy_lifecycle_metrics["streamopd/teacher_trim_free_before_gib"] = int(
-            trim_result["free_before_bytes"]
-        ) / (1024**3)
-        self._policy_lifecycle_metrics["streamopd/teacher_trim_free_after_gib"] = int(
-            trim_result["free_after_bytes"]
-        ) / (1024**3)
-        return time.perf_counter() - started, int(trim_result["freed_bytes"]) / (1024**3)
+        self.actor_rollout_wg.offload_streamopd_trainer_state()
+        self._trainer_state_offloaded = True
+        return time.perf_counter() - started
+
+    def _load_trainer_state(self) -> float:
+        if self.placement is TrainerPlacement.DEDICATED or not self._trainer_state_offloaded:
+            return 0.0
+        if self.placement.shares_teacher and not self._teacher_sleeping:
+            raise RuntimeError("cannot restore Trainer state before the shared Teacher enters level-2 sleep")
+        if self.placement.shares_rollout and not self._shared_rollout_sleeping:
+            raise RuntimeError("cannot restore Trainer state before the shared Rollout enters level-2 sleep")
+        started = time.perf_counter()
+        if self._reverse_plan_result is None:
+            self._configure_reverse_plan(self.actor_rollout_wg.prepare_streamopd_reverse_plan())
+        self.actor_rollout_wg.load_streamopd_trainer_state()
+        self._trainer_state_offloaded = False
+        return time.perf_counter() - started
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
-        """Consume an early reverse cohort, then normal Teacher/Trainer microbatches."""
+        """Run placement-gated reverse units for one strict policy batch."""
         train_batch_size = int(self.config.data.train_batch_size)
         batch_sizes = partition_training_units(train_batch_size, self._training_unit_size)
         prepare_metrics = self.prepare_step()
         metrics_aggregator = MetricsAggregator()
         if prepare_metrics:
             metrics_aggregator.add_step_metrics(prepare_metrics)
-        if self._effective_scheduler_policy() == "teacher_then_train":
+        if self.placement.shares_teacher:
             with marked_timer("gen", timing_raw, color="red"):
                 teacher_drain_wait = self._wait_for_teacher_drain()
             metrics_aggregator.add_step_metrics({"streamopd/teacher_drain_wait_seconds": teacher_drain_wait})
@@ -473,7 +420,16 @@ class PPOTrainerStreamOPD(PPOTrainer):
                 combined_keys.extend(batch.keys)
                 combined_tags.extend(batch.tags)
             metrics.update(metrics_aggregator.get_aggregated_metrics())
-            return KVBatchMeta(partition_id="train", keys=combined_keys, tags=combined_tags)
+            result = KVBatchMeta(partition_id="train", keys=combined_keys, tags=combined_tags)
+        except BaseException:
+            try:
+                self._offload_trainer_state()
+            except Exception:
+                logger.exception("failed to release shared Trainer state while preserving the training error")
+            raise
+        else:
+            metrics["streamopd/trainer_offload_seconds"] = self._offload_trainer_state()
+            return result
         finally:
             del self._streamopd_runtime_accumulation_steps
 
@@ -500,10 +456,13 @@ class PPOTrainerStreamOPD(PPOTrainer):
     def _optimizer_updates_per_global_step(self) -> int:
         return 1
 
-    def _actor_update_extra_info(self) -> dict[str, int]:
+    def _actor_update_extra_info(self) -> dict[str, int | bool]:
         return {
             "streamopd_accumulation_step": self.local_trigger_step,
             "streamopd_accumulation_steps": self._streamopd_runtime_accumulation_steps,
+            # The controller owns one load/offload transition around the full
+            # training phase, rather than paying it for every reverse unit.
+            "disable_auto_offload": self.placement is not TrainerPlacement.DEDICATED,
         }
 
     def _prepare_metric_tensors(self, data):
@@ -546,11 +505,11 @@ class PPOTrainerStreamOPD(PPOTrainer):
         metrics["streamopd/rollout_pool_wait_seconds"] = self._wait_for_shared_rollout_idle()
         wait_seconds = self._acquire_training(trajectory_count)
         metrics["streamopd/scheduler_wait_seconds"] = wait_seconds
-        state = ray.get(self._scheduler.snapshot.remote())
-        trim_seconds, trim_gib = self._trim_teacher_before_training(state)
-        metrics["streamopd/teacher_trim_seconds"] = trim_seconds
-        metrics["streamopd/teacher_trim_freed_gib"] = trim_gib
-        metrics["streamopd/teacher_sleep_seconds"] = self._maybe_sleep_teacher(state)
+        metrics["streamopd/trainer_load_seconds"] = self._load_trainer_state()
+        metrics["streamopd/reverse_wave_size"] = float(self._reverse_wave_size)
+        metrics["streamopd/reverse_waves_per_training_unit"] = float(
+            math.ceil(self._training_unit_size / self._reverse_wave_size)
+        )
         try:
             return super()._update_actor(batch, metrics)
         finally:
@@ -559,6 +518,8 @@ class PPOTrainerStreamOPD(PPOTrainer):
     def _wait_for_shared_rollout_idle(self) -> float:
         if not self.placement.shares_rollout:
             return 0.0
+        if self._shared_rollout_sleeping:
+            return 0.0
         stream_config = self.config.distillation.streamopd_kv
         poll_seconds = max(int(stream_config.scheduler_poll_interval_ms) / 1000.0, 0.01)
         timeout = float(stream_config.scheduler_timeout_seconds)
@@ -566,6 +527,9 @@ class PPOTrainerStreamOPD(PPOTrainer):
         while True:
             state = ray.get(self._scheduler.snapshot.remote())
             if int(state["terminal_trajectories"]) == int(state["expected_trajectories"]):
+                self.llm_server_manager.wait_for_streamopd_kv_transfers()
+                self.checkpoint_manager.sleep_replicas(level=2)
+                self._shared_rollout_sleeping = True
                 return time.perf_counter() - started
             if time.perf_counter() - started > timeout:
                 raise TimeoutError(f"timed out waiting for Trainer-shared Rollout pool to become idle: {state}")
@@ -573,7 +537,6 @@ class PPOTrainerStreamOPD(PPOTrainer):
 
     def _acquire_training(self, trajectory_count: int) -> float:
         stream_config = self.config.distillation.streamopd_kv
-        threshold = 0
         poll_seconds = int(stream_config.scheduler_poll_interval_ms) / 1000.0
         timeout = float(stream_config.scheduler_timeout_seconds)
         started = time.perf_counter()
@@ -581,14 +544,13 @@ class PPOTrainerStreamOPD(PPOTrainer):
         ray.get(
             self._scheduler.training_waiting.remote(
                 self._policy_version,
-                threshold,
                 trajectory_count,
             )
         )
         registered = True
         try:
             while True:
-                granted = ray.get(self._scheduler.try_training_started.remote(self._policy_version, threshold))
+                granted = ray.get(self._scheduler.try_training_started.remote(self._policy_version))
                 if granted:
                     registered = False
                     return time.perf_counter() - started
@@ -621,12 +583,32 @@ class PPOTrainerStreamOPD(PPOTrainer):
             f"streamopd/rollout_memory/{name.removesuffix('_bytes')}_gib": value / (1024**3)
             for name, value in rollout_memory.items()
         }
+        rollout_transfer = self.llm_server_manager.collect_streamopd_kv_transfer_stats()
+        rollout_transfer_metrics = {}
+        for name, value in rollout_transfer.items():
+            metric_name = f"{name.removesuffix('_bytes')}_gib" if name.endswith("_bytes") else name
+            metric_value = value / (1024**3) if name.endswith("_bytes") else value
+            rollout_transfer_metrics[f"streamopd/rollout_kv_transfer/{metric_name}"] = metric_value
+        with marked_timer("allocator_cleanup", self.timing_raw, color="cyan"):
+            self.actor_rollout_wg.release_streamopd_allocator_cache()
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            sync_metrics = dict(self.checkpoint_manager.update_weights(self.global_steps) or {})
+            sync_metrics = dict(
+                self.checkpoint_manager.update_weights(
+                    self.global_steps,
+                    phase_exclusive=self.placement.shares_rollout,
+                )
+                or {}
+            )
+        if self.placement.shares_rollout:
+            self._shared_rollout_sleeping = False
+            sync_metrics["streamopd/rollout_wake_seconds"] = sync_metrics.get(
+                "checkpoint/phase_exclusive_weights_wake_seconds", 0.0
+            ) + sync_metrics.get("checkpoint/phase_exclusive_kv_wake_seconds", 0.0)
         sync_metrics.update(scheduler_metrics)
         sync_metrics.update(self._policy_lifecycle_metrics)
         sync_metrics.update(teacher_memory_metrics)
         sync_metrics.update(rollout_memory_metrics)
+        sync_metrics.update(rollout_transfer_metrics)
         self._pending_sync_metrics = sync_metrics
         self._policy_version = None
         if self.global_steps >= self.total_training_steps:

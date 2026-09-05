@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-STUDENT_MODEL=${STUDENT_MODEL:-/models/store/Qwen/Qwen3-1.7B}
-TEACHER_MODEL=${TEACHER_MODEL:-/models/store/Qwen/Qwen3-4B}
-DATASET=${DATASET:-/data1/models/hf/datasets--open-r1--DAPO-Math-17k-Processed/snapshots/31dd309567e3da778038cc87d868b6097a3ccf68/en/train-00000-of-00001.parquet}
+STUDENT_MODEL=${STUDENT_MODEL:-/nasdata/Model/Qwen3-1.7B}
+TEACHER_MODEL=${TEACHER_MODEL:-/nasdata/Model/Qwen3-4B}
+DATASET=${DATASET:-/nasdata/Model/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet}
 # Aliases for verl's existing resource-pool options.
-STUDENT_GPUS=${STUDENT_GPUS:-2}
 TEACHER_GPUS=${TEACHER_GPUS:-2}
-ROLLOUT_GPUS=${ROLLOUT_GPUS:-$STUDENT_GPUS}
-# The only optional StreamOPD scheduling choice on the default auto profile.
-TRAINER_PLACEMENT=${TRAINER_PLACEMENT:-teacher}
+ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
+TEACHER_TP_SIZE=${TEACHER_TP_SIZE:-1}
+ENABLE_GRADIENT_CHECKPOINTING=${ENABLE_GRADIENT_CHECKPOINTING:-False}
+USE_NO_SYNC_FOR_GRADIENT_ACCUMULATION=${USE_NO_SYNC_FOR_GRADIENT_ACCUMULATION:-True}
+TRAINER_PLACEMENT=${TRAINER_PLACEMENT:-union}
+if [[ $TRAINER_PLACEMENT == union ]]; then
+  STUDENT_GPUS=${STUDENT_GPUS:-$((TEACHER_GPUS + ROLLOUT_GPUS))}
+else
+  STUDENT_GPUS=${STUDENT_GPUS:-2}
+fi
 
 # OPD algorithm settings.
 BATCH_SIZE=${BATCH_SIZE:-128}
@@ -32,8 +38,13 @@ fi
 LAUNCH=(python3)
 RAY=(ray_kwargs.ray_init.runtime_env.py_executable=null)
 if [ "${VERL_USE_UV:-1}" != 0 ] && [ "${DEVICE:-gpu}" = gpu ]; then
-  LAUNCH=(uv run --frozen --all-packages --extra vllm --extra fsdp python3)
-  RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv -v run --frozen --all-packages --extra vllm --extra fsdp")
+  if [[ -n ${VIRTUAL_ENV:-} ]]; then
+    LAUNCH=(uv run --active --no-sync python3)
+    RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv run --active --no-sync")
+  else
+    LAUNCH=(uv run --frozen --all-packages --extra vllm --extra fsdp python3)
+    RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv -v run --frozen --all-packages --extra vllm --extra fsdp")
+  fi
 fi
 
 "${LAUNCH[@]}" -m verl.trainer.main_ppo \
@@ -48,13 +59,14 @@ fi
   data.custom_cls.name=DAPOMathDataset \
   actor_rollout_ref.model.path="$STUDENT_MODEL" \
   actor_rollout_ref.model.use_remove_padding=True \
-  actor_rollout_ref.model.enable_gradient_checkpointing=False \
+  actor_rollout_ref.model.enable_gradient_checkpointing="$ENABLE_GRADIENT_CHECKPOINTING" \
   actor_rollout_ref.actor.strategy=fsdp \
   actor_rollout_ref.actor.ppo_epochs=1 \
   actor_rollout_ref.actor.use_torch_compile=False \
   actor_rollout_ref.actor.ppo_mini_batch_size="$BATCH_SIZE" \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
+  actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation="$USE_NO_SYNC_FOR_GRADIENT_ACCUMULATION" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.pipeline_model_parallel_size=1 \
@@ -77,7 +89,7 @@ fi
   distillation.n_gpus_per_node="$TEACHER_GPUS" \
   distillation.nnodes=1 \
   distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL" \
-  distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
+  distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size="$TEACHER_TP_SIZE" \
   distillation.distillation_loss.loss_mode=forward_kl_topk \
   distillation.distillation_loss.topk=32 \
   distillation.distillation_loss.use_task_rewards=False \

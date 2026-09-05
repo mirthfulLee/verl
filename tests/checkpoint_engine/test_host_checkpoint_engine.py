@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 import torch
 
 from verl.checkpoint_engine.base import split_weight_chunks
@@ -78,12 +79,44 @@ def test_host_checkpoint_round_trip_to_multiple_receivers(tmp_path) -> None:
         assert metrics["checkpoint/host_gib_per_second"] > 0
 
         session_dir = sender.session_dir
+        assert session_dir is not None
+        metadata_paths = sorted(session_dir.glob("bucket-*.meta.pt"))
+        data_paths = sorted(session_dir.glob("bucket-*.bin"))
+        assert len(metadata_paths) == len(data_paths) > 1
+        for metadata_path, data_path in zip(metadata_paths, data_paths, strict=True):
+            metadata = torch.load(metadata_path, weights_only=False)
+            assert "buffer" not in metadata
+            assert data_path.stat().st_size == metadata["length"]
         receiver_a.finalize()
         receiver_b.finalize()
         sender.finalize()
-        assert session_dir is not None and not session_dir.exists()
+        assert not session_dir.exists()
 
     asyncio.run(run_round_trip())
+
+
+def test_host_checkpoint_rejects_incomplete_raw_bucket(tmp_path) -> None:
+    engine = HostCheckpointEngine(bucket_size=32, is_master=True, directory=str(tmp_path))
+    metadata = engine.prepare()
+    assert metadata.session_dir is not None
+    engine.init_process_group(role="receiver", session_dir=metadata.session_dir, actor_world_size=1)
+    engine._bucket_data_path(0).write_bytes(b"\0")
+    torch.save(
+        {
+            "format": "verl-host-checkpoint-mmap-v1",
+            "bucket_meta": {},
+            "is_last": True,
+            "length": 2,
+        },
+        engine._bucket_metadata_path(0),
+    )
+
+    async def consume() -> None:
+        async for _ in engine.receive_weights():
+            pass
+
+    with pytest.raises(RuntimeError, match="invalid host checkpoint bucket data"):
+        asyncio.run(consume())
 
 
 def test_meta_only_weight_split_does_not_view_payload() -> None:

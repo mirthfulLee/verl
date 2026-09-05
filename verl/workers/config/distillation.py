@@ -71,15 +71,13 @@ class DistillationLossConfig(BaseConfig):
 
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
     # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
-    # Default ``False`` to preserve short-context performance (chunked path
-    # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
-    # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
+    # Default ``False`` preserves the native fused path when its full
+    # normalized-vocabulary tensor fits comfortably.
     use_chunked_topk: bool = False
     # Tokens per chunk along (B*T) when ``use_chunked_topk=True``. Larger
-    # chunks reduce kernel-launch overhead but increase per-chunk memory;
-    # smaller chunks reduce per-chunk memory but increase kernel-launch
-    # overhead (saved-tensor total stays constant either way).
-    chunked_topk_chunk_size: int = 4096
+    # chunks reduce recomputation/launch overhead but increase the bounded
+    # forward/backward workspace; smaller chunks reduce peak memory.
+    chunked_topk_chunk_size: int = 512
 
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
@@ -102,6 +100,9 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        if self.chunked_topk_chunk_size < 1:
+            raise ValueError("chunked_topk_chunk_size must be positive")
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -235,16 +236,19 @@ class StreamOPDKVConfig(BaseConfig):
     # verl options remain the public constraints; this field is diagnostic.
     planner_explicit_options: list[str] = field(default_factory=list)
     token_chunk_size: int = 256
+    # Export complete trajectories after EOS. ``eos_host`` copies vLLM's
+    # physical pages directly and performs the layout transform on CPU.
+    rollout_kv_export_strategy: str = "eos_host"
+    # Rollout export is independent of Teacher streaming granularity. Zero
+    # resolves to a bounded 2048-token staging chunk before vLLM starts.
+    rollout_kv_export_chunk_size: int = 0
+    # This also bounds persistent pinned Host staging to one buffer per writer.
+    rollout_kv_writer_threads: int = 4
     # Physical GPU allocation is user-controlled. ``teacher`` colocates the
     # fixed-topology trainer with Teacher vLLM; ``rollout`` colocates separate
     # rollout processes on Trainer GPUs; ``union`` spans disjoint Teacher and
     # Rollout subsets; ``dedicated`` gives each role its own pool.
-    trainer_placement: str = "teacher"
-    # ``teacher_then_train`` is the work-conserving scheduler baseline: keep
-    # streaming Teacher scoring, but delay all reverse units until Teacher
-    # drain. ``adaptive`` launches a genuinely ready reverse cohort and uses
-    # completed-trajectory backlog hysteresis on shared resources.
-    scheduler_policy: str = "adaptive"
+    trainer_placement: str = "union"
     # Zero values are resolved into static caps before worker startup.
     reverse_chunk_size: int = 0
     reverse_chunk_min_size: int = 0
@@ -262,9 +266,8 @@ class StreamOPDKVConfig(BaseConfig):
     # Optional preflight caps. Zero lets the scheduler derive stable values
     # from vLLM's profiled KV blocks and the reverse training-unit width.
     teacher_prefill_max_active_trajectories: int = 0
-    # Conservative global reservation for the shared Teacher/Trainer pool.
-    # Effective live-session count is this budget divided by the configured
-    # prompt+response trajectory length.
+    # Optional global Teacher KV admission cap. Effective live-session count
+    # is this budget divided by the configured trajectory length.
     teacher_prefill_max_active_kv_tokens: int = 0
     teacher_prefill_kv_page_size: int = 64
     # Host-side KV prefetch is overlapped with the current reverse unit.  The
@@ -281,8 +284,13 @@ class StreamOPDKVConfig(BaseConfig):
     def __post_init__(self) -> None:
         if self.runtime_profile not in {"auto", "manual"}:
             raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
+        if self.rollout_kv_export_strategy not in {"eos_host", "eos_triton", "incremental_triton"}:
+            raise ValueError(
+                "streamopd_kv.rollout_kv_export_strategy must be eos_host, eos_triton, or incremental_triton"
+            )
         for name in (
             "token_chunk_size",
+            "rollout_kv_writer_threads",
             "reverse_page_size",
             "scheduler_poll_interval_ms",
             "max_pending_teacher_chunks",
@@ -295,6 +303,7 @@ class StreamOPDKVConfig(BaseConfig):
         if not self.kv_handoff_dir:
             raise ValueError("streamopd_kv.kv_handoff_dir must be non-empty")
         for name in (
+            "rollout_kv_export_chunk_size",
             "reverse_chunk_size",
             "reverse_chunk_min_size",
             "reverse_batch_size",
@@ -328,8 +337,6 @@ class StreamOPDKVConfig(BaseConfig):
             raise NotImplementedError(
                 "streamopd_kv.trainer_placement supports 'teacher', 'rollout', 'union', and 'dedicated'"
             )
-        if self.scheduler_policy not in {"adaptive", "teacher_then_train"}:
-            raise ValueError("streamopd_kv.scheduler_policy must be 'adaptive' or 'teacher_then_train'")
 
 
 @dataclass

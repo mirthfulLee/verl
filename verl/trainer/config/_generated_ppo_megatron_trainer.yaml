@@ -920,8 +920,10 @@ distillation:
     runtime_profile: auto
     planner_explicit_options: []
     token_chunk_size: 256
-    trainer_placement: teacher
-    scheduler_policy: adaptive
+    rollout_kv_export_strategy: eos_host
+    rollout_kv_export_chunk_size: 0
+    rollout_kv_writer_threads: 4
+    trainer_placement: union
     reverse_chunk_size: 0
     reverse_chunk_min_size: 0
     reverse_page_size: 64
@@ -951,6 +953,8 @@ distillation:
     distillation_loss_coef: 1.0
     loss_max_clamp: null
     log_prob_min_clamp: null
+    use_chunked_topk: false
+    chunked_topk_chunk_size: 512
     use_policy_gradient: false
     policy_loss_mode: vanilla
     clip_ratio: 0.2

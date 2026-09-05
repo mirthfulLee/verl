@@ -215,10 +215,10 @@ class MultiTeacherModelManager:
         return teacher_clients
 
     @auto_await
-    async def sleep(self) -> None:
+    async def sleep(self, level: int | None = None) -> None:
         await asyncio.gather(
             *(
-                replica.sleep()
+                replica.sleep(level=level)
                 for manager in self.teacher_model_managers.values()
                 for replica in manager.rollout_replicas
             )

@@ -18,6 +18,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import ray
@@ -30,6 +31,7 @@ from verl.experimental.agent_loop import (
     AgentLoopOutput,
     AgentLoopWorker,
     get_trajectory_info,
+    resolve_do_sample,
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
@@ -113,7 +115,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
-            do_sample = prompt.pop("__do_sample__", True)
+            do_sample = resolve_do_sample(config.do_sample, prompt.pop("__do_sample__", None))
 
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
@@ -160,6 +162,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
+        rollout_completed_at = time.perf_counter()
+        rollout_started_at = rollout_completed_at - float(final_output.metrics.generate_sequences)
+        teacher_started_at = time.perf_counter()
         # TODO: Support output:list[AgentLoopOutput]
         await self._compute_teacher_logprobs(
             final_output,
@@ -168,6 +173,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             validate=validate,
             sample_kwargs=kwargs,
         )
+        teacher_completed_at = time.perf_counter()
+        has_teacher_timing = self.distillation_enabled and not validate
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
@@ -216,6 +223,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "_stage_rollout_started_at": rollout_started_at,
+                    "_stage_rollout_completed_at": rollout_completed_at,
+                    "_stage_rollout_request_seconds": float(final_output.metrics.generate_sequences),
+                    **(
+                        {
+                            "_stage_teacher_started_at": teacher_started_at,
+                            "_stage_teacher_completed_at": teacher_completed_at,
+                            "_stage_teacher_request_seconds": float(final_output.metrics.teacher_logprobs),
+                        }
+                        if has_teacher_timing
+                        else {}
+                    ),
                 }
             )
 

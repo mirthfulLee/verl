@@ -48,7 +48,6 @@ class StreamOPDAgentSession:
             self._score,
             max_pending_chunks=int(stream_config.max_pending_teacher_chunks),
             scheduler=scheduler,
-            scheduler_poll_interval_ms=int(stream_config.scheduler_poll_interval_ms),
             max_active_trajectories=int(stream_config.teacher_prefill_max_active_trajectories),
             max_active_kv_tokens=int(stream_config.teacher_prefill_max_active_kv_tokens),
             kv_page_size=int(stream_config.teacher_prefill_kv_page_size),

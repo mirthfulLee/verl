@@ -274,6 +274,17 @@ class vLLMHttpServer:
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
+    def _prepare_engine_core_environment(self) -> None:
+        """Give each spawned EngineCore a unique rendezvous endpoint."""
+        os.environ["MASTER_ADDR"] = self._master_address
+        os.environ["MASTER_PORT"] = str(self._master_port)
+        os.environ["VLLM_PORT"] = str(self._master_port)
+        for socket_name in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
+            reserved_socket = getattr(self, socket_name, None)
+            if reserved_socket is not None:
+                reserved_socket.close()
+                setattr(self, socket_name, None)
+
     @property
     def lora_as_adapter(self) -> bool:
         return (
@@ -356,6 +367,9 @@ class vLLMHttpServer:
             compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
+        exclusive_gpu_memory = bool(
+            (engine_kwargs.get("additional_config", {}) or {}).get("verl_exclusive_gpu_memory", False)
+        )
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
@@ -371,7 +385,6 @@ class vLLMHttpServer:
             "enable_sleep_mode": self.config.enable_sleep_mode,
             "logprobs_mode": self.config.logprobs_mode,
             "enforce_eager": self.config.enforce_eager,
-            "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.replica_rank + self.config.seed,
@@ -382,6 +395,8 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+        if not exclusive_gpu_memory:
+            args["gpu_memory_utilization"] = self.config.gpu_memory_utilization
 
         # update profiler args, only on the replica that will actually be profiled: configuring
         # the engine profiler everywhere makes every replica log that profiling is enabled while
@@ -515,6 +530,10 @@ class vLLMHttpServer:
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
+
+        # Ray worker groups set one shared MASTER_PORT. Independent vLLM
+        # replicas must override it before vLLM freezes the rendezvous URL.
+        self._prepare_engine_core_environment()
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
 

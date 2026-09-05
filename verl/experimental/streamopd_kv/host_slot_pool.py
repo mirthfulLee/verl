@@ -15,6 +15,7 @@ import mmap
 import os
 import re
 import struct
+import time
 from contextlib import contextmanager
 from enum import IntEnum
 from pathlib import Path
@@ -327,28 +328,39 @@ class HostKVSlotPool:
         policy_version: int,
         prompt_length: int,
         token_ids: Any,
+        wait_timeout_seconds: float = 0.0,
+        poll_interval_seconds: float = 0.001,
     ) -> dict[str, int]:
         root, slot, generation = self.parse_slot_path(slot_path)
         if root != self.root:
             raise RuntimeError("shared Host KV slot belongs to another pool")
-        with self._locked():
-            record = self._read_record(slot)
-            if int(record[0]) != generation or record[1] != HostSlotState.SEALED:
-                raise RuntimeError("shared Host KV slot is not sealed for this generation")
-            if int(record[2]) != int(policy_version) or record[3] != _identity_digest(trajectory_id):
-                raise RuntimeError("shared Host KV slot identity does not match the training trajectory")
-            if record[5] != _token_digest(token_ids):
-                raise RuntimeError("shared Host KV token identity does not match the training trajectory")
-            if int(record[6]) != prompt_length:
-                raise RuntimeError("shared Host KV prompt boundary does not match the training trajectory")
-            return {
-                "slot": slot,
-                "generation": generation,
-                "prompt_length": int(record[6]),
-                "token_count": int(record[7]),
-                "streamed_tokens_before_eos": int(record[8]),
-                "streamed_chunks_before_eos": int(record[9]),
-            }
+        deadline = time.monotonic() + wait_timeout_seconds
+        while True:
+            with self._locked():
+                record = self._read_record(slot)
+                if int(record[0]) != generation:
+                    raise RuntimeError("shared Host KV slot generation changed before it was consumed")
+                state = HostSlotState(record[1])
+                if state == HostSlotState.SEALED:
+                    if int(record[2]) != int(policy_version) or record[3] != _identity_digest(trajectory_id):
+                        raise RuntimeError("shared Host KV slot identity does not match the training trajectory")
+                    if record[5] != _token_digest(token_ids):
+                        raise RuntimeError("shared Host KV token identity does not match the training trajectory")
+                    if int(record[6]) != prompt_length:
+                        raise RuntimeError("shared Host KV prompt boundary does not match the training trajectory")
+                    return {
+                        "slot": slot,
+                        "generation": generation,
+                        "prompt_length": int(record[6]),
+                        "token_count": int(record[7]),
+                        "streamed_tokens_before_eos": int(record[8]),
+                        "streamed_chunks_before_eos": int(record[9]),
+                    }
+                if state != HostSlotState.WRITING:
+                    raise RuntimeError("shared Host KV slot is not sealed for this generation")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for shared Host KV slot to seal: {slot_path}")
+            time.sleep(poll_interval_seconds)
 
     def release(self, slot_path: str) -> None:
         root, slot, generation = self.parse_slot_path(slot_path)

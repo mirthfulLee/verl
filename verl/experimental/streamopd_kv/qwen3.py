@@ -116,6 +116,7 @@ class ReverseTrainingResult:
     max_parallel_trajectories: int = 1
     lm_head_tokens: int = 0
     dense_lm_head_tokens: int = 0
+    padded_model_tokens: int = 0
 
 
 def _build_reverse_wavefront(sequence_lengths: Sequence[int], chunk_size: int) -> list[tuple[int, list[int]]]:
@@ -126,6 +127,16 @@ def _build_reverse_wavefront(sequence_lengths: Sequence[int], chunk_size: int) -
         (depth, [idx for idx, count in enumerate(chunk_counts) if count >= depth])
         for depth in range(max(chunk_counts), 0, -1)
     ]
+
+
+def _wavefront_compute_end(
+    sequence_lengths: Sequence[int], active: Sequence[int], start: int, slot_end: int, page_size: int
+) -> int:
+    """Trim a wavefront's trailing padding while preserving page-aligned slot ownership."""
+
+    longest_sequence = max(sequence_lengths[idx] for idx in active)
+    compute_end = math.ceil(longest_sequence / page_size) * page_size
+    return min(slot_end, max(start + page_size, compute_end))
 
 
 class Qwen3ReverseTrainer:
@@ -185,7 +196,8 @@ class Qwen3ReverseTrainer:
         with use_qwen3_reverse_attention(self.model, state):
             for call_idx, (depth, active) in enumerate(schedule):
                 start = (depth - 1) * self.chunk_size
-                end = depth * self.chunk_size
+                slot_end = depth * self.chunk_size
+                end = _wavefront_compute_end(sequence_lengths, active, start, slot_end, self.page_size)
                 state.begin(active, start, end)
                 chunk_ids = torch.cat([padded_input_ids[idx][:, start:end] for idx in active], dim=0)
                 position_ids = torch.arange(start, end, device=chunk_ids.device).unsqueeze(0)
@@ -233,11 +245,15 @@ class Qwen3ReverseTrainer:
                     chunk_loss = chunk_loss + sample_loss
                     chunk_valid_tokens += sample_valid_tokens
                 sync_context = backward_context(call_idx, len(schedule)) if backward_context else nullcontext()
+                state.validate_complete()
                 with sync_context:
-                    (chunk_loss + state.gradient_injection()).backward()
+                    chunk_loss.backward()
                 state.commit_prefix_gradients()
                 if on_depth_committed is not None:
-                    on_depth_committed(active, start, end)
+                    # The unused suffix is still owned by this slot depth. It can
+                    # be released with the computed range after backward because
+                    # its zero KV never entered the graph.
+                    on_depth_committed(active, start, slot_end)
                 loss_sum = loss_sum + chunk_loss.detach().float()
                 valid_tokens += chunk_valid_tokens
 
@@ -249,4 +265,5 @@ class Qwen3ReverseTrainer:
             max_parallel_trajectories=max(len(active) for _, active in schedule),
             lm_head_tokens=lm_head_tokens,
             dense_lm_head_tokens=dense_lm_head_tokens,
+            padded_model_tokens=sum(padded_lengths),
         )

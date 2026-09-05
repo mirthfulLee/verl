@@ -18,8 +18,8 @@ class CommittedChunkPublisher:
 
     vLLM and SGLang expose cumulative accepted output IDs while streaming.
     Rejected speculative tokens never appear in that list.  A non-prefix update
-    therefore indicates a backend contract violation and fails closed. In the
-    every complete Teacher-input chunk is submitted immediately;
+    therefore indicates a backend contract violation and fails closed. Every
+    complete Teacher-input chunk is submitted immediately;
     the first chunk budget includes the prompt, while later resumable chunks
     contain only new response tokens.
     """

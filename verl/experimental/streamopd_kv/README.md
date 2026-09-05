@@ -10,9 +10,10 @@ union      Trainer spans disjoint Teacher + Rollout subsets
 dedicated  Trainer, Teacher, and Rollout use disjoint GPUs
 ```
 
-The rollout engine remains resident and uses continuous batching. Shared roles are separate Ray processes in the same
-placement group; model loading is not repeated per unit. The scheduler serializes kernels on intersecting resource
-sets and allows work on disjoint sets to overlap. The trainer is registered as `streamopd`.
+The Rollout server process remains resident and uses continuous batching. Shared roles are separate Ray processes in
+the same placement group; model files are not reloaded per training unit, but vLLM-managed device mappings may be
+discarded and restored at phase boundaries. The scheduler serializes kernels on intersecting resource sets and allows
+work on disjoint sets to overlap. The trainer is registered as `streamopd`.
 
 ## Minimal configuration
 
@@ -22,7 +23,7 @@ existing verl resource options; StreamOPD does not introduce parallel GPU-count
 settings:
 
 ```bash
-STUDENT_GPUS=2 TEACHER_GPUS=2 ROLLOUT_GPUS=2 \
+TRAINER_PLACEMENT=union TEACHER_GPUS=2 ROLLOUT_GPUS=2 \
   bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_kv_fsdp.sh
 ```
 
@@ -30,29 +31,31 @@ The aliases above map to `trainer.n_gpus_per_node`,
 `distillation.n_gpus_per_node`, and
 `actor_rollout_ref.rollout.n_gpus_per_node`; they do not count as StreamOPD
 options. Node counts and model parallelism likewise retain their existing verl
-configuration. The default placement shares Teacher and Trainer GPUs;
+configuration. In the command above, the example derives `STUDENT_GPUS=4` for the default `union` placement, letting
+Trainer use the combined Teacher and Rollout pools after inference;
 `trainer_placement` is the only optional StreamOPD topology choice. Before any model server starts, the auto profile
-derives context limits, Rollout and Teacher concurrency, committed-token chunk size, Teacher batched-token capacity,
+derives context limits, Rollout and Teacher concurrency, Teacher fragment size, Teacher batched-token capacity,
 checkpoint transport, and zero-valued reverse-plan sentinels from the global batch, maximum trajectory length, GPU
 allocation, and placement. Existing verl options explicitly supplied as Hydra overrides are hard constraints rather
-than values for auto mode to replace. If only Rollout memory is constrained, the planner lowers continuous-batching
-concurrency; if only concurrency is constrained, it raises memory to the smallest sufficient `0.05` utilization step.
-If neither is constrained, it targets the whole per-replica rollout batch and reduces concurrency only when the
-physical GPU cannot hold its worst-case KV.
+than values for auto mode to replace. Auto mode never derives, rewrites, or passes `gpu_memory_utilization`. Each
+phase-exclusive vLLM worker sizes KV from the actual free bytes after CUDA/NCCL setup, activation/CUDA-graph profiling,
+and deterministic workspace reservations. It reserves no simultaneously active Trainer workspace because vLLM enters
+level-2 sleep before Trainer state and reverse slots are loaded. A worst-case Host KV backing check also runs before
+Rollout starts; auto mode uses
+`/dev/shm`, while an explicitly selected path fails closed if it lacks capacity. Teacher session admission is refined
+after vLLM reports its actual paged-KV capacity, so group/session widths are not fixed to the reference hardware.
+Common Trainer execution choices such as gradient checkpointing, Liger, and FSDP `no_sync` remain ordinary verl
+options and are never changed by the StreamOPD auto planner.
 
-Both dedicated and Trainer-shared Rollout memory are calculated from checkpoint weight bytes, model KV geometry,
-maximum trajectory length, physical GPU capacity, and runtime/checkpoint reserves. For `rollout` and `union`, fixed
-reverse slots are planned before Rollout vLLM starts; the target Rollout ranks' remaining memory minus the frozen
-reverse workspace determines a `0.05`-aligned vLLM ceiling and stable continuous-batching width. A worst-case host KV
-backing check also runs before Rollout starts; auto mode uses `/dev/shm`, while an explicitly selected path fails closed
-if it lacks capacity. Teacher/Trainer sharing starts from a `0.25` Teacher envelope and is refined after vLLM reports
-its actual paged-KV capacity and Trainer preflight measures the remaining memory. Group/session widths therefore are
-not fixed to the reference hardware.
+Auto deliberately does not select Teacher TP or replica count. Model parallelism remains a normal user resource
+choice: more replicas can improve Teacher prefill throughput, while a shared Trainer may receive less reverse
+headroom from the resulting sleeping processes. Shared reverse planning uses the post-sleep measurement, not a
+model-name rule, so an infeasible chunk or batch width is rejected before the first training phase.
 
 Set `distillation.streamopd_kv.runtime_profile=manual` only for ablations or
 parameter-sensitivity studies. Manual mode preserves every low-level setting,
 including engine utilization, chunk/page/group sizes, fixed-slot reserve,
-Teacher session caps, prefetch depth, and scheduler policy. The resolved auto
+Teacher session caps, and prefetch depth. The resolved auto
 values are logged under `streamopd/runtime_profile_*`.
 
 ## Supported envelope
@@ -65,56 +68,76 @@ The implementation fails closed outside the following configuration:
 - vLLM rollout with TP=1, PP=1, `n=1`, and a non-quantized KV cache;
 - FSDP/FSDP2 student, one PPO epoch, and global `token-mean` aggregation;
 - direct `forward_kl_topk` distillation without task rewards or a policy-gradient term;
-- exact dense attention using CUDA FlashAttention for batched wavefront reverse, with no SDPA fallback;
+- exact dense attention using native-GQA CUDA FlashAttention for batched wavefront reverse, with no SDPA fallback;
 - BF16 CUDA KV/query tensors, `head_dim <= 256`, right-padded batches, and page-aligned reverse chunks.
 
-`distillation.streamopd_kv.enabled=true` is rejected unless the dedicated StreamOPD trainer mode is selected.
+`distillation.streamopd_kv.enabled=true` is rejected unless `trainer.v1.trainer_mode=streamopd` is selected.
+The default `union` placement runs Teacher and Rollout on disjoint pools, then lends both pools to Trainer after
+their inference phases finish. `dedicated` keeps a separate Trainer pool for overlap experiments.
 
 ## Streaming path
 
-1. `CommittedChunkPublisher` observes cumulative vLLM output and publishes every committed token/KV range during
+1. `CommittedChunkPublisher` observes cumulative vLLM output and publishes committed token ranges to Teacher during
    generation. The first teacher input budget includes the complete prompt plus the initial response prefix; later
-   resumable chunks contain only newly committed response tokens. EOS seals the already-streamed Host KV slot.
+   resumable chunks contain only newly committed response tokens. Rollout KV export is deliberately independent of
+   this path and starts only after the complete trajectory reaches EOS.
 2. `StreamingTeacherCoordinator` submits chunks to the central scheduler. vLLM 0.15.1 resumable `StreamingInput`
    sessions retain causal teacher KV across fragments. Contiguous queued fragments may be coalesced without changing
    token coverage. A session reservation is held until EOS; releasing it immediately permits another trajectory to
    use the bounded teacher KV capacity.
-3. The scheduler owns separate Teacher Chunk and Reverse Training queues plus explicit resource sets. Shared resources
-   are mutually exclusive; dedicated resources can overlap. `teacher_then_train` is the drain-first baseline.
-   `adaptive` launches as soon as one reverse cohort is genuinely ready. On shared GPUs, Teacher-complete trajectories
-   that have not entered reverse training form a backlog: Trainer retains the pool while another full cohort is
-   available, then yields to Teacher when it catches up. A short bounded handoff window lets the controller register
-   that next cohort without leaving the GPU idle. This makes the reverse quantum follow the producer/consumer rates
-   instead of a fixed model- or hardware-specific count. A Rollout-shared Trainer waits for all Rollout EOS because the
-   current KV connector is non-preemptible, then overlaps reverse work with the dedicated Teacher tail. A union Trainer
-   has no remaining disjoint critical-path work after Rollout EOS, so adaptive safely collapses to drain-first. Live
-   Teacher sessions refill as earlier trajectories reach EOS; there is no per-unit model sleep/wake boundary.
-4. At a shared Teacher/Trainer role switch, inactive Teacher allocator cache is trimmed while weights, live paged KV,
-   and request state remain resident. Once all Teacher sessions drain, vLLM enters level-1 sleep; the next policy
-   version wakes it behind a scheduler admission gate while Rollout is already starting.
-5. `StreamOPDKVConnector` copies completed rollout KV ranges from live vLLM pages into a fixed shared Host KV slot pool
-   before EOS. Each TP shard owns one stable data mmap and one fixed control array; a bounded pinned staging ring moves
-   D2H chunks into their assigned rows without serializing per-chunk tensor files. Multiple generating or sealed
+3. The scheduler owns Teacher session admission, Reverse Training readiness, and explicit resource sets. Fragment
+   scoring needs no second scheduler admission because each resumable session already holds its worst-case KV
+   reservation. Each trajectory reports its fragment count and score intervals once at completion; the scheduler merges
+   those intervals for busy/concurrency metrics without putting actor RPCs between vLLM fragments. Capacity-limited
+   sessions wait once on the scheduler's FIFO admission queue; session release and Teacher wake grant reservations and
+   notify waiters directly, without client polling. A dedicated Trainer
+   may start a unit as soon as every trajectory in that unit has complete Rollout KV and Teacher scores. A Trainer that shares
+   Teacher GPUs waits for complete Teacher drain; one that shares Rollout GPUs waits for all Rollout EOS. A union
+   Trainer waits for both conditions. There is no Teacher/Trainer alternation inside a policy.
+4. A shared pool changes active owner once per policy. The outgoing vLLM process enters level-2 sleep to discard its
+   sleep-managed weight/KV mappings, then the Trainer loads parameters and optimizer state once for its full training
+   phase. CUDA contexts, graph pools, and allocations outside vLLM's sleep allocator may remain; the first post-sleep
+   reverse preflight measures that real headroom. Trainer FSDP state is offloaded before the vLLM process wakes again.
+5. `StreamOPDKVConnector` claims a finished request's vLLM pages through the HMA async-save contract and exports its
+   complete trajectory after EOS. The default path copies arithmetic runs of physical cross-layer pages directly to
+   pinned Host staging with `cudaMemcpy2DAsync`, then performs the block-to-layer layout transform in Host writer
+   threads. It runs no GPU gather kernel, never blocks the model-runner thread on a staging slot, and reports completion
+   only after the shared slot is sealed. Because this path allocates no GPU gather output, the exclusive vLLM memory
+   profile does not reserve one. The ordered CUDA submitter may advance to a later trajectory while an earlier Host
+   commit and seal finish; four reusable writer buffers bound both this pipeline and pinned Host memory. Each TP shard
+   owns one stable data mmap and one fixed control array. Multiple
+   generating or sealed
    training units may be host-resident, while each trainer worker may hold exactly one GPU KV lease. Trainer prefetch
    maps the next slot as a zero-copy tensor view while the current reverse unit executes. Within the leased microbatch, the
    next reverse group may reuse suffix pages released by the current group; the next microbatch still cannot acquire
    GPU KV until the current lease is released.
 6. Once `EOS && student KV complete && teacher supervision complete`, the trainer uses rollout KV as OOMB Stage-1 and
    traverses chunks from suffix to prefix. Wavefront batches contain all trajectories active at the same reverse
-   depth. Completed suffix chunks leave the wavefront, and dK/dV continues into earlier chunks.
-7. Before policy version zero, vLLM reports its profiled KV block capacity and the trainer measures reusable memory
-   once. Preflight derives a stable Teacher session budget, fixed `B_slot`, page-aligned `T_slot`, chunk size, and
-   accumulation count. For Rollout-shared GPUs it also budgets complete non-preemptible Rollout KV, model weights,
-   runtime workspace, and checkpoint sender/receiver buffers; it caps reverse group tokens before allocating slots.
-   Reverse candidates prefer the largest feasible chunk and then the largest batch at that chunk. The hot path performs
-   no allocator query, OOM retry, tensor growth, or kernel-shape adaptation.
+   depth. The highest wavefront is computed only through the group's page-aligned longest trajectory rather than the
+   full fixed chunk; the unused slot suffix is released after backward without entering the model. Completed suffix
+   chunks leave the wavefront, and dK/dV continues into earlier chunks.
+7. Before policy version zero, each phase-exclusive vLLM worker uses the free memory measured after CUDA/NCCL setup
+   and reserves one measured activation peak for runtime and each configured CUDA graph mode plus deterministic sampler
+   and StreamOPD connector/logit workspaces, then reports its profiled KV block capacity. Teacher admission and a
+   dedicated Trainer's reverse plan are derived at startup. A shared Trainer freezes its reverse plan after the first
+   inference sleep and before its first training phase, using the retained process footprint measured on every rank.
+   These plans select a stable session budget, fixed `B_slot`, page-aligned `T_slot`, chunk size, and accumulation count
+   without a model-size or utilization-fraction heuristic.
+   Reverse candidates maximize the useful `batch * chunk` token tile. Equal tiles avoid a singleton batch and then
+   prefer the longer chunk. The hot path performs no allocator query, OOM retry, tensor growth, or kernel-shape
+   adaptation.
 8. Raw gradients accumulate across the complete global batch. Parameters stay at `theta_k` until all rollout,
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
+9. When Trainer shares the Rollout pool, Host checkpoint publication is phase-exclusive: Rollout enters level-2 sleep,
+   Trainer publishes and offloads the durable checkpoint, Rollout wakes only its weights to receive it, and KV wakes
+   last. Active Trainer state is gone before Rollout mappings are restored; sleep-retained process allocations remain
+   part of the measured shared-pool budget.
 
-Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`. Set
-reverse batch/chunk and Teacher admission caps to zero (the default) for automatic preflight planning; non-zero values
-are experimental caps.
+Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`.
+`rollout_kv_export_chunk_size` is also independent of `token_chunk_size`: auto uses a bounded 2048-token export chunk
+and four Host writers, while the latter remains the Teacher streaming granularity. Set reverse batch/chunk and
+Teacher admission caps to zero (the default) for automatic preflight planning; non-zero values are experimental caps.
 
 ## Fixed reverse slots
 
@@ -124,20 +147,33 @@ prompt/response upper bounds and page-aligns it. Preflight evaluates the fixed b
 LM-head workspace, model/optimizer reserve, and H2D reserve before selecting `B_slot` and a chunk size that divides
 `T_slot`. The optimizer reserve is derived per rank from gradients and optimizer tensors that have not yet been
 materialized; it is not a hardware-specific fixed allowance. The resulting addresses and kernel shapes are frozen
-before policy version zero.
+before the first training phase. Dedicated pools plan at startup; shared pools
+plan once after their inference process first enters level-2 sleep so retained
+CUDA state is included in the measured headroom.
 
-Host slots expose token-major contiguous `[T, H_kv, D]` K/V views directly from the mmap; there is no read-time tensor
-allocation or deserialization. A dedicated enqueue thread uses raw async CUDA memcpy/memset operations on a copy
-stream, avoiding transpose dispatch and per-group GPU staging tensors. Every GPU slot page tracks `FREE ->
+Host slots expose token-major contiguous `[T, H_kv, D]` K/V views directly from the mmap; there is no read-time
+deserialization. Because mmap views are pageable, a dedicated enqueue thread first copies exactly one reverse group
+into persistent pinned Host storage, then uses raw async CUDA memcpy/memset operations on a copy stream. The pinned
+group is reused by every reverse wave and remains alive across policy steps even when phase-shared GPU slots are
+released. It is bounded to half of one fixed GPU slot backing (K/V without dK/dV), rather than the complete training
+batch. Host staging for the next group overlaps the current backward traversal. Every GPU slot page tracks `FREE ->
 LOADING_NEXT -> NEXT_READY -> CURRENT_ACTIVE -> BACKWARD_DONE -> FREE`. After a wavefront depth commits, the compute
 stream records a free event; the copy stream waits on it before overwriting that suffix range with next-group KV.
 Group activation waits for all required load events. Short-trajectory tail pages and unused rows can therefore load
-before the current group reaches their reverse depth.
+before the current group reaches their reverse depth. When the selected chunk spans the complete slot, there is no
+release depth before backward finishes. If measured free memory can also hold a second K/V pair, preflight enables an
+inactive K/V buffer so the next complete group transfers during the current backward; dK/dV remains shared. If that
+extra pair does not fit, preflight selects a smaller multi-chunk plan and retains page reuse.
 
-Preflight enumerates power-of-two reverse widths under the fixed-slot, activation, LM-head, optimizer, and transfer
-reserve. It first maximizes the feasible chunk (up to the profiled 1024-token kernel tile), then batch width. A larger
-batch that forces a smaller chunk is not selected merely because it fits in memory. Non-zero token/batch/chunk caps
-remain available for controlled ablations.
+The exposed transfer metrics separate pinned allocation, mmap-to-pinned staging, CUDA enqueue/copy, and activation
+wait. In particular, `reverse_slot_next_wait_seconds` is the transfer time visible on the training critical path;
+aggregate staging and CUDA durations may overlap backward and must not be added to step time.
+
+Preflight enumerates power-of-two reverse widths and chunks up to the trajectory length under the fixed-slot,
+activation, LM-head, optimizer, and transfer reserve. It first maximizes the useful `batch * chunk` token tile. Equal
+tiles prefer at least two trajectories when feasible, then the longer chunk to reduce wavefront depth. The memory
+test includes six KV tensors for a one-chunk prefetch plan and four for a page-reuse plan. Non-zero token/batch/chunk
+caps remain available for controlled ablations.
 
 ## Baseline isolation
 
@@ -158,3 +194,9 @@ transport.
 The reverse chain rule, fixed-slot attention, and parameter gradients are checked against ordinary full-sequence
 training. Reverse kernels are BF16-only, so tests use numerical tolerances rather than bitwise equality. Unsupported
 device, dtype, head dimension, page size, or reverse shape fails before training starts.
+
+vLLM FlashAttention can produce numerically different BF16 top-k values when the same sequence is evaluated with
+different prefill partitioning. `VLLM_BATCH_INVARIANT=1` with an explicitly selected `FLASH_ATTN` backend is the
+bitwise correctness oracle for StreamingInput tests; it is not a production default because its deterministic GEMM
+and attention paths reduce Teacher throughput. In batch-invariant mode, multi-fragment Teacher artifacts match the
+full request exactly, including across fragment boundaries.

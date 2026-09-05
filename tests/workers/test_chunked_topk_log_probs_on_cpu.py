@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Numerical equivalence and gradient correctness tests for the chunked
-gather-logsumexp helper added to verl/trainer/distillation/fsdp/losses.py.
+"""Numerical and gradient tests for memory-bounded top-k log probabilities.
 
 The helper avoids materializing the [B, T, V] log_softmax tensor (which can
-exceed 28 GB at long context with V=152064 in bf16) by computing
-log_softmax(x).gather(idx) as x.gather(idx) - logsumexp(x, keepdim=True),
-streamed in chunks along the (B*T) dimension.
+exceed 28 GB at long context with V=152064 in bf16) by recomputing fused
+log-softmax one chunk at a time during backward.
 
 These tests verify:
-  1. Forward output matches torch.log_softmax(...).gather(...) exactly within
-     numerical precision (fp32 max diff ~1.9e-6 due to PyTorch's fused log_softmax
-     kernel vs explicit logsumexp; bf16/fp16 max diff = 0).
+  1. Forward output matches torch.log_softmax(...).gather(...).
   2. Result is independent of chunk_size (only memory/perf knob, never numerics).
   3. Backward gradients match the reference within autograd precision (~2.4e-7).
+  4. The custom autograd function retains only the original logits and ids, not
+     FP32 vocabulary-sized intermediates.
 
 All tests run on CPU and complete in seconds.
 """
@@ -38,6 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
+from verl.workers.config.distillation import DistillationLossConfig
 
 
 def _reference_topk_log_probs(logits: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -168,25 +167,53 @@ def test_empty_input():
     assert out.dtype == torch.float32
 
 
-def test_gradient_flows_through_slice_assignment():
-    """Verify that PyTorch tracks `out[s:e] = ...` via aten.index_put_ / CopySlices.
+def test_rejects_non_positive_chunk_size():
+    with pytest.raises(ValueError, match="must be positive"):
+        _chunked_topk_log_probs(
+            torch.randn(1, 2, 8),
+            torch.randint(0, 8, (1, 2, 2)),
+            chunk_size=0,
+        )
 
-    This is a regression guard for confusion that `torch.empty(...)` plus
-    in-place slice assignment might break autograd. PyTorch's __setitem__
-    dispatches to a differentiable op; `out` becomes non-leaf with
-    grad_fn=CopySlices and gradients propagate correctly.
-    """
+
+def test_memory_bound_chunk_config_has_safe_default_and_validates():
+    assert DistillationLossConfig().chunked_topk_chunk_size == 512
+    with pytest.raises(ValueError, match="must be positive"):
+        DistillationLossConfig(chunked_topk_chunk_size=0)
+
+
+def test_gradient_flows_through_memory_bound_function():
+    """The memory-bounded autograd function preserves the logits gradient."""
     torch.manual_seed(0)
     B, T, V, K = 2, 8, 256, 4
     logits = torch.randn(B, T, V, dtype=torch.float32, requires_grad=True)
     topk_ids = torch.randint(0, V, (B, T, K))
 
     out = _chunked_topk_log_probs(logits, topk_ids, chunk_size=4)
-    # After slice assignments, `out` should be a non-leaf tensor tracked by autograd.
-    assert not out.is_leaf, "out should be non-leaf after slice assignment"
+    assert not out.is_leaf, "chunked output should be tracked by autograd"
     assert out.requires_grad, "out should have requires_grad=True"
 
     out.sum().backward()
     assert logits.grad is not None, "gradient should propagate to logits"
     assert torch.isfinite(logits.grad).all(), "gradient should be finite"
     assert (logits.grad.abs() > 0).any(), "gradient should be non-zero"
+
+
+def test_memory_bound_function_does_not_save_fp32_vocabulary_intermediates():
+    logits = torch.randn(2, 8, 256, dtype=torch.bfloat16, requires_grad=True)
+    topk_ids = torch.randint(0, 256, (2, 8, 4))
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        _chunked_topk_log_probs(logits, topk_ids, chunk_size=3)
+
+    vocabulary_tensors = [tensor for tensor in saved if tensor.ndim == 2 and tensor.shape[-1] == 256]
+    assert vocabulary_tensors
+    assert all(tensor.dtype == logits.dtype for tensor in vocabulary_tensors)
+    assert all(
+        tensor.untyped_storage().data_ptr() == logits.untyped_storage().data_ptr() for tensor in vocabulary_tensors
+    )

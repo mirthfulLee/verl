@@ -14,7 +14,15 @@
 
 import asyncio
 
+from verl.experimental.agent_loop import resolve_do_sample
 from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
+
+
+def test_resolve_do_sample_uses_config_unless_per_sample_override_is_present():
+    assert resolve_do_sample(True)
+    assert not resolve_do_sample(False)
+    assert resolve_do_sample(False, True)
+    assert not resolve_do_sample(True, False)
 
 
 def test_settle_session_tasks_waits_for_siblings_after_failure():

@@ -130,3 +130,6 @@ logs
 log
 outputs
 .history
+
+# Local StreamOPD benchmark artifacts
+/benchmarks/streamopd_kv/results/

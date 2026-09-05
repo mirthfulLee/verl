@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -36,11 +38,18 @@ from verl.experimental.streamopd_kv.fsdp_worker import (
     _has_valid_response,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
+    _unsharded_gradient_reserve_bytes,
 )
 from verl.experimental.streamopd_kv.host_slot_pool import HostKVSlotPool, cleanup_host_kv_pools
-from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront
+from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront, _wavefront_compute_end
+from verl.experimental.streamopd_kv.reverse_attention import (
+    FixedSlotPageState,
+    ReverseKVSlotPool,
+    _ContiguousKVBatchView,
+)
 from verl.experimental.streamopd_kv.scheduler import StreamOPDTaskScheduler
 from verl.experimental.streamopd_kv.snapshot_io import (
+    extract_vllm_cross_layers_nhd_token_range,
     extract_vllm_nhd_token_range,
     extract_vllm_nhd_tokens,
     load_vllm_snapshot,
@@ -48,6 +57,59 @@ from verl.experimental.streamopd_kv.snapshot_io import (
 )
 from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.workers.config.distillation import DistillationConfig, StreamOPDKVConfig
+
+
+def test_contiguous_kv_view_keeps_native_gqa_heads_and_accumulates_gradients() -> None:
+    layer = SimpleNamespace(
+        key=torch.arange(3 * 5 * 2 * 3, dtype=torch.float32).reshape(3, 5, 2, 3),
+        value=torch.ones(3, 5, 2, 3),
+        key_grad=torch.zeros(3, 5, 2, 3),
+        value_grad=torch.zeros(3, 5, 2, 3),
+        num_kv_heads=2,
+        head_dim=3,
+    )
+    view = _ContiguousKVBatchView(layer, active=[0, 2], start=2, end=5)
+
+    key, value = view.key_value(query_heads=4)
+    assert key.shape == value.shape == (2, 5, 2, 3)
+    torch.testing.assert_close(key[1], layer.key[2])
+
+    key_gradient = torch.ones_like(key)
+    value_gradient = torch.full_like(value, 2)
+    view.accumulate_gradients(key_gradient, value_gradient)
+    torch.testing.assert_close(layer.key_grad[0], torch.ones_like(layer.key_grad[0]))
+    torch.testing.assert_close(layer.key_grad[1], torch.zeros_like(layer.key_grad[1]))
+    torch.testing.assert_close(layer.key_grad[2], torch.ones_like(layer.key_grad[2]))
+    torch.testing.assert_close(layer.value_grad[2], torch.full_like(layer.value_grad[2], 2))
+    current_key_grad, current_value_grad = view.grad
+    assert current_key_grad.shape == current_value_grad.shape == (2, 3, 2, 3)
+
+    with pytest.raises(ValueError, match="query heads"):
+        view.key_value(query_heads=3)
+
+
+def test_reverse_slot_abort_clears_failed_group_metadata() -> None:
+    pool = ReverseKVSlotPool.__new__(ReverseKVSlotPool)
+    pool.batch_size = 2
+    pool.num_pages = 3
+    pool._current_lengths = [192]
+    pool._next_sources = [[object()]]
+    pool._next_lengths = [64]
+    pool._next_padded_lengths = [64]
+    pool._pending_enqueues = []
+    pool.page_states = [[FixedSlotPageState.CURRENT_ACTIVE] * 3 for _ in range(2)]
+    pool.load_events = [[object()] * 3 for _ in range(2)]
+    pool.free_events = [[object()] * 3 for _ in range(2)]
+
+    pool.abort_groups()
+
+    assert pool._current_lengths == []
+    assert pool._next_sources is None
+    assert pool._next_lengths == []
+    assert pool._next_padded_lengths == []
+    assert pool.page_states == [[FixedSlotPageState.FREE] * 3 for _ in range(2)]
+    assert pool.load_events == [[None] * 3 for _ in range(2)]
+    assert pool.free_events == [[None] * 3 for _ in range(2)]
 
 
 @pytest.mark.asyncio
@@ -161,6 +223,85 @@ async def test_teacher_streaming_coalesces_queued_progress_before_prefill() -> N
 
 
 @pytest.mark.asyncio
+async def test_teacher_streaming_reports_one_scheduler_summary_per_trajectory() -> None:
+    calls: list[tuple[str, tuple]] = []
+
+    class RemoteMethod:
+        def __init__(self, name: str, result=None) -> None:
+            self.name = name
+            self.result = result
+
+        async def remote(self, *args):
+            calls.append((self.name, args))
+            return self.result
+
+    class Scheduler:
+        wait_teacher_session_admitted = RemoteMethod("admit", True)
+        teacher_trajectory_terminal_submitted = RemoteMethod("terminal")
+        teacher_session_released = RemoteMethod("release")
+        teacher_session_admission_cancelled = RemoteMethod("cancel")
+        teacher_trajectory_completed = RemoteMethod("complete")
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        del request_id, terminal
+        ids = torch.tensor(fragment).unsqueeze(-1)
+        return ids, -ids.float()
+
+    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=4, scheduler=Scheduler())
+    key = TrajectoryKey(3, "summary")
+    await coordinator.submit(CommittedTokenChunk(key=key, start=0, token_ids=(10, 11), prompt_ids=(1,), terminal=False))
+    await coordinator.submit(CommittedTokenChunk(key=key, start=2, token_ids=(12, 13), terminal=True))
+    await coordinator.result(key, required_completion_tokens=4)
+
+    assert [name for name, _ in calls] == ["terminal", "admit", "release", "complete"]
+    assert calls[0][1] == (3, 2)
+    assert len(calls[-1][1][1]) == 1
+
+
+@pytest.mark.asyncio
+async def test_teacher_admission_waits_once_for_scheduler_notification() -> None:
+    attempts = 0
+    releases = []
+
+    class WaitMethod:
+        async def remote(self, *args):
+            nonlocal attempts
+            attempts += 1
+            return True
+
+    class ReleaseMethod:
+        async def remote(self, *args):
+            releases.append(args)
+
+    class Scheduler:
+        wait_teacher_session_admitted = WaitMethod()
+        teacher_session_released = ReleaseMethod()
+        teacher_session_admission_cancelled = ReleaseMethod()
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        del request_id, terminal
+        ids = torch.tensor(fragment).unsqueeze(-1)
+        return ids, -ids.float()
+
+    coordinator = StreamingTeacherCoordinator(
+        score,
+        max_pending_chunks=4,
+        scheduler=Scheduler(),
+        max_active_trajectories=1,
+        max_active_kv_tokens=16,
+        kv_page_size=1,
+        kv_reservation_tokens=4,
+    )
+    key = TrajectoryKey(3, "backoff")
+
+    await coordinator._admit_session(key, 4)
+    await coordinator._release_session(key, 4)
+
+    assert attempts == 1
+    assert releases == [(3, "v3-backoff")]
+
+
+@pytest.mark.asyncio
 async def test_teacher_streaming_serializes_chunks_for_one_trajectory() -> None:
     calls = []
     first_started = asyncio.Event()
@@ -197,6 +338,46 @@ async def test_teacher_streaming_serializes_chunks_for_one_trajectory() -> None:
     assert calls[0][1] == calls[1][1]
     assert [call[2] for call in calls] == [False, True]
     torch.testing.assert_close(ids[:, 0], torch.tensor([1, 2, 10, 11, 12, 13]))
+
+
+@pytest.mark.asyncio
+async def test_teacher_streaming_concatenates_fragments_once_at_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    from verl.experimental.streamopd_kv import streaming_teacher
+
+    completed = asyncio.Queue()
+
+    async def score(fragment: list[int], request_id: str, terminal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        del request_id, terminal
+        ids = torch.tensor(fragment).unsqueeze(-1)
+        await completed.put(None)
+        return ids, -ids.float()
+
+    cat_calls = []
+    original_cat = torch.cat
+
+    def counted_cat(tensors, *args, **kwargs):
+        cat_calls.append(len(tensors))
+        return original_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(streaming_teacher.torch, "cat", counted_cat)
+    coordinator = StreamingTeacherCoordinator(score, max_pending_chunks=8, kv_page_size=1)
+    key = TrajectoryKey(9, "deferred-concat")
+    chunks = [
+        CommittedTokenChunk(key=key, start=0, token_ids=(10, 11), prompt_ids=(1, 2), terminal=False),
+        CommittedTokenChunk(key=key, start=2, token_ids=(12, 13), terminal=False),
+        CommittedTokenChunk(key=key, start=4, token_ids=(14, 15), terminal=True),
+    ]
+    for chunk in chunks:
+        await coordinator.submit(chunk)
+        await completed.get()
+        while coordinator._sessions[key].scored_response_tokens < chunk.end:
+            await asyncio.sleep(0)
+
+    assert cat_calls == []
+    ids, logprobs = await coordinator.result(key, required_completion_tokens=6)
+    assert cat_calls == [3, 3]
+    torch.testing.assert_close(ids[:, 0], torch.tensor([1, 2, 10, 11, 12, 13, 14, 15]))
+    torch.testing.assert_close(logprobs[:, 0], -ids[:, 0].float())
 
 
 @pytest.mark.asyncio
@@ -284,6 +465,49 @@ def test_vllm_prompt_logprobs_can_extract_incremental_tensor_suffix() -> None:
     assert result["prompt_ids"].dtype == torch.int32
     assert result["prompt_logprobs"].dtype == torch.float32
     torch.testing.assert_close(result["prompt_ids"], torch.tensor([[20, 21], [30, 31], [0, 0]], dtype=torch.int32))
+
+
+def test_vllm_prompt_logprobs_chunked_gather_matches_full_normalization() -> None:
+    from vllm.v1.sample.sampler import Sampler
+
+    from verl.workers.rollout.vllm_rollout.utils import _gather_prompt_logprobs_in_chunks
+
+    torch.manual_seed(17)
+    logits = torch.randn(11, 31, dtype=torch.bfloat16)
+    token_ids = torch.randint(0, logits.shape[-1], (logits.shape[0],))
+    sampler = Sampler()
+    expected = sampler.gather_logprobs(sampler.compute_logprobs(logits), 4, token_ids)
+    actual = _gather_prompt_logprobs_in_chunks(sampler, logits, 4, token_ids, chunk_size=3)
+
+    torch.testing.assert_close(actual.logprob_token_ids, expected.logprob_token_ids, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual.selected_token_ranks, expected.selected_token_ranks, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual.logprobs, expected.logprobs, rtol=0.0, atol=0.0)
+
+
+def test_vllm_prompt_logprobs_chunks_lm_head_and_normalization() -> None:
+    from vllm.v1.sample.sampler import Sampler
+
+    from verl.workers.rollout.vllm_rollout.utils import _compute_prompt_logprobs_in_chunks
+
+    torch.manual_seed(19)
+    hidden_states = torch.randn(11, 31, dtype=torch.bfloat16)
+    target_ids = torch.randint(0, hidden_states.shape[-1], (hidden_states.shape[0],))
+    calls = []
+
+    class Model:
+        @staticmethod
+        def compute_logits(chunk):
+            calls.append(chunk.shape[0])
+            return chunk
+
+    sampler = Sampler()
+    expected = sampler.gather_logprobs(sampler.compute_logprobs(hidden_states), 4, target_ids)
+    actual = _compute_prompt_logprobs_in_chunks(Model(), sampler, hidden_states, 4, target_ids, chunk_size=3)
+
+    assert calls == [3, 3, 3, 2]
+    torch.testing.assert_close(actual.logprob_token_ids, expected.logprob_token_ids, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual.selected_token_ranks, expected.selected_token_ranks, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual.logprobs, expected.logprobs, rtol=0.0, atol=0.0)
 
 
 def test_vllm_worker_reports_and_resets_device_memory_stats(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,6 +623,110 @@ def test_rollout_manager_aggregates_vllm_worker_memory_stats() -> None:
     }
 
 
+def test_vllm_worker_exposes_streamopd_connector_transfer_stats(monkeypatch) -> None:
+    import vllm.distributed.kv_transfer as kv_transfer
+
+    from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
+
+    resets = []
+    connector = SimpleNamespace(
+        reset_transfer_stats=lambda: resets.append(True),
+        get_transfer_stats=lambda: {"copy_chunks": 3.0},
+        wait_for_all_exports=lambda: 1.25,
+    )
+    monkeypatch.setattr(kv_transfer, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kv_transfer, "get_kv_transfer_group", lambda: connector)
+
+    worker = SimpleNamespace()
+    assert vLLMColocateWorkerExtension.reset_streamopd_kv_transfer_stats(worker) is True
+    assert resets == [True]
+    assert vLLMColocateWorkerExtension.get_streamopd_kv_transfer_stats(worker) == {"copy_chunks": 3.0}
+    assert vLLMColocateWorkerExtension.wait_for_streamopd_kv_transfers(worker) == 1.25
+
+    monkeypatch.setattr(kv_transfer, "has_kv_transfer_group", lambda: False)
+    assert vLLMColocateWorkerExtension.reset_streamopd_kv_transfer_stats(worker) is False
+    assert vLLMColocateWorkerExtension.get_streamopd_kv_transfer_stats(worker) == {}
+    assert vLLMColocateWorkerExtension.wait_for_streamopd_kv_transfers(worker) == 0.0
+
+
+def test_rollout_manager_aggregates_streamopd_transfer_stats() -> None:
+    from verl.workers.rollout.llm_server import LLMServerManager
+
+    keys = (
+        "copy_chunks",
+        "copy_bytes",
+        "copy_calls",
+        "block_runs",
+        "staging_wait_seconds",
+        "copy_enqueue_seconds",
+        "gpu_gather_seconds",
+        "gpu_d2h_seconds",
+        "gpu_copy_seconds",
+        "d2h_wait_seconds",
+        "host_commit_seconds",
+        "terminal_wait_seconds",
+        "max_staging_wait_seconds",
+        "max_outstanding_writes",
+    )
+
+    class RemoteMethod:
+        def __init__(self, value):
+            self.value = value
+
+        async def remote(self, method):
+            assert method == "get_streamopd_kv_transfer_stats"
+            return [self.value]
+
+    manager = LLMServerManager.__new__(LLMServerManager)
+    manager.server_handles = [
+        SimpleNamespace(collective_rpc=RemoteMethod({key: float(index + 1) for index, key in enumerate(keys)})),
+        SimpleNamespace(collective_rpc=RemoteMethod({key: float(2 * (index + 1)) for index, key in enumerate(keys)})),
+    ]
+
+    stats = manager.collect_streamopd_kv_transfer_stats()
+    for index, key in enumerate(keys[:-2]):
+        assert stats[key] == 3.0 * (index + 1)
+    assert stats["max_staging_wait_seconds"] == 2.0 * (keys.index("max_staging_wait_seconds") + 1)
+    assert stats["max_outstanding_writes"] == 2.0 * (keys.index("max_outstanding_writes") + 1)
+
+
+def test_rollout_manager_aggregates_profiled_kv_capacity() -> None:
+    from verl.workers.rollout.llm_server import LLMServerManager
+
+    class RemoteMethod:
+        def __init__(self, value):
+            self.value = value
+
+        async def remote(self, method):
+            assert method == "get_kv_cache_capacity"
+            return self.value
+
+    manager = LLMServerManager.__new__(LLMServerManager)
+    manager.server_handles = [
+        SimpleNamespace(collective_rpc=RemoteMethod([{"capacity_tokens": 120}, {"capacity_tokens": 120}])),
+        SimpleNamespace(collective_rpc=RemoteMethod([{"capacity_tokens": 80}, {"capacity_tokens": 80}])),
+    ]
+
+    assert manager.collect_kv_cache_capacity_tokens() == 200
+
+
+def test_vllm_connector_transfer_stats_accumulate_maxima_and_reset() -> None:
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector
+
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    connector._futures = {}
+    connector._record_transfer_stats(copy_chunks=2, copy_bytes=16, maxima={"max_outstanding_writes": 3})
+    connector._record_transfer_stats(copy_chunks=1, copy_bytes=8, maxima={"max_outstanding_writes": 2})
+
+    stats = connector.get_transfer_stats()
+    assert stats["copy_chunks"] == 3
+    assert stats["copy_bytes"] == 24
+    assert stats["max_outstanding_writes"] == 3
+
+    connector.reset_transfer_stats()
+    assert all(value == 0 for value in connector.get_transfer_stats().values())
+
+
 def test_vllm_worker_reports_profiled_kv_capacity() -> None:
     from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 
@@ -492,11 +820,104 @@ def test_shared_host_kv_slot_pool_uses_fixed_backing_and_reuses_rows(tmp_path) -
     assert not list(tmp_path.glob("host_kv_pool.tp0.*"))
 
 
+def test_shared_host_kv_metadata_waits_for_async_seal(tmp_path) -> None:
+    pool = HostKVSlotPool.create_or_open(
+        str(tmp_path),
+        tp_rank=0,
+        slot_count=1,
+        token_capacity=4,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=16,
+        dtype=torch.float32,
+    )
+    slot_path = pool.acquire(request_id="backend", trajectory_id="trajectory", policy_version=3, prompt_length=1)
+
+    def seal() -> None:
+        time.sleep(0.02)
+        pool.seal(
+            slot_path,
+            request_id="backend",
+            trajectory_id="trajectory",
+            policy_version=3,
+            prompt_length=1,
+            token_ids=[4, 5, 6],
+            token_count=3,
+            streamed_tokens_before_eos=0,
+            streamed_chunks_before_eos=0,
+        )
+
+    thread = threading.Thread(target=seal)
+    thread.start()
+    metadata = pool.metadata(
+        slot_path,
+        trajectory_id="trajectory",
+        policy_version=3,
+        prompt_length=1,
+        token_ids=[4, 5, 6],
+        wait_timeout_seconds=1.0,
+    )
+    thread.join()
+    assert metadata["token_count"] == 3
+    pool.release(slot_path)
+    pool.close()
+
+
 def test_vllm_range_extraction_copies_only_intersecting_blocks() -> None:
     cache = torch.arange(4 * 2 * 4 * 1 * 2).reshape(4, 2, 4, 1, 2)
     full = extract_vllm_nhd_tokens(cache, [3, 1, 2], block_size=4, num_tokens=12)
     selected = extract_vllm_nhd_token_range(cache, [3, 1, 2], block_size=4, start=3, end=10)
     torch.testing.assert_close(selected, full[3:10])
+
+
+def test_vllm_cross_layer_range_extraction_matches_individual_layers() -> None:
+    layers = [torch.arange(4 * 2 * 4 * 1 * 2).reshape(4, 2, 4, 1, 2) + 1000 * layer for layer in range(3)]
+    cross_layers = torch.stack(layers, dim=1)
+    expected = torch.stack([extract_vllm_nhd_token_range(layer, [3, 1, 2], 4, 3, 10) for layer in layers])
+
+    actual = extract_vllm_cross_layers_nhd_token_range(cross_layers, [3, 1, 2], 4, 3, 10)
+    torch.testing.assert_close(actual, expected)
+    reordered = extract_vllm_cross_layers_nhd_token_range(
+        cross_layers,
+        [3, 1, 2],
+        4,
+        3,
+        10,
+        layer_order=[2, 0, 1],
+    )
+    torch.testing.assert_close(reordered, expected[[2, 0, 1]])
+
+
+def test_vllm_cross_layer_registration_uses_physical_layout_not_backend_identity(monkeypatch) -> None:
+    from verl.experimental.streamopd_kv import vllm_connector
+
+    connector = vllm_connector.StreamOPDKVConnector.__new__(vllm_connector.StreamOPDKVConnector)
+    connector._block_size = 4
+    connector._chunk_size = 8
+    connector._export_strategy = "eos_host"
+    connector._kv_cache_config = SimpleNamespace(
+        kv_cache_tensors=[
+            SimpleNamespace(shared_by=["model.layers.1.attn"]),
+            SimpleNamespace(shared_by=["model.layers.0.attn"]),
+        ]
+    )
+    connector._staging_token_capacity = connector._chunk_size
+    connector._cross_output_buffers = []
+    connector._cross_block_id_buffers = []
+    connector._cross_block_id_host_buffers = []
+    connector._cross_block_id_host_views = []
+    initialized = {}
+    connector._initialize_host_storage = lambda *args: initialized.setdefault("shape", args)
+    monkeypatch.setattr(vllm_connector, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(vllm_connector, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    cache = torch.empty(3, 2, 2, 4, 1, 8)
+    connector.register_cross_layers_kv_cache(cache, attn_backend=object)
+
+    assert connector._cross_layer_order == (1, 0)
+    assert connector._staging_token_capacity == 12
+    assert initialized["shape"] == (2, 1, 8, cache.dtype)
 
 
 def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
@@ -505,6 +926,7 @@ def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
     connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
     connector._chunk_size = 4
     connector._block_size = 2
+    connector._export_strategy = "incremental_triton"
     connector._pending = []
     connector._claimed_requests = set()
     state = _SchedulerSaveState(
@@ -527,6 +949,90 @@ def test_vllm_connector_queues_kv_before_eos_and_only_seals_the_tail() -> None:
     ]
     assert state.published_tokens == 7
     assert state.next_chunk_index == 2
+
+
+def test_vllm_connector_eos_export_queues_the_complete_trajectory() -> None:
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector, _SchedulerSaveState
+
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    connector._chunk_size = 4
+    connector._block_size = 2
+    connector._export_strategy = "eos_host"
+    connector._pending = []
+    state = _SchedulerSaveState(
+        req_id="backend",
+        trajectory_id="trajectory",
+        slot_path="/tmp/trajectory",
+        block_ids_by_group=[[0, 1, 2, 3]],
+        policy_version=6,
+        prompt_length=2,
+    )
+
+    connector._queue_committed(state, 6)
+    assert not connector._pending
+    assert state.published_tokens == 0
+
+    connector._queue_committed(state, 7, terminal=True, token_ids=torch.arange(7))
+    assert [(item.start, item.end, item.terminal) for item in connector._pending] == [
+        (0, 4, False),
+        (4, 7, True),
+    ]
+    assert connector._pending[-1].streamed_tokens_before_eos == 0
+    assert connector._pending[-1].streamed_chunks_before_eos == 0
+
+
+def test_vllm_connector_preemption_restarts_export_from_recomputed_prefix() -> None:
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector, _SchedulerSaveState
+
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    state = _SchedulerSaveState(
+        req_id="backend",
+        trajectory_id="trajectory",
+        slot_path="/tmp/trajectory",
+        block_ids_by_group=[[1, 2]],
+        policy_version=6,
+        prompt_length=2,
+        published_tokens=4,
+        next_chunk_index=1,
+    )
+    connector._scheduler_states = {state.req_id: state}
+    connector._scheduler_paths = {state.req_id: state.slot_path}
+    connector._pending = []
+    cached = SimpleNamespace(req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set())
+    scheduler_output = SimpleNamespace(
+        preempted_req_ids={state.req_id},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached,
+        num_scheduled_tokens={},
+    )
+
+    metadata = connector.build_connector_meta(scheduler_output)
+
+    assert not metadata.pending_saves
+    assert state.published_tokens == 0
+    assert state.next_chunk_index == 1
+    assert connector._scheduler_paths[state.req_id] == state.slot_path
+
+
+def test_vllm_connector_raw_block_runs_and_host_reorder() -> None:
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector
+
+    assert StreamOPDKVConnector._block_runs([8, 9, 10, 3, 4, 12]) == [
+        (0, 8, 1, 3),
+        (3, 3, 1, 2),
+        (5, 12, 1, 1),
+    ]
+    assert StreamOPDKVConnector._block_runs([2, 66, 130, 194]) == [(0, 2, 64, 4)]
+
+    blocks = torch.arange(4 * 3 * 2, dtype=torch.float32).view(4, 3, 2)
+    destination = torch.empty(8, 2)
+    StreamOPDKVConnector._copy_raw_token_range(
+        destination,
+        blocks,
+        token_offset=1,
+        token_count=8,
+    )
+    torch.testing.assert_close(destination, blocks.flatten(0, 1)[1:9])
 
 
 def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
@@ -578,7 +1084,101 @@ def test_fixed_slot_preflight_jointly_selects_stable_batch_and_chunk() -> None:
         dtype=torch.bfloat16,
         available_memory_bytes=memory,
     )
-    assert (long.batch_size, long.token_capacity, long.chunk_size) == (4, 8192, 1024)
+    assert (long.batch_size, long.token_capacity, long.chunk_size) == (8, 8192, 1024)
+
+    non_power_cap = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=6,
+        token_capacity=4096,
+        max_batch_tokens=6 * 4096,
+        max_chunk_size=1024,
+        min_chunk_size=256,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=128 * 1024**3,
+    )
+    assert (non_power_cap.batch_size, non_power_cap.token_capacity, non_power_cap.chunk_size) == (4, 4096, 1024)
+
+
+def test_fixed_slot_preflight_maximizes_token_tile_without_preferring_singleton_batch() -> None:
+    config = SimpleNamespace(
+        hidden_size=2560,
+        num_hidden_layers=36,
+        num_key_value_heads=8,
+        num_attention_heads=32,
+        head_dim=128,
+        vocab_size=151936,
+    )
+    model = SimpleNamespace(config=config, model=SimpleNamespace(layers=[object()] * 36))
+
+    balanced = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=16,
+        token_capacity=8192,
+        max_batch_tokens=16 * 8192,
+        max_chunk_size=8192,
+        min_chunk_size=64,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=int(78.5 * 1024**3),
+        reserve_bytes=int(30.2 * 1024**3),
+    )
+    assert (balanced.batch_size, balanced.chunk_size) == (2, 2048)
+    assert balanced.prefetch_kv is False
+
+    small_config = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=28,
+        num_key_value_heads=8,
+        num_attention_heads=16,
+        head_dim=128,
+        vocab_size=151936,
+    )
+    small_model = SimpleNamespace(config=small_config, model=SimpleNamespace(layers=[object()] * 28))
+    one_chunk = _fixed_reverse_slot_plan(
+        small_model,
+        configured_batch_size=16,
+        token_capacity=4096,
+        max_batch_tokens=16 * 4096,
+        max_chunk_size=4096,
+        min_chunk_size=64,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=int(78.5 * 1024**3),
+        reserve_bytes=int(15.3 * 1024**3),
+    )
+    assert (one_chunk.batch_size, one_chunk.chunk_size) == (2, 4096)
+    assert one_chunk.prefetch_kv is True
+
+    memory_fallback = _fixed_reverse_slot_plan(
+        small_model,
+        configured_batch_size=16,
+        token_capacity=4096,
+        max_batch_tokens=16 * 4096,
+        max_chunk_size=4096,
+        min_chunk_size=64,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=int(52 * 1024**3),
+        reserve_bytes=int(15.3 * 1024**3),
+    )
+    assert (memory_fallback.batch_size, memory_fallback.chunk_size) == (2, 2048)
+    assert memory_fallback.prefetch_kv is False
+
+    singleton_fallback = _fixed_reverse_slot_plan(
+        model,
+        configured_batch_size=1,
+        token_capacity=8192,
+        max_batch_tokens=8192,
+        max_chunk_size=8192,
+        min_chunk_size=64,
+        page_size=64,
+        dtype=torch.bfloat16,
+        available_memory_bytes=int(78.5 * 1024**3),
+        reserve_bytes=int(30.2 * 1024**3),
+    )
+    assert (singleton_fallback.batch_size, singleton_fallback.chunk_size) == (1, 4096)
+    assert singleton_fallback.prefetch_kv is False
 
 
 def test_fixed_slot_preflight_reports_memory_budget_on_failure() -> None:
@@ -612,9 +1212,12 @@ def test_reverse_preflight_reserves_lazy_adam_state_and_gradients() -> None:
     parameter_bytes = model.weight.numel() * model.weight.element_size()
 
     assert _deferred_training_state_bytes(model, optimizer) == 3 * parameter_bytes
+    assert _unsharded_gradient_reserve_bytes(model, data_parallel_size=4) == 3 * parameter_bytes
+    with pytest.raises(ValueError, match="data_parallel_size"):
+        _unsharded_gradient_reserve_bytes(model, data_parallel_size=0)
     model.weight.grad = torch.zeros_like(model.weight)
     optimizer.state[model.weight]["exp_avg"] = torch.zeros_like(model.weight)
-    assert _deferred_training_state_bytes(model, optimizer) == parameter_bytes
+    assert _deferred_training_state_bytes(model, optimizer) == 3 * parameter_bytes
 
 
 def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
@@ -622,19 +1225,6 @@ def test_trainer_rejects_a_second_gpu_kv_lease() -> None:
     worker._gpu_kv_lease_active = True
     with pytest.raises(RuntimeError, match="already holds a GPU KV lease"):
         worker.train_mini_batch(TensorDict({}, batch_size=[]))
-
-
-def test_reverse_preflight_constraints_are_installed_before_slot_allocation() -> None:
-    worker = StreamOPDKVTrainingWorker.__new__(StreamOPDKVTrainingWorker)
-    worker._reverse_slot_pool = None
-    worker._preflight_batch_cap = None
-    worker._preflight_additional_reserve_bytes = 0
-    worker.configure_reverse_preflight(batch_cap=4, additional_reserve_gib=1.25)
-    assert worker._preflight_batch_cap == 4
-    assert worker._preflight_additional_reserve_bytes == int(1.25 * 1024**3)
-    worker._reverse_slot_pool = object()
-    with pytest.raises(RuntimeError, match="after slot allocation"):
-        worker.configure_reverse_preflight(batch_cap=2)
 
 
 def test_vllm_nhd_page_extraction_preserves_logical_token_order() -> None:
@@ -668,6 +1258,13 @@ def test_reverse_wavefront_only_batches_active_trajectories() -> None:
         (2, [0, 1, 2, 3]),
         (1, [0, 1, 2, 3]),
     ]
+
+
+def test_reverse_wavefront_trims_only_trailing_page_padding() -> None:
+    lengths = [7010, 6577, 6100]
+
+    assert _wavefront_compute_end(lengths, [0, 1], 6144, 8192, page_size=64) == 7040
+    assert _wavefront_compute_end(lengths, [0, 1, 2], 4096, 6144, page_size=64) == 6144
 
 
 def test_zero_loss_synthetic_padding_is_not_trainable() -> None:
@@ -708,6 +1305,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
                     "ppo_epochs": 1,
                     "loss_agg_mode": "token-mean",
                     "use_torch_compile": False,
+                    "fsdp_config": {"param_offload": True, "optimizer_offload": True},
                 },
             },
             "distillation": {
@@ -716,6 +1314,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
                 "streamopd_kv": {
                     "enabled": True,
                     "runtime_profile": "manual",
+                    "trainer_placement": "teacher",
                     "kv_handoff_dir": "/tmp/test-streamopd",
                 },
                 "distillation_loss": {
@@ -740,7 +1339,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
     assert config.distillation.streamopd_kv.reverse_slot_max_tokens == 4096
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
     assert config.distillation.streamopd_kv.reverse_batch_max_tokens == 128 * 4096
-    assert config.distillation.streamopd_kv.reverse_chunk_size == 1024
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 4096
     assert config.distillation.streamopd_kv.reverse_chunk_min_size == 64
 
     stale_config = copy.deepcopy(config)
@@ -799,6 +1398,13 @@ def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
                 "max_response_length": 3072,
             },
             "actor_rollout_ref": {
+                "actor": {
+                    "fsdp_config": {
+                        "param_offload": False,
+                        "optimizer_offload": False,
+                        "use_no_sync_for_gradient_accumulation": False,
+                    }
+                },
                 "rollout": {
                     "nnodes": 1,
                     "n_gpus_per_node": 2,
@@ -810,7 +1416,7 @@ def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
                     "max_num_seqs": 1024,
                     "gpu_memory_utilization": 0.3,
                     "checkpoint_engine": {"backend": "naive"},
-                }
+                },
             },
             "distillation": {
                 "n_gpus_per_node": 2,
@@ -845,11 +1451,10 @@ def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
     assert plan == {
         "profile": "auto",
         "trajectory_tokens": 4096,
-        "token_chunk_size": 384,
+        "token_chunk_size": 768,
         "teacher_max_batched_tokens": 4096,
-        "teacher_gpu_memory_utilization": 0.25,
-        "teacher_max_num_seqs": 64,
-        "rollout_gpu_memory_utilization_ceiling": 0.9,
+        "vllm_memory_policy": "exclusive_free",
+        "teacher_max_num_seqs": 32,
         "rollout_max_num_seqs": 64,
     }
     assert config.actor_rollout_ref.rollout.nnodes == 1
@@ -867,15 +1472,26 @@ def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
     assert config.actor_rollout_ref.rollout.max_model_len == 4097
     assert config.actor_rollout_ref.rollout.checkpoint_engine.backend == "host"
     assert config.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 512
+    assert config.actor_rollout_ref.actor.fsdp_config.param_offload is True
+    assert config.actor_rollout_ref.actor.fsdp_config.optimizer_offload is True
+    assert config.actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation is False
     assert config.distillation.streamopd_kv.reverse_batch_size == 0
     assert config.distillation.streamopd_kv.reverse_chunk_size == 0
     assert config.distillation.streamopd_kv.teacher_prefill_max_active_kv_tokens == 0
     assert config.distillation.streamopd_kv.kv_handoff_dir.startswith("/dev/shm/verl-streamopd-kv-")
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.3
+    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.5
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.verl_exclusive_gpu_memory
+    assert config.distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.additional_config.get(
+        "verl_exclusive_gpu_memory"
+    )
+    assert config.distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.additional_config.get(
+        "verl_streaming_teacher_logprobs"
+    )
 
     config.distillation.streamopd_kv.trainer_placement = "rollout"
     shared_rollout_plan = _auto_streamopd_runtime_profile(config)
-    assert shared_rollout_plan["teacher_gpu_memory_utilization"] == 0.9
-    assert shared_rollout_plan["rollout_gpu_memory_utilization_ceiling"] == 0.9
+    assert shared_rollout_plan["vllm_memory_policy"] == "exclusive_free"
     assert config.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 128
 
     config.data.train_batch_size = 256
@@ -885,12 +1501,14 @@ def test_auto_runtime_profile_needs_only_resource_allocation() -> None:
     config.distillation.streamopd_kv.trainer_placement = "dedicated"
     long_context_plan = _auto_streamopd_runtime_profile(config)
     assert long_context_plan["trajectory_tokens"] == 8192
-    assert long_context_plan["token_chunk_size"] == 896
+    assert long_context_plan["token_chunk_size"] == 1024
+    assert config.distillation.streamopd_kv.rollout_kv_export_strategy == "eos_host"
+    assert config.distillation.streamopd_kv.rollout_kv_export_chunk_size == 2048
+    assert config.distillation.streamopd_kv.rollout_kv_writer_threads == 4
     assert long_context_plan["teacher_max_batched_tokens"] == 8192
-    assert long_context_plan["teacher_max_num_seqs"] == 64
+    assert long_context_plan["teacher_max_num_seqs"] == 32
     assert long_context_plan["rollout_max_num_seqs"] == 64
-    assert long_context_plan["teacher_gpu_memory_utilization"] == 0.9
-    assert long_context_plan["rollout_gpu_memory_utilization_ceiling"] == 0.9
+    assert long_context_plan["vllm_memory_policy"] == "exclusive_free"
 
 
 def test_auto_runtime_profile_preserves_explicit_existing_options() -> None:
@@ -898,6 +1516,7 @@ def test_auto_runtime_profile_preserves_explicit_existing_options() -> None:
         {
             "data": {"train_batch_size": 128, "max_prompt_length": 1024, "max_response_length": 3072},
             "actor_rollout_ref": {
+                "actor": {"fsdp_config": {"param_offload": False, "optimizer_offload": False}},
                 "rollout": {
                     "nnodes": 1,
                     "n_gpus_per_node": 1,
@@ -909,7 +1528,7 @@ def test_auto_runtime_profile_preserves_explicit_existing_options() -> None:
                     "max_num_seqs": 48,
                     "gpu_memory_utilization": 0.7,
                     "checkpoint_engine": {"backend": "host", "update_weights_bucket_megabytes": 256},
-                }
+                },
             },
             "distillation": {
                 "n_gpus_per_node": 2,
@@ -934,18 +1553,26 @@ def test_auto_runtime_profile_preserves_explicit_existing_options() -> None:
     explicit = {
         "actor_rollout_ref.rollout.gpu_memory_utilization",
         "actor_rollout_ref.rollout.max_num_seqs",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
         "distillation.teacher_models.teacher_model.inference.max_num_batched_tokens",
         "distillation.streamopd_kv.token_chunk_size",
     }
 
-    _auto_streamopd_runtime_profile(config, explicit_paths=explicit)
+    plan = _auto_streamopd_runtime_profile(config, explicit_paths=explicit)
 
     assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.7
     assert config.actor_rollout_ref.rollout.max_num_seqs == 48
+    assert config.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 256
     assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 3072
     assert config.distillation.streamopd_kv.token_chunk_size == 512
+    assert plan["teacher_max_batched_tokens"] == 3072
+    assert plan["token_chunk_size"] == 512
     assert config.actor_rollout_ref.rollout.max_model_len == 4097
-    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.25
+    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.3
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.verl_exclusive_gpu_memory
+    assert config.distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.additional_config.get(
+        "verl_exclusive_gpu_memory"
+    )
 
 
 def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None:
@@ -983,6 +1610,11 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
                     "ppo_epochs": 1,
                     "loss_agg_mode": "token-mean",
                     "use_torch_compile": False,
+                    "fsdp_config": {
+                        "param_offload": False,
+                        "optimizer_offload": False,
+                        "use_no_sync_for_gradient_accumulation": False,
+                    },
                 },
             },
             "distillation": {
@@ -1019,13 +1651,20 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
     prepare_streamopd_kv_config(config)
 
     assert config.distillation.streamopd_kv.runtime_profile == "auto"
-    assert config.distillation.streamopd_kv.token_chunk_size == 384
-    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.25
+    assert config.distillation.streamopd_kv.token_chunk_size == 768
+    assert config.distillation.teacher_models.teacher_model.inference.gpu_memory_utilization == 0.5
     assert config.actor_rollout_ref.rollout.max_num_seqs == 64
     assert config.actor_rollout_ref.rollout.checkpoint_engine.backend == "host"
-    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.9
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.5
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.verl_exclusive_gpu_memory
+    assert config.distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm.additional_config.get(
+        "verl_exclusive_gpu_memory"
+    )
+    assert config.actor_rollout_ref.actor.fsdp_config.param_offload is True
+    assert config.actor_rollout_ref.actor.fsdp_config.optimizer_offload is True
+    assert config.actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation is False
     assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 4096
-    assert config.distillation.streamopd_kv.reverse_chunk_size == 1024
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 4096
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
 
 
@@ -1055,45 +1694,71 @@ def test_prepare_config_does_not_mutate_sync_baseline() -> None:
 
 def test_teacher_priority_scheduler_enforces_version_barrier() -> None:
     scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(7)
-    scheduler.teacher_notified(7)
-    scheduler.teacher_enqueued(7)
-    scheduler.teacher_started(7)
+    scheduler.begin_policy(7, expected_trajectories=1)
+    assert scheduler.try_teacher_session_admitted(7, "teacher-0", 32, 1, 32)
+    scheduler.teacher_trajectory_terminal_submitted(7, notifications=2)
     state = scheduler.snapshot()
     assert state["teacher_pending"] == 1
     with pytest.raises(RuntimeError, match="unfinished work"):
         scheduler.end_policy(7)
 
-    scheduler.teacher_finished(7)
+    score_started = time.perf_counter()
+    time.sleep(0.001)
+    scheduler.teacher_session_released(7, "teacher-0")
+    scheduler.teacher_trajectory_completed(7, [(score_started, time.perf_counter())])
     scheduler.training_started(7)
     with pytest.raises(RuntimeError, match="unfinished work"):
         scheduler.end_policy(7)
     scheduler.training_finished(7)
     metrics = scheduler.end_policy(7)
     assert metrics["streamopd/scheduler_teacher_chunks"] == 1
-    assert metrics["streamopd/scheduler_teacher_notifications"] == 1
-    assert metrics["streamopd/scheduler_teacher_coalesced_fragments"] == 0
+    assert metrics["streamopd/scheduler_teacher_notifications"] == 2
+    assert metrics["streamopd/scheduler_teacher_coalesced_fragments"] == 1
     assert metrics["streamopd/scheduler_training_units"] == 1
     assert metrics["streamopd/scheduler_pool_busy_seconds"] >= 0
     with pytest.raises(RuntimeError, match="no active policy"):
-        scheduler.teacher_enqueued(8)
+        scheduler.teacher_trajectory_terminal_submitted(8)
 
 
 def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     from verl.experimental.streamopd_kv.planning import (
-        checkpoint_weight_bytes,
         kv_bytes_per_token,
-        minimum_device_total_bytes,
         partition_training_units,
         plan_host_kv,
         plan_teacher_admission,
-        plan_vllm_memory,
+        plan_training_unit_size,
         planned_reverse_width,
-        shared_vllm_utilization_limit,
     )
 
     assert partition_training_units(128, 16) == [16] * 8
     assert partition_training_units(130, 16) == [16] * 8 + [2]
+    assert (
+        plan_training_unit_size(
+            train_batch_size=128,
+            reverse_wave_size=16,
+            resources_overlap=True,
+            kv_prefetch_depth=1,
+        )
+        == 128
+    )
+    assert (
+        plan_training_unit_size(
+            train_batch_size=256,
+            reverse_wave_size=16,
+            resources_overlap=False,
+            kv_prefetch_depth=1,
+        )
+        == 32
+    )
+    assert (
+        plan_training_unit_size(
+            train_batch_size=256,
+            reverse_wave_size=16,
+            resources_overlap=False,
+            kv_prefetch_depth=3,
+        )
+        == 64
+    )
     assert (
         planned_reverse_width(
             [{"slot_batch_size": 8.0}, [{"slot_batch_size": 4.0}]],
@@ -1108,15 +1773,28 @@ def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) 
         page_size=64,
         max_batched_tokens=2048,
         initial_chunk_tokens=384,
-        train_launch_width=8,
     ) == {
-        "active_trajectories": 8,
-        "active_kv_tokens": 8192,
+        "active_trajectories": 32,
+        "active_kv_tokens": 32768,
         "vllm_capacity_tokens": 40000,
-        "safe_capacity_tokens": 29952,
+        "safe_capacity_tokens": 40000,
         "trajectory_tokens": 1024,
+        "teacher_replicas": 1,
+        "prefill_wave_per_replica": 5,
         "prefill_wave": 5,
     }
+    replicated = plan_teacher_admission(
+        expected_trajectories=32,
+        trajectory_tokens=1000,
+        vllm_capacity_tokens=40000,
+        page_size=64,
+        max_batched_tokens=2048,
+        initial_chunk_tokens=384,
+        teacher_replicas=2,
+    )
+    assert replicated["active_trajectories"] == 32
+    assert replicated["prefill_wave_per_replica"] == 5
+    assert replicated["prefill_wave"] == 10
     capped = plan_teacher_admission(
         expected_trajectories=32,
         trajectory_tokens=4096,
@@ -1124,7 +1802,6 @@ def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) 
         page_size=64,
         max_batched_tokens=2048,
         initial_chunk_tokens=1024,
-        train_launch_width=8,
         trajectory_cap=16,
         token_cap=12000,
     )
@@ -1138,82 +1815,16 @@ def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) 
             page_size=64,
             max_batched_tokens=2048,
             initial_chunk_tokens=1024,
-            train_launch_width=4,
             token_cap=2048,
         )
-
-    assert minimum_device_total_bytes([{"total_bytes": 80 * 1024**3}, [{"total_bytes": 79 * 1024**3}]]) == 79 * 1024**3
-    shared_limit = shared_vllm_utilization_limit(
-        [
-            {"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3},
-            {"free_bytes": 68 * 1024**3, "total_bytes": 80 * 1024**3},
-        ],
-        rank_offset=1,
-        world_size=1,
-        required_free_bytes=28 * 1024**3,
-    )
-    assert shared_limit == {
-        "utilization_limit": 0.5,
-        "free_gib": 68.0,
-        "total_gib": 80.0,
-        "reverse_reserve_gib": 28.0,
-    }
-    with pytest.raises(ValueError, match="insufficient memory"):
-        shared_vllm_utilization_limit(
-            [{"free_bytes": 30 * 1024**3, "total_bytes": 80 * 1024**3}],
-            rank_offset=0,
-            world_size=1,
-            required_free_bytes=20 * 1024**3,
-        )
-    inferred_4k = plan_vllm_memory(
-        total_memory_bytes=80 * 1024**3,
-        weight_bytes=4063479808,
-        kv_bytes_per_token=112 * 1024,
-        requested_max_num_seqs=128,
-        max_model_len=4096,
-        utilization_limit=0.9,
-        max_num_seqs_explicit=False,
-        utilization_explicit=False,
-    )
-    assert inferred_4k["max_num_seqs"] == 128
-    assert inferred_4k["gpu_memory_utilization"] == 0.9
-
-    inferred_8k = plan_vllm_memory(
-        total_memory_bytes=80 * 1024**3,
-        weight_bytes=4063479808,
-        kv_bytes_per_token=112 * 1024,
-        requested_max_num_seqs=128,
-        max_model_len=8192,
-        utilization_limit=0.9,
-        max_num_seqs_explicit=False,
-        utilization_explicit=False,
-    )
-    assert inferred_8k["max_num_seqs"] == 64
-    assert inferred_8k["gpu_memory_utilization"] == 0.9
-
-    memory_capped_8k = plan_vllm_memory(
-        total_memory_bytes=80 * 1024**3,
-        weight_bytes=4063479808,
-        kv_bytes_per_token=112 * 1024,
-        requested_max_num_seqs=128,
-        max_model_len=8192,
-        utilization_limit=0.5,
-        max_num_seqs_explicit=False,
-        utilization_explicit=True,
-    )
-    assert memory_capped_8k["max_num_seqs"] == 32
-    assert memory_capped_8k["gpu_memory_utilization"] == 0.5
-
-    with pytest.raises(ValueError, match="explicitly requested"):
-        plan_vllm_memory(
-            total_memory_bytes=80 * 1024**3,
-            weight_bytes=4063479808,
-            kv_bytes_per_token=112 * 1024,
-            requested_max_num_seqs=128,
-            max_model_len=8192,
-            utilization_limit=0.5,
-            max_num_seqs_explicit=True,
-            utilization_explicit=True,
+    with pytest.raises(ValueError, match="vLLM capacity"):
+        plan_teacher_admission(
+            expected_trajectories=8,
+            trajectory_tokens=4096,
+            vllm_capacity_tokens=2048,
+            page_size=64,
+            max_batched_tokens=2048,
+            initial_chunk_tokens=1024,
         )
 
     monkeypatch.setattr(
@@ -1237,12 +1848,10 @@ def test_streamopd_resource_planners(tmp_path, monkeypatch: pytest.MonkeyPatch) 
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    (model_dir / "model.safetensors.index.json").write_text('{"metadata": {"total_size": 12345}}')
     (model_dir / "config.json").write_text(
         '{"num_hidden_layers": 4, "num_key_value_heads": 2, '
-        '"num_attention_heads": 8, "hidden_size": 512, "head_dim": 64}'
+        '"num_attention_heads": 8, "hidden_size": 512, "head_dim": 64, "vocab_size": 100}'
     )
-    assert checkpoint_weight_bytes(str(model_dir)) == 12345
     assert kv_bytes_per_token(str(model_dir), "bfloat16") == 4 * 2 * 64 * 2 * 2
 
 
@@ -1250,178 +1859,121 @@ def test_teacher_priority_scheduler_rejects_policy_staleness() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(3)
     with pytest.raises(RuntimeError, match="policy mismatch"):
-        scheduler.teacher_enqueued(2)
+        scheduler.teacher_trajectory_terminal_submitted(2)
 
 
-def test_teacher_and_training_admission_are_mutually_exclusive() -> None:
+def test_shared_trainer_waits_for_complete_teacher_drain() -> None:
     scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(11)
-    scheduler.teacher_enqueued(11)
-    assert scheduler.try_training_started(11, teacher_queue_threshold=0) is False
-    assert scheduler.try_teacher_started(11) is True
-    assert scheduler.try_training_started(11, teacher_queue_threshold=1) is False
-    scheduler.teacher_enqueued(11)
-    scheduler.teacher_finished(11)
-    assert scheduler.try_training_started(11, teacher_queue_threshold=1) is True
-    assert scheduler.try_teacher_started(11) is False
+    scheduler.begin_policy(11, expected_trajectories=2, train_launch_width=2)
+    scheduler.training_waiting(11, trajectory_count=2)
+    assert scheduler.try_teacher_session_admitted(11, "a", 32, 2, 64)
+    assert scheduler.try_teacher_session_admitted(11, "b", 32, 2, 64)
+    assert scheduler.try_training_started(11) is False
+    for session_id in ("a", "b"):
+        scheduler.teacher_trajectory_terminal_submitted(11)
+        scheduler.teacher_session_released(11, session_id)
+        scheduler.teacher_trajectory_completed(11)
+    assert scheduler.try_training_started(11) is True
     scheduler.training_finished(11)
-    assert scheduler.try_teacher_started(11) is True
-    scheduler.teacher_finished(11)
-    scheduler.end_policy(11)
+    metrics = scheduler.end_policy(11)
+    assert metrics["streamopd/scheduler_teacher_completed_at_first_training"] == 2
+    assert metrics["streamopd/scheduler_rollouts_terminal_at_first_training"] == 2
+    assert metrics["streamopd/scheduler_teacher_pending_at_first_training"] == 0
 
 
 def test_teacher_admission_waits_for_asynchronous_wake() -> None:
     scheduler = StreamOPDTaskScheduler()
     scheduler.begin_policy(12, teacher_available=False)
-    scheduler.teacher_enqueued(12)
 
-    assert scheduler.try_teacher_started(12) is False
+    assert scheduler.try_teacher_session_admitted(12, "a", 32, 1, 32) is False
     assert scheduler.snapshot()["teacher_available"] is False
     scheduler.teacher_wake_completed(12)
-    assert scheduler.try_teacher_started(12) is True
-    scheduler.teacher_finished(12)
-    scheduler.end_policy(12)
+    assert scheduler.try_teacher_session_admitted(12, "a", 32, 1, 32) is True
+    scheduler.teacher_session_released(12, "a")
+    metrics = scheduler.end_policy(12)
+    assert metrics["streamopd/scheduler_teacher_admission_attempts"] == 2
+    assert metrics["streamopd/scheduler_teacher_admission_rejections"] == 1
+    assert metrics["streamopd/scheduler_teacher_admission_unavailable_rejections"] == 1
+    assert metrics["streamopd/scheduler_teacher_admission_trajectory_rejections"] == 0
+    assert metrics["streamopd/scheduler_teacher_admission_kv_rejections"] == 0
+    assert metrics["streamopd/scheduler_teacher_admission_waited_sessions"] == 1
+    assert metrics["streamopd/scheduler_teacher_admission_wait_seconds"] >= 0
 
 
-def test_ready_training_waiter_wins_tie_with_teacher_queue() -> None:
+@pytest.mark.asyncio
+async def test_teacher_admission_notification_wakes_on_session_release() -> None:
     scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(14)
-    scheduler.training_waiting(14, teacher_queue_threshold=1)
-    scheduler.teacher_enqueued(14)
-    assert scheduler.try_teacher_started(14) is False
-    assert scheduler.try_training_started(14, teacher_queue_threshold=1) is True
-    assert scheduler.snapshot()["training_waiters"] == 0
-    scheduler.training_finished(14)
-    scheduler.teacher_cancelled(14)
-    scheduler.end_policy(14)
+    scheduler.begin_policy(18)
+
+    assert await scheduler.wait_teacher_session_admitted(18, "a", 32, 1, 32)
+    pending = asyncio.create_task(scheduler.wait_teacher_session_admitted(18, "b", 32, 1, 32))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    assert scheduler.snapshot()["teacher_admission_waiters"] == 1
+
+    scheduler.teacher_session_released(18, "a")
+    assert await pending
+    scheduler.teacher_session_released(18, "b")
+    metrics = scheduler.end_policy(18)
+    assert metrics["streamopd/scheduler_teacher_admission_attempts"] == 2
+    assert metrics["streamopd/scheduler_teacher_admission_rejections"] == 1
+    assert metrics["streamopd/scheduler_teacher_admission_waited_sessions"] == 1
 
 
-def test_adaptive_shared_scheduler_uses_ready_backlog_hysteresis() -> None:
+@pytest.mark.asyncio
+async def test_teacher_admission_cancellation_does_not_leak_reservation() -> None:
     scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(20, expected_trajectories=12, scheduler_policy="adaptive", train_launch_width=4)
-    scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
-    scheduler.teacher_enqueued(20)
-    for _ in range(4):
-        scheduler.teacher_trajectory_completed(20)
+    scheduler.begin_policy(19)
 
-    # A genuinely ready cohort starts immediately; no second cohort gate.
-    assert scheduler.try_teacher_started(20) is False
-    assert scheduler.try_training_started(20, teacher_queue_threshold=0) is True
-    scheduler.training_finished(20)
-
-    for _ in range(4):
-        scheduler.teacher_trajectory_completed(20)
-    scheduler.training_waiting(20, teacher_queue_threshold=0, trajectory_count=4)
-    # The completed-but-unlaunched cohort keeps ownership on Trainer.
-    assert scheduler.try_teacher_started(20) is False
-    assert scheduler.try_training_started(20, teacher_queue_threshold=0) is True
-    scheduler.training_finished(20)
-
-    # Once Trainer catches up, pending Teacher work gets the next turn.
-    assert scheduler.try_teacher_started(20) is True
-    scheduler.teacher_finished(20)
-    assert scheduler.snapshot()["forced_teacher_turns"] == 1
-    assert scheduler.snapshot()["max_training_burst"] == 2
-
-
-def test_adaptive_shared_scheduler_bounds_next_training_handoff() -> None:
-    scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(25, expected_trajectories=12, scheduler_policy="adaptive", train_launch_width=4)
-    for _ in range(8):
-        scheduler.teacher_trajectory_completed(25)
-    scheduler.training_waiting(25, teacher_queue_threshold=0, trajectory_count=4)
-    assert scheduler.try_training_started(25, teacher_queue_threshold=0) is True
-    scheduler.training_finished(25)
-    scheduler.teacher_enqueued(25)
-
-    # Reserve a short controller handoff window for the next ready cohort.
-    assert scheduler.try_teacher_started(25) is False
-    scheduler.last_training_finished_at -= scheduler.teacher_turn_grace_seconds
-    assert scheduler.try_teacher_started(25) is True
-    scheduler.teacher_finished(25)
-
-
-def test_adaptive_shared_scheduler_resumes_training_after_teacher_grace() -> None:
-    scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(24, scheduler_policy="adaptive", train_launch_width=4)
-    scheduler.training_waiting(24, teacher_queue_threshold=0, trajectory_count=4)
-    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is True
-    scheduler.training_finished(24)
-    scheduler.training_waiting(24, teacher_queue_threshold=0, trajectory_count=4)
-    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is False
-    scheduler.last_training_finished_at -= scheduler.teacher_turn_grace_seconds
-    assert scheduler.try_training_started(24, teacher_queue_threshold=0) is True
-    scheduler.training_finished(24)
+    assert await scheduler.wait_teacher_session_admitted(19, "a", 32, 1, 32)
+    pending = asyncio.create_task(scheduler.wait_teacher_session_admitted(19, "b", 32, 1, 32))
+    await asyncio.sleep(0)
+    scheduler.teacher_session_admission_cancelled(19, "b")
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await pending
+    scheduler.teacher_session_released(19, "a")
+    scheduler.end_policy(19)
 
 
 def test_dedicated_teacher_and_trainer_resources_can_run_concurrently() -> None:
     scheduler = StreamOPDTaskScheduler(teacher_resources=("teacher",), trainer_resources=("trainer",))
-    scheduler.begin_policy(21)
-    scheduler.teacher_enqueued(21)
-    assert scheduler.try_teacher_started(21) is True
-    scheduler.training_waiting(21, teacher_queue_threshold=0, trajectory_count=4)
-    assert scheduler.try_training_started(21, teacher_queue_threshold=0) is True
+    scheduler.begin_policy(21, expected_trajectories=1)
+    assert scheduler.try_teacher_session_admitted(21, "a", 32, 1, 32)
+    scheduler.teacher_trajectory_terminal_submitted(21)
+    score_started = time.perf_counter()
+    scheduler.training_waiting(21, trajectory_count=4)
+    assert scheduler.try_training_started(21) is True
     state = scheduler.snapshot()
-    assert state["teacher_active"] == 1
+    assert state["teacher_sessions"] == 1
     assert state["training_active"] == 1
     assert state["resources_overlap"] is False
+    time.sleep(0.001)
+    score_finished = time.perf_counter()
     scheduler.training_finished(21)
-    scheduler.teacher_finished(21)
+    scheduler.teacher_session_released(21, "a")
+    scheduler.teacher_trajectory_completed(21, [(score_started, score_finished)])
     metrics = scheduler.end_policy(21)
     assert metrics["streamopd/scheduler_resources_overlap"] == 0
-    assert metrics["streamopd/scheduler_concurrent_busy_seconds"] >= 0
+    assert metrics["streamopd/scheduler_concurrent_busy_seconds"] > 0
 
 
-def test_teacher_then_train_policy_waits_for_streaming_teacher_drain() -> None:
-    scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(
-        22,
-        expected_trajectories=2,
-        scheduler_policy="teacher_then_train",
-        train_launch_width=2,
-    )
-    scheduler.training_waiting(22, teacher_queue_threshold=0, trajectory_count=2)
-    assert scheduler.try_training_started(22, teacher_queue_threshold=0) is False
-    for _ in range(2):
-        scheduler.teacher_trajectory_terminal_submitted(22)
-        scheduler.teacher_trajectory_completed(22)
-    assert scheduler.snapshot()["teacher_drained"] is True
-    assert scheduler.try_training_started(22, teacher_queue_threshold=0) is True
-    scheduler.training_finished(22)
-    scheduler.end_policy(22)
-
-
-def test_adaptive_scheduler_drains_a_single_teacher_tail_quantum() -> None:
+def test_dedicated_trainer_starts_when_one_complete_unit_is_ready() -> None:
     scheduler = StreamOPDTaskScheduler(teacher_resources=("teacher",), trainer_resources=("trainer",))
-    scheduler.begin_policy(23, expected_trajectories=8, scheduler_policy="adaptive", train_launch_width=4)
+    scheduler.begin_policy(23, expected_trajectories=8, train_launch_width=4)
     for _ in range(8):
         scheduler.teacher_trajectory_terminal_submitted(23)
     for _ in range(4):
         scheduler.teacher_trajectory_completed(23)
-    scheduler.training_waiting(23, teacher_queue_threshold=0, trajectory_count=4)
+    scheduler.training_waiting(23, trajectory_count=4)
     assert scheduler.snapshot()["teacher_drained"] is False
-    assert scheduler.try_training_started(23, teacher_queue_threshold=0) is False
+    assert scheduler.try_training_started(23) is True
+    scheduler.training_finished(23)
     for _ in range(4):
         scheduler.teacher_trajectory_completed(23)
-    assert scheduler.try_training_started(23, teacher_queue_threshold=0) is True
+    scheduler.training_waiting(23, trajectory_count=4)
+    assert scheduler.try_training_started(23) is True
     scheduler.training_finished(23)
     scheduler.end_policy(23)
-
-
-def test_teacher_admission_limits_active_trajectory_count_and_kv_tokens() -> None:
-    scheduler = StreamOPDTaskScheduler()
-    scheduler.begin_policy(12)
-    for _ in range(3):
-        scheduler.teacher_enqueued(12)
-
-    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is True
-    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is False
-    assert scheduler.snapshot()["teacher_active_kv_tokens"] == 4
-    scheduler.teacher_finished(12, 4)
-    assert scheduler.try_teacher_started(12, 4, max_active_trajectories=2, max_active_kv_tokens=7) is True
-    scheduler.teacher_finished(12, 4)
-    scheduler.teacher_cancelled(12)
-    scheduler.end_policy(12)
 
 
 def test_teacher_session_reservation_is_held_until_eos() -> None:
@@ -1439,7 +1991,11 @@ def test_teacher_session_reservation_is_held_until_eos() -> None:
     assert scheduler.try_teacher_session_admitted(13, "c", 4096, 16, 8192) is True
     scheduler.teacher_session_released(13, "b")
     scheduler.teacher_session_released(13, "c")
-    scheduler.end_policy(13)
+    metrics = scheduler.end_policy(13)
+    assert metrics["streamopd/scheduler_teacher_admission_attempts"] == 4
+    assert metrics["streamopd/scheduler_teacher_admission_rejections"] == 1
+    assert metrics["streamopd/scheduler_teacher_admission_trajectory_rejections"] == 0
+    assert metrics["streamopd/scheduler_teacher_admission_kv_rejections"] == 1
 
 
 def test_teacher_session_slot_refills_after_eos() -> None:
@@ -1579,6 +2135,51 @@ def test_streamopd_runtime_profile_rejects_unknown_policy() -> None:
         StreamOPDKVConfig(runtime_profile="guess")
 
 
+def test_streamopd_default_trainer_placement_uses_teacher_and_rollout_pools() -> None:
+    assert StreamOPDKVConfig().trainer_placement == "union"
+
+
+def test_sync_stage_timing_aggregates_rollout_teacher_and_training() -> None:
+    from verl.trainer.ppo.v1.trainer_sync import _stage_timing_metrics_from_tags
+
+    metrics = _stage_timing_metrics_from_tags(
+        [
+            {
+                "_stage_rollout_started_at": 101.0,
+                "_stage_rollout_completed_at": 105.0,
+                "_stage_rollout_request_seconds": 4.0,
+                "_stage_teacher_started_at": 105.0,
+                "_stage_teacher_completed_at": 108.0,
+                "_stage_teacher_request_seconds": 3.0,
+            },
+            {
+                "_stage_rollout_started_at": 102.0,
+                "_stage_rollout_completed_at": 107.0,
+                "_stage_rollout_request_seconds": 5.0,
+                "_stage_teacher_started_at": 107.0,
+                "_stage_teacher_completed_at": 109.0,
+                "_stage_teacher_request_seconds": 2.0,
+            },
+            {"is_padding": True},
+        ],
+        policy_started_at=100.0,
+        training_seconds=6.5,
+    )
+
+    assert metrics == {
+        "stage/training_seconds": 6.5,
+        "stage/rollout_span_seconds": 6.0,
+        "stage/rollout_makespan_seconds": 7.0,
+        "stage/rollout_request_seconds/mean": 4.5,
+        "stage/rollout_request_seconds/max": 5.0,
+        "stage/teacher_span_seconds": 4.0,
+        "stage/teacher_makespan_seconds": 9.0,
+        "stage/teacher_request_seconds/mean": 2.5,
+        "stage/teacher_request_seconds/max": 3.0,
+        "stage/teacher_tail_seconds": 2.0,
+    }
+
+
 def test_dapo_adapter_wraps_plain_prompt_as_chat_messages(monkeypatch) -> None:
     from benchmarks.streamopd_kv.dapo_math_dataset import DAPOMathDataset
     from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -1603,19 +2204,320 @@ def test_streamopd_trainer_does_not_expose_unused_reward_handles() -> None:
     assert torch.equal(prepared["rm_scores"], torch.zeros(2, 3))
 
 
-def test_union_topology_falls_back_to_drain_first_policy() -> None:
+@pytest.mark.parametrize(
+    ("placement", "expected_pools", "teacher_pool"),
+    [
+        ("teacher", {"global_pool": [2], "rollout_pool": [3]}, "global_pool"),
+        ("rollout", {"global_pool": [2], "teacher_pool": [1]}, "teacher_pool"),
+        ("union", {"global_pool": [2]}, "global_pool"),
+        (
+            "dedicated",
+            {"global_pool": [2], "teacher_pool": [1], "rollout_pool": [3]},
+            "teacher_pool",
+        ),
+    ],
+)
+def test_streamopd_resource_pools_follow_trainer_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    placement: str,
+    expected_pools: dict[str, list[int]],
+    teacher_pool: str,
+) -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.utils import Role
+    from verl.trainer.ppo.v1 import trainer_streamopd
+    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+    def fake_base_init(self) -> None:
+        self.role_worker_mapping = {Role.ActorRollout: object(), Role.TeacherModel: object()}
+        self.mapping = {Role.ActorRollout: "global_pool", Role.TeacherModel: "teacher_pool"}
+        self.resource_pool_manager = SimpleNamespace(resource_pool_spec={"global_pool": [2], "teacher_pool": [1]})
+
+    monkeypatch.setattr(PPOTrainer, "_init_resource_pool_mgr", fake_base_init)
+    monkeypatch.setattr(trainer_streamopd.ray, "remote", lambda cls: cls)
+    monkeypatch.setattr(trainer_streamopd, "need_reference_policy", lambda _config: False)
+    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"rollout": {"n_gpus_per_node": 3, "nnodes": 1}},
+        }
+    )
+    trainer.placement = TrainerPlacement(placement)
+
+    trainer._init_resource_pool_mgr()
+
+    assert trainer.resource_pool_manager.resource_pool_spec == expected_pools
+    assert trainer.mapping[Role.Actor] == "global_pool"
+    assert trainer.mapping[Role.TeacherModel] == teacher_pool
+
+
+def test_auto_shared_teacher_runtime_defers_reverse_plan_until_pool_sleep() -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1 import trainer_streamopd
+
+    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
+    trainer.placement = TrainerPlacement.TEACHER
+    trainer._reverse_plan_result = None
+    reverse_plans = []
+
+    def prepare_reverse_plan():
+        reverse_plans.append(True)
+        return [{"slot_batch_size": 8.0}]
+
+    trainer.actor_rollout_wg = SimpleNamespace(
+        get_streamopd_device_memory_stats=lambda: [
+            {"free_bytes": 79 * 1024**3, "total_bytes": 80 * 1024**3},
+            {"free_bytes": 79 * 1024**3, "total_bytes": 80 * 1024**3},
+        ],
+        prepare_streamopd_reverse_plan=prepare_reverse_plan,
+    )
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": 128},
+            "distillation": {
+                "n_gpus_per_node": 2,
+                "nnodes": 1,
+                "streamopd_kv": {
+                    "runtime_profile": "auto",
+                    "planner_explicit_options": [],
+                    "reverse_slot_max_tokens": 8192,
+                    "reverse_batch_max_tokens": 1048576,
+                    "reverse_slot_reserve_gib": 4.0,
+                },
+                "teacher_models": {
+                    "teacher_model": {
+                        "model_path": "/teacher",
+                        "inference": {
+                            "tensor_model_parallel_size": 2,
+                            "data_parallel_size": 1,
+                            "pipeline_model_parallel_size": 1,
+                            "max_num_seqs": 128,
+                            "max_num_batched_tokens": 8192,
+                            "max_model_len": 8193,
+                            "dtype": "bfloat16",
+                            "gpu_memory_utilization": 0.9,
+                        },
+                    }
+                },
+            },
+        }
+    )
+
+    trainer._prepare_teacher_runtime()
+
+    inference = trainer.config.distillation.teacher_models.teacher_model.inference
+    assert inference.gpu_memory_utilization == 0.9
+    assert inference.max_num_seqs == 128
+    assert trainer._teacher_memory_plan == {"max_num_seqs": 128.0, "exclusive_pool_memory": 1.0}
+    assert trainer._reverse_plan_result is None
+    assert reverse_plans == []
+
+
+@pytest.mark.parametrize("placement", ["teacher", "rollout", "union"])
+def test_shared_trainer_state_has_one_load_offload_pair(placement: str) -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+
+    transitions = []
+    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer.placement = TrainerPlacement(placement)
+    trainer._trainer_state_offloaded = True
+    trainer._reverse_plan_result = [{"slot_batch_size": 8.0}]
+    trainer._teacher_sleeping = trainer.placement.shares_teacher
+    trainer._shared_rollout_sleeping = trainer.placement.shares_rollout
+    trainer.actor_rollout_wg = SimpleNamespace(
+        offload_streamopd_trainer_state=lambda: transitions.append("offload"),
+        load_streamopd_trainer_state=lambda: transitions.append("load"),
+    )
+
+    assert trainer._load_trainer_state() >= 0.0
+    assert trainer._load_trainer_state() == 0.0
+    assert trainer._offload_trainer_state() >= 0.0
+    assert trainer._offload_trainer_state() == 0.0
+    assert transitions == ["load", "offload"]
+
+
+def test_shared_trainer_plans_against_sleeping_pool_before_loading() -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+
+    transitions = []
+    plan_result = [{"slot_batch_size": 2.0}]
+    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer.placement = TrainerPlacement.UNION
+    trainer._trainer_state_offloaded = True
+    trainer._teacher_sleeping = True
+    trainer._shared_rollout_sleeping = True
+    trainer._reverse_plan_result = None
+    trainer.actor_rollout_wg = SimpleNamespace(
+        prepare_streamopd_reverse_plan=lambda: transitions.append("plan") or plan_result,
+        load_streamopd_trainer_state=lambda: transitions.append("load"),
+    )
+
+    def configure_reverse_plan(result) -> None:
+        assert result is plan_result
+        transitions.append("configure")
+        trainer._reverse_plan_result = result
+
+    trainer._configure_reverse_plan = configure_reverse_plan
+
+    assert trainer._load_trainer_state() >= 0.0
+    assert transitions == ["plan", "configure", "load"]
+
+
+def test_shared_trainer_cannot_load_before_inference_pool_sleeps() -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
     from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
 
     trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
-    trainer.config = OmegaConf.create(
-        {"distillation": {"streamopd_kv": {"trainer_placement": "union", "scheduler_policy": "adaptive"}}}
-    )
     trainer.placement = TrainerPlacement.UNION
-    assert trainer._effective_scheduler_policy() == "teacher_then_train"
-    trainer.config.distillation.streamopd_kv.trainer_placement = "rollout"
+    trainer._trainer_state_offloaded = True
+    trainer._teacher_sleeping = True
+    trainer._shared_rollout_sleeping = False
+    trainer.actor_rollout_wg = SimpleNamespace(load_streamopd_trainer_state=lambda: None)
+
+    with pytest.raises(RuntimeError, match="shared Rollout"):
+        trainer._load_trainer_state()
+
+
+@pytest.mark.parametrize(
+    ("placement", "expected"),
+    [("union", ["sleep", "sync", "cleanup"]), ("dedicated", ["sync", "cleanup"])],
+)
+def test_initial_weight_sync_releases_shared_teacher_first(placement: str, expected: list[str]) -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+
+    transitions = []
+    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer.placement = TrainerPlacement(placement)
+    trainer.global_steps = 0
+    trainer._maybe_sleep_teacher = lambda _state: transitions.append("sleep")
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda _step, **_kwargs: transitions.append("sync"))
+    trainer.actor_rollout_wg = SimpleNamespace(release_streamopd_allocator_cache=lambda: transitions.append("cleanup"))
+
+    trainer._publish_initial_weights()
+
+    assert transitions == expected
+
+
+def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeypatch) -> None:
+    from verl.checkpoint_engine import base as checkpoint_base
+
+    events = []
+
+    class Replica:
+        workers = [object()]
+
+        async def sleep(self, level=None):
+            events.append(("rollout-sleep", level))
+
+        async def release_kv_cache(self):
+            events.append("weights-wake")
+
+        async def resume_kv_cache(self):
+            events.append("kv-wake")
+
+        async def abort_all_requests(self):
+            events.append("abort")
+
+        async def resume_generation(self):
+            events.append("resume-generation")
+
+    class ActorGroup:
+        world_size = 1
+
+        def update_weights(self, **kwargs):
+            events.append(("trainer-publish", kwargs["mode"]))
+            return [{"sender_metric": 1.0}]
+
+        def execute_checkpoint_engine(self, methods):
+            assert methods == ["finalize"]
+            events.append("trainer-finalize")
+            return [None]
+
+        def release_streamopd_allocator_cache(self):
+            events.append("trainer-release")
+
+    class RolloutGroup:
+        world_size = 1
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def update_weights(self, **_kwargs):
+            events.append("rollout-receive")
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            assert methods == ["finalize"]
+            events.append("rollout-finalize")
+            return [None]
+
+    monkeypatch.setattr(checkpoint_base, "RayWorkerGroup", RolloutGroup)
+    monkeypatch.setattr(checkpoint_base.ray, "get", lambda values: values)
+    manager = checkpoint_base.CheckpointEngineManager.__new__(checkpoint_base.CheckpointEngineManager)
+    manager.backend = "host"
+    manager.actor_wg = ActorGroup()
+    manager.replicas = [Replica()]
+    manager.build_process_group = lambda _rollout: events.append("build")
+
+    metrics = asyncio.run(
+        checkpoint_base.CheckpointEngineManager.update_weights.__wrapped__(
+            manager,
+            global_steps=3,
+            phase_exclusive=True,
+        )
+    )
+
+    assert events == [
+        ("rollout-sleep", 2),
+        "build",
+        ("trainer-publish", "host"),
+        "trainer-release",
+        "weights-wake",
+        "rollout-receive",
+        "trainer-finalize",
+        "rollout-finalize",
+        "kv-wake",
+    ]
+    assert metrics["sender_metric"] == 1.0
+    assert "abort" not in events
+    assert "resume-generation" not in events
+
+
+def test_shared_rollout_sleeps_once_after_all_trajectories_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1 import trainer_streamopd
+
+    class Snapshot:
+        @staticmethod
+        def remote():
+            return object()
+
+    sleep_levels = []
+    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
     trainer.placement = TrainerPlacement.ROLLOUT
-    assert trainer._effective_scheduler_policy() == "adaptive"
+    trainer._shared_rollout_sleeping = False
+    trainer.config = OmegaConf.create(
+        {"distillation": {"streamopd_kv": {"scheduler_poll_interval_ms": 1, "scheduler_timeout_seconds": 1}}}
+    )
+    trainer._scheduler = SimpleNamespace(snapshot=Snapshot())
+    transfer_drains = []
+    trainer.llm_server_manager = SimpleNamespace(wait_for_streamopd_kv_transfers=lambda: transfer_drains.append(True))
+    trainer.checkpoint_manager = SimpleNamespace(sleep_replicas=lambda *, level: sleep_levels.append(level))
+    monkeypatch.setattr(
+        trainer_streamopd.ray,
+        "get",
+        lambda _value: {"terminal_trajectories": 128, "expected_trajectories": 128},
+    )
+
+    trainer._wait_for_shared_rollout_idle()
+    trainer._wait_for_shared_rollout_idle()
+
+    assert sleep_levels == [2]
+    assert transfer_drains == [True]
+    assert trainer._shared_rollout_sleeping
 
 
 def test_vllm_connector_waits_for_terminal_seal_and_ignores_unclaimed_request() -> None:
@@ -1643,6 +2545,90 @@ def test_vllm_connector_waits_for_terminal_seal_and_ignores_unclaimed_request() 
     future.complete = True
     assert connector.get_finished(set()) == ({"claimed"}, None)
     assert not connector._claimed_requests
+
+
+def test_vllm_connector_pipelines_terminal_exports_across_trajectories() -> None:
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector, _PendingSave
+
+    sealed = []
+
+    class Pool:
+        @staticmethod
+        def validate_writer(*args, **kwargs):
+            return 0
+
+        @staticmethod
+        def seal(*args, **kwargs):
+            sealed.append(kwargs["request_id"])
+
+    pool = Pool()
+    connector = StreamOPDKVConnector.__new__(StreamOPDKVConnector)
+    connector._executor = ThreadPoolExecutor(max_workers=2)
+    connector._get_host_pool = lambda: pool
+    blockers: dict[str, Future] = {}
+    launched = []
+
+    def launch(pending, _pool, _slot, request_futures, *, ready_event=None):
+        del ready_event
+        launched.append(pending.req_id)
+        blocker = Future()
+        blockers[pending.req_id] = blocker
+        request_futures.append(blocker)
+
+    connector._launch_host_slot_chunk = launch
+
+    def terminal(req_id: str) -> _PendingSave:
+        return _PendingSave(
+            req_id=req_id,
+            trajectory_id=req_id,
+            slot_path=f"/tmp/{req_id}",
+            block_ids_by_group=([0],),
+            policy_version=1,
+            prompt_length=1,
+            start=0,
+            end=1,
+            chunk_index=0,
+            terminal=True,
+            token_ids=torch.tensor([1]),
+        )
+
+    first_seal = connector._export_terminal_saves([terminal("first")], ready_event=object())
+    second_seal = connector._export_terminal_saves([terminal("second")], ready_event=object())
+    assert launched == ["first", "second"]
+    assert not first_seal.done()
+    assert not second_seal.done()
+
+    blockers["first"].set_result(None)
+    blockers["second"].set_result(None)
+    first_seal.result(timeout=1)
+    second_seal.result(timeout=1)
+    assert sorted(sealed) == ["first", "second"]
+    connector._executor.shutdown(wait=True)
+
+
+def test_vllm_connector_completion_tracks_inner_seal_future() -> None:
+    from concurrent.futures import Future
+
+    from verl.experimental.streamopd_kv.vllm_connector import StreamOPDKVConnector
+
+    submission = Future()
+    seal = Future()
+    completion = Future()
+    submission.set_result(seal)
+    StreamOPDKVConnector._terminal_export_submitted(completion, submission)
+    assert not completion.done()
+
+    seal.set_result(None)
+    assert completion.result(timeout=1) is None
+
+    failed_submission = Future()
+    failed_completion = Future()
+    failed_submission.set_exception(RuntimeError("submit failed"))
+    StreamOPDKVConnector._terminal_export_submitted(failed_completion, failed_submission)
+    with pytest.raises(RuntimeError, match="submit failed"):
+        failed_completion.result(timeout=1)
 
 
 def test_vllm_connector_finish_is_idempotent() -> None:

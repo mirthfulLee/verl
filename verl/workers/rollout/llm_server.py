@@ -733,6 +733,67 @@ class LLMServerManager:
         return result
 
     @auto_await
+    async def collect_kv_cache_capacity_tokens(self) -> int:
+        """Return total logical KV capacity across Rollout replicas."""
+
+        responses = await asyncio.gather(
+            *(server.collective_rpc.remote("get_kv_cache_capacity") for server in self.server_handles)
+        )
+        replica_capacities = []
+        for response in responses:
+            worker_capacities = [int(stats["capacity_tokens"]) for stats in (response or [])]
+            if not worker_capacities:
+                raise RuntimeError("Rollout vLLM workers returned no KV cache capacity")
+            replica_capacities.append(min(worker_capacities))
+        if not replica_capacities:
+            raise RuntimeError("StreamOPD Rollout has no vLLM replicas")
+        return sum(replica_capacities)
+
+    @auto_await
+    async def reset_streamopd_kv_transfer_stats(self) -> None:
+        await asyncio.gather(
+            *(server.collective_rpc.remote("reset_streamopd_kv_transfer_stats") for server in self.server_handles)
+        )
+
+    @auto_await
+    async def collect_streamopd_kv_transfer_stats(self) -> dict[str, float]:
+        responses = await asyncio.gather(
+            *(server.collective_rpc.remote("get_streamopd_kv_transfer_stats") for server in self.server_handles)
+        )
+        worker_stats = [stats for response in responses for stats in (response or []) if stats]
+        if not worker_stats:
+            raise RuntimeError("Rollout vLLM workers returned no StreamOPD KV transfer statistics")
+        sum_keys = (
+            "copy_chunks",
+            "copy_bytes",
+            "copy_calls",
+            "block_runs",
+            "staging_wait_seconds",
+            "copy_enqueue_seconds",
+            "gpu_gather_seconds",
+            "gpu_d2h_seconds",
+            "gpu_copy_seconds",
+            "d2h_wait_seconds",
+            "host_commit_seconds",
+            "terminal_wait_seconds",
+        )
+        max_keys = ("max_staging_wait_seconds", "max_outstanding_writes")
+        return {
+            **{key: sum(float(stats[key]) for stats in worker_stats) for key in sum_keys},
+            **{key: max(float(stats[key]) for stats in worker_stats) for key in max_keys},
+        }
+
+    @auto_await
+    async def wait_for_streamopd_kv_transfers(self) -> float:
+        """Wait until every Rollout worker has sealed its Host KV slots."""
+
+        responses = await asyncio.gather(
+            *(server.collective_rpc.remote("wait_for_streamopd_kv_transfers") for server in self.server_handles)
+        )
+        waits = [float(value) for response in responses for value in (response or [])]
+        return max(waits, default=0.0)
+
+    @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""
         await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])

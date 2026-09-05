@@ -38,6 +38,8 @@ from verl.checkpoint_engine.base import (
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_BUCKET_FORMAT = "verl-host-checkpoint-mmap-v1"
+
 
 @dataclass(frozen=True)
 class HostCheckpointMetadata:
@@ -143,10 +145,15 @@ class HostCheckpointEngine(CheckpointEngine):
                 raise RuntimeError("actor process group is not initialized")
             torch.distributed.barrier()
 
-    def _bucket_path(self, bucket_index: int) -> Path:
+    def _bucket_metadata_path(self, bucket_index: int) -> Path:
         if self.session_dir is None:
             raise RuntimeError("host checkpoint session is not initialized")
-        return self.session_dir / f"bucket-{bucket_index:06d}.pt"
+        return self.session_dir / f"bucket-{bucket_index:06d}.meta.pt"
+
+    def _bucket_data_path(self, bucket_index: int) -> Path:
+        if self.session_dir is None:
+            raise RuntimeError("host checkpoint session is not initialized")
+        return self.session_dir / f"bucket-{bucket_index:06d}.bin"
 
     def _write_bucket(
         self,
@@ -156,14 +163,29 @@ class HostCheckpointEngine(CheckpointEngine):
         bucket_meta: dict[str, TensorMeta],
         is_last: bool,
     ) -> None:
-        path = self._bucket_path(bucket_index)
-        temporary_path = path.with_suffix(".tmp")
-        payload = {
-            "metadata": {"bucket_meta": bucket_meta, "is_last": is_last, "length": length},
-            "buffer": bucket[:length],
-        }
-        torch.save(payload, temporary_path)
-        os.replace(temporary_path, path)
+        data_path = self._bucket_data_path(bucket_index)
+        metadata_path = self._bucket_metadata_path(bucket_index)
+        temporary_metadata_path = metadata_path.with_suffix(".tmp")
+        fd = os.open(data_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, length)
+        finally:
+            os.close(fd)
+        if length:
+            mapped = torch.from_file(str(data_path), shared=True, size=length, dtype=torch.uint8)
+            mapped.copy_(bucket[:length])
+        # The small atomic metadata file is the publication record. Receivers
+        # never observe a bucket until its raw shared mapping is complete.
+        torch.save(
+            {
+                "format": _BUCKET_FORMAT,
+                "bucket_meta": bucket_meta,
+                "is_last": is_last,
+                "length": length,
+            },
+            temporary_metadata_path,
+        )
+        os.replace(temporary_metadata_path, metadata_path)
 
     @torch.no_grad()
     async def send_weights(
@@ -272,17 +294,24 @@ class HostCheckpointEngine(CheckpointEngine):
         deadline = time.monotonic() + self.timeout
         bucket_index = 0
         while True:
-            path = self._bucket_path(bucket_index)
-            while not path.exists():
+            metadata_path = self._bucket_metadata_path(bucket_index)
+            while not metadata_path.exists():
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for host checkpoint bucket {bucket_index}: {path}")
+                    raise TimeoutError(f"timed out waiting for host checkpoint bucket {bucket_index}: {metadata_path}")
                 await asyncio.sleep(self.poll_interval)
 
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            metadata = payload["metadata"]
-            buffer = payload["buffer"]
-            if buffer.dtype != torch.uint8 or buffer.numel() != metadata["length"]:
-                raise RuntimeError(f"invalid host checkpoint bucket payload: {path}")
+            metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
+            if metadata.get("format") != _BUCKET_FORMAT:
+                raise RuntimeError(f"unsupported host checkpoint bucket metadata: {metadata_path}")
+            length = int(metadata["length"])
+            data_path = self._bucket_data_path(bucket_index)
+            if length < 0 or not data_path.is_file() or data_path.stat().st_size != length:
+                raise RuntimeError(f"invalid host checkpoint bucket data: {data_path}")
+            buffer = (
+                torch.from_file(str(data_path), shared=True, size=length, dtype=torch.uint8)
+                if length
+                else torch.empty(0, dtype=torch.uint8)
+            )
             for tensor_meta in metadata["bucket_meta"].values():
                 start = tensor_meta.offset
                 yield tensor_meta, buffer[start : start + tensor_meta.chunk_size]

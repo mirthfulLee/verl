@@ -18,6 +18,7 @@ from .agent_loop import (
     AgentLoopOutput,
     AgentLoopWorker,
     get_trajectory_info,
+    resolve_do_sample,
 )
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
@@ -30,4 +31,5 @@ __all__ = [
     "AgentLoopWorker",
     "AgentLoopOutput",
     "get_trajectory_info",
+    "resolve_do_sample",
 ]

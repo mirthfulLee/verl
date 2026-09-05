@@ -71,7 +71,7 @@ def _reverse_memory_estimate(
 
 
 def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> int:
-    """Estimate gradient and optimizer tensors materialized by the first update."""
+    """Estimate gradient and optimizer tensors that must be loaded onto the GPU."""
 
     if optimizer is None:
         return 0
@@ -84,20 +84,31 @@ def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.opti
                 continue
             seen.add(id(parameter))
             parameter_bytes = parameter.numel() * parameter.element_size()
-            if parameter.grad is None:
+            if parameter.grad is None or parameter.grad.device.type != get_device_name():
                 reserve += parameter_bytes
 
             state = optimizer.state.get(parameter, {})
             if "adam" in optimizer_name:
                 for name in ("exp_avg", "exp_avg_sq"):
                     value = state.get(name)
-                    if not isinstance(value, torch.Tensor) or value.device.type != parameter.device.type:
+                    if not isinstance(value, torch.Tensor) or value.device.type != get_device_name():
                         reserve += parameter_bytes
             elif "sgd" in optimizer_name and float(group.get("momentum", 0.0)) > 0:
                 value = state.get("momentum_buffer")
-                if not isinstance(value, torch.Tensor) or value.device.type != parameter.device.type:
+                if not isinstance(value, torch.Tensor) or value.device.type != get_device_name():
                     reserve += parameter_bytes
     return reserve
+
+
+def _unsharded_gradient_reserve_bytes(model: torch.nn.Module, data_parallel_size: int) -> int:
+    """Return the extra gradient storage retained by FSDP ``no_sync``."""
+
+    if data_parallel_size < 1:
+        raise ValueError("data_parallel_size must be positive")
+    local_gradient_bytes = sum(
+        parameter.numel() * parameter.element_size() for parameter in model.parameters() if parameter.requires_grad
+    )
+    return local_gradient_bytes * (data_parallel_size - 1)
 
 
 @dataclass(frozen=True)
@@ -107,6 +118,7 @@ class ReverseSlotPlan:
     chunk_size: int
     slot_bytes: int
     estimated_workspace_bytes: int
+    prefetch_kv: bool
 
 
 def _fixed_reverse_slot_plan(
@@ -122,7 +134,7 @@ def _fixed_reverse_slot_plan(
     available_memory_bytes: int | None,
     reserve_bytes: int = 4 * 1024**3,
 ) -> ReverseSlotPlan:
-    """Choose one stable row count and kernel shape before policy version zero."""
+    """Choose one stable row count and kernel shape before the first training phase."""
 
     if token_capacity < 1 or token_capacity % page_size:
         raise ValueError("fixed reverse token capacity must be positive and page aligned")
@@ -131,9 +143,10 @@ def _fixed_reverse_slot_plan(
         raise ValueError("reverse_batch_max_tokens cannot fit one fixed trajectory slot")
     candidate = 1 << (max_rows.bit_length() - 1)
     best_plan: ReverseSlotPlan | None = None
+    best_score: tuple[int, bool, int, int] | None = None
     smallest_attempt: tuple[int, int, int, int] | None = None
     while candidate:
-        slot_bytes, bytes_per_token = _reverse_memory_estimate(
+        base_slot_bytes, bytes_per_token = _reverse_memory_estimate(
             model,
             trajectory_count=candidate,
             trace_length=token_capacity,
@@ -142,14 +155,26 @@ def _fixed_reverse_slot_plan(
         if available_memory_bytes is None:
             chunk_limit = max_chunk_size
         else:
-            workspace_budget = int(available_memory_bytes * 0.85) - reserve_bytes - slot_bytes
+            workspace_budget = available_memory_bytes - reserve_bytes - base_slot_bytes
             chunk_limit = min(max_chunk_size, workspace_budget // max(1, bytes_per_token))
-        smallest_attempt = (candidate, slot_bytes, bytes_per_token, chunk_limit)
+        smallest_attempt = (candidate, base_slot_bytes, bytes_per_token, chunk_limit)
         chunk_size = 0
+        slot_bytes = base_slot_bytes
+        prefetch_kv = False
         for proposed in range(chunk_limit // page_size * page_size, min_chunk_size - 1, -page_size):
-            if token_capacity % proposed == 0:
-                chunk_size = proposed
-                break
+            if token_capacity % proposed:
+                continue
+            proposed_prefetch_kv = proposed == token_capacity
+            proposed_slot_bytes = base_slot_bytes + (base_slot_bytes // 2 if proposed_prefetch_kv else 0)
+            if (
+                available_memory_bytes is not None
+                and reserve_bytes + proposed_slot_bytes + proposed * bytes_per_token > available_memory_bytes
+            ):
+                continue
+            chunk_size = proposed
+            slot_bytes = proposed_slot_bytes
+            prefetch_kv = proposed_prefetch_kv
+            break
         if chunk_size >= min_chunk_size:
             plan = ReverseSlotPlan(
                 batch_size=candidate,
@@ -157,14 +182,20 @@ def _fixed_reverse_slot_plan(
                 chunk_size=chunk_size,
                 slot_bytes=slot_bytes,
                 estimated_workspace_bytes=chunk_size * bytes_per_token,
+                prefetch_kv=prefetch_kv,
             )
-            # A larger reverse tile reduces wavefront depth and kernel launch
-            # count. Once tile size ties, prefer more trajectories per launch.
-            if best_plan is None or (plan.chunk_size, plan.batch_size) > (
-                best_plan.chunk_size,
-                best_plan.batch_size,
-            ):
+            # Maximize useful model tokens per launch. For equal-sized tiles,
+            # avoid a singleton batch and then prefer the longer chunk to
+            # reduce wavefront depth and kernel launch count.
+            score = (
+                plan.batch_size * plan.chunk_size,
+                plan.batch_size > 1,
+                plan.chunk_size,
+                plan.batch_size,
+            )
+            if best_score is None or score > best_score:
                 best_plan = plan
+                best_score = score
         candidate //= 2
     if best_plan is not None:
         return best_plan
@@ -331,22 +362,9 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._reverse_available_memory_bytes: int | None = None
         self._reverse_slot_plan: ReverseSlotPlan | None = None
         self._reverse_slot_pool = None
+        self._reverse_pinned_layers = None
         self._gpu_kv_lease_active = False
         self._kv_prefetch_executor: ThreadPoolExecutor | None = None
-        self._preflight_batch_cap: int | None = None
-        self._preflight_additional_reserve_bytes = 0
-
-    def configure_reverse_preflight(self, *, batch_cap: int | None = None, additional_reserve_gib: float = 0.0) -> None:
-        """Install controller-derived constraints before fixed slots are allocated."""
-
-        if self._reverse_slot_pool is not None:
-            raise RuntimeError("cannot change StreamOPD reverse constraints after slot allocation")
-        if batch_cap is not None and batch_cap < 1:
-            raise ValueError("StreamOPD reverse preflight batch cap must be positive")
-        if additional_reserve_gib < 0:
-            raise ValueError("StreamOPD reverse preflight reserve must be non-negative")
-        self._preflight_batch_cap = batch_cap
-        self._preflight_additional_reserve_bytes = int(additional_reserve_gib * 1024**3)
 
     def _get_kv_prefetch_executor(self) -> ThreadPoolExecutor:
         if self._kv_prefetch_executor is None:
@@ -364,28 +382,38 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         self._accum_global_valid_tokens = 0.0
 
     def prepare_reverse_plan(self) -> dict[str, float]:
-        """Measure reverse headroom before the first policy version starts."""
+        """Plan reverse shapes from a clear pool without allocating GPU slots."""
 
         model = self.engine.module
         if self._reverse_available_memory_bytes is None:
             try:
-                parameter_device = next(model.parameters()).device
-                self._reverse_available_memory_bytes = _available_cuda_memory(parameter_device)
+                self._reverse_available_memory_bytes = _available_cuda_memory(self.device_name)
             except (AttributeError, RuntimeError):
                 self._reverse_available_memory_bytes = 0
         metrics = {
             "available_memory_gib": (self._reverse_available_memory_bytes or 0) / (1024**3),
         }
-        if self._reverse_slot_pool is None:
+        if self._reverse_slot_plan is None:
             deferred_training_state_bytes = _deferred_training_state_bytes(model, self.engine.optimizer)
+            unsharded_gradient_reserve_bytes = 0
+            if bool(self.engine_config.use_no_sync_for_gradient_accumulation):
+                unsharded_gradient_reserve_bytes = _unsharded_gradient_reserve_bytes(
+                    model,
+                    self.engine.get_data_parallel_size(),
+                )
+            offloaded_parameter_bytes = sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in model.parameters()
+                if parameter.device.type != get_device_name()
+            )
             metrics["deferred_training_state_gib"] = deferred_training_state_bytes / (1024**3)
+            metrics["unsharded_gradient_reserve_gib"] = unsharded_gradient_reserve_bytes / (1024**3)
+            metrics["offloaded_parameter_gib"] = offloaded_parameter_bytes / (1024**3)
             parameter_dtype = next(model.parameters()).dtype
             forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
             page_size = int(self.streamopd_config.reverse_page_size)
             token_capacity = math.ceil(int(self.streamopd_config.reverse_slot_max_tokens) / page_size) * page_size
             configured_batch_size = int(self.streamopd_config.reverse_batch_size)
-            if self._preflight_batch_cap is not None:
-                configured_batch_size = min(configured_batch_size, self._preflight_batch_cap)
             self._reverse_slot_plan = _fixed_reverse_slot_plan(
                 model,
                 configured_batch_size=configured_batch_size,
@@ -398,46 +426,85 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 available_memory_bytes=self._reverse_available_memory_bytes or None,
                 reserve_bytes=(
                     int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
-                    + self._preflight_additional_reserve_bytes
                     + deferred_training_state_bytes
+                    + unsharded_gradient_reserve_bytes
+                    + offloaded_parameter_bytes
                 ),
-            )
-            from .reverse_attention import ReverseKVSlotPool
-
-            config = getattr(model, "config", None)
-            base_model = getattr(model, "model", None)
-            if config is None and base_model is not None:
-                config = getattr(base_model, "config", None)
-            hidden_size = int(getattr(config, "hidden_size", 0) or 0)
-            query_heads = int(getattr(config, "num_attention_heads", 0) or 0)
-            head_dim = int(getattr(config, "head_dim", 0) or 0) or hidden_size // query_heads
-            self._reverse_slot_pool = ReverseKVSlotPool(
-                batch_size=self._reverse_slot_plan.batch_size,
-                token_capacity=self._reverse_slot_plan.token_capacity,
-                num_layers=len(getattr(base_model, "layers", ())),
-                num_kv_heads=int(getattr(config, "num_key_value_heads", 0) or 0),
-                head_dim=head_dim,
-                page_size=page_size,
-                dtype=forward_dtype,
-                device=self.device_name,
             )
             metrics.update(
                 {
                     "slot_batch_size": float(self._reverse_slot_plan.batch_size),
                     "slot_token_capacity": float(self._reverse_slot_plan.token_capacity),
                     "slot_chunk_size": float(self._reverse_slot_plan.chunk_size),
+                    "slot_prefetch_kv": float(self._reverse_slot_plan.prefetch_kv),
                     "slot_gib": self._reverse_slot_plan.slot_bytes / (1024**3),
                     "estimated_workspace_gib": self._reverse_slot_plan.estimated_workspace_bytes / (1024**3),
                     "runtime_required_free_gib": (
                         self._reverse_slot_plan.estimated_workspace_bytes
+                        + self._reverse_slot_plan.slot_bytes
                         + deferred_training_state_bytes
+                        + unsharded_gradient_reserve_bytes
+                        + offloaded_parameter_bytes
                         + int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
-                        + self._preflight_additional_reserve_bytes
                     )
                     / (1024**3),
                 }
             )
+        else:
+            metrics.update(
+                {
+                    "slot_batch_size": float(self._reverse_slot_plan.batch_size),
+                    "slot_token_capacity": float(self._reverse_slot_plan.token_capacity),
+                    "slot_chunk_size": float(self._reverse_slot_plan.chunk_size),
+                    "slot_prefetch_kv": float(self._reverse_slot_plan.prefetch_kv),
+                    "slot_gib": self._reverse_slot_plan.slot_bytes / (1024**3),
+                    "estimated_workspace_gib": self._reverse_slot_plan.estimated_workspace_bytes / (1024**3),
+                }
+            )
         return metrics
+
+    def allocate_reverse_slots(self) -> None:
+        """Allocate Trainer-only KV slots after shared inference enters sleep."""
+
+        if self._reverse_slot_pool is not None:
+            return
+        if self._reverse_slot_plan is None:
+            raise RuntimeError("reverse slots cannot be allocated before preflight planning")
+        from .reverse_attention import ReverseKVSlotPool
+
+        model = self.engine.module
+        config = getattr(model, "config", None)
+        base_model = getattr(model, "model", None)
+        if config is None and base_model is not None:
+            config = getattr(base_model, "config", None)
+        hidden_size = int(getattr(config, "hidden_size", 0) or 0)
+        query_heads = int(getattr(config, "num_attention_heads", 0) or 0)
+        head_dim = int(getattr(config, "head_dim", 0) or 0) or hidden_size // query_heads
+        forward_dtype = getattr(self.engine, "_autocast_dtype", next(model.parameters()).dtype)
+        self._reverse_slot_pool = ReverseKVSlotPool(
+            batch_size=self._reverse_slot_plan.batch_size,
+            token_capacity=self._reverse_slot_plan.token_capacity,
+            num_layers=len(getattr(base_model, "layers", ())),
+            num_kv_heads=int(getattr(config, "num_key_value_heads", 0) or 0),
+            head_dim=head_dim,
+            page_size=int(self.streamopd_config.reverse_page_size),
+            dtype=forward_dtype,
+            device=self.device_name,
+            prefetch_kv=self._reverse_slot_plan.prefetch_kv,
+            pinned_layers=self._reverse_pinned_layers,
+        )
+        self._reverse_pinned_layers = None
+
+    def release_reverse_slots(self) -> None:
+        """Release Trainer-only KV slots before a shared vLLM process wakes."""
+
+        if self._gpu_kv_lease_active:
+            raise RuntimeError("cannot release reverse slots while a training KV lease is active")
+        if self._reverse_slot_pool is None:
+            return
+        self._reverse_slot_pool.copy_executor.shutdown(wait=True)
+        self._reverse_pinned_layers = self._reverse_slot_pool.detach_pinned_layers()
+        self._reverse_slot_pool = None
 
     @staticmethod
     def _sample_tensor(sample: TensorDict, name: str) -> torch.Tensor:
@@ -528,11 +595,11 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         page_size = int(self.streamopd_config.reverse_page_size)
         trace_lengths = [self._sample_tensor(sample, "input_ids").numel() - 1 for sample in samples]
         # The memory budget was captured once by prepare_reverse_plan before
-        # policy version zero. Planning below is deterministic and does not
-        # query the allocator or change kernel shapes after training starts.
+        # the first training phase. Planning below is deterministic and does
+        # not query the allocator or change kernel shapes after training starts.
         available_memory_bytes = self._reverse_available_memory_bytes or None
         if self._reverse_slot_plan is None or self._reverse_slot_pool is None:
-            raise RuntimeError("reverse slots were not prepared before policy version zero")
+            raise RuntimeError("reverse slots were not prepared before the first training phase")
         if max(trace_lengths) > self._reverse_slot_plan.token_capacity:
             raise RuntimeError(
                 "trajectory exceeds the preflight reverse token capacity: "
@@ -558,6 +625,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         synchronized_backward_calls = int(synchronized_calls_tensor.item())
         if synchronized_backward_calls < 1:
             raise RuntimeError("StreamOPD cohort contains no trainable token trace")
+        dummy_backward_calls = synchronized_backward_calls - local_backward_calls
 
         local_valid_tokens = sum(int(self._sample_tensor(sample, "response_mask").sum().item()) for sample in samples)
         global_valid_tokens = torch.tensor(local_valid_tokens, device=self.device_name, dtype=torch.float32)
@@ -592,6 +660,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         max_parallel_trajectories = 0
         lm_head_tokens = 0
         dense_lm_head_tokens = 0
+        padded_model_tokens = 0
         handoff_seconds = 0.0
         prefetch_host_seconds = 0.0
         prefetch_wait_seconds = 0.0
@@ -685,7 +754,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             nonlocal processed_backward_calls
             is_last = processed_backward_calls == synchronized_backward_calls - 1
             processed_backward_calls += 1
-            return self.engine._gradient_sync_context(is_last_micro_batch=is_last)
+            return self.engine._gradient_sync_context(is_last_micro_batch=finalize and is_last)
 
         try:
             model.eval()
@@ -774,6 +843,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 max_parallel_trajectories = max(max_parallel_trajectories, result.max_parallel_trajectories)
                 lm_head_tokens += result.lm_head_tokens
                 dense_lm_head_tokens += result.dense_lm_head_tokens
+                padded_model_tokens += result.padded_model_tokens
                 total_loss += result.loss_sum
 
             dummy_token = torch.zeros((1, 1), dtype=torch.long, device=self.device_name)
@@ -794,6 +864,7 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 grad_norm = 0.0
                 lr = self.engine.optimizer.param_groups[0]["lr"]
         except Exception:
+            self._reverse_slot_pool.abort_groups()
             self._reset_accumulation(zero_grad=True)
             raise
         finally:
@@ -812,6 +883,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 release_vllm_snapshot(base_path)
 
         elapsed = time.perf_counter() - started
+        defer_gradient_sync = bool(self.engine_config.use_no_sync_for_gradient_accumulation)
+        gradient_syncs = float(finalize) if defer_gradient_sync else float(processed_backward_calls)
         reported_loss = total_loss.detach()
         dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM, group=self.engine.get_data_parallel_group())
         normalized_loss = reported_loss / global_valid_tokens
@@ -830,6 +903,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
         slot_bytes_gib = self._reverse_slot_pool.slot_bytes / (1024**3)
         slot_copy_enqueue_seconds = self._reverse_slot_pool.copy_enqueue_seconds
         slot_next_copy_enqueue_seconds = self._reverse_slot_pool.next_copy_enqueue_seconds
+        slot_pinned_staging_seconds = self._reverse_slot_pool.pinned_staging_seconds
+        slot_pinned_staging_allocation_seconds = self._reverse_slot_pool.pinned_staging_allocation_seconds
+        slot_pinned_staging_gib = self._reverse_slot_pool.pinned_staging_bytes / (1024**3)
+        slot_pinned_staging_capacity_gib = self._reverse_slot_pool.pinned_staging_capacity_bytes / (1024**3)
         metrics = {
             "loss": normalized_loss.item(),
             "grad_norm": grad_norm,
@@ -837,17 +914,23 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "mfu": 0.0,
             "streamopd/reverse_chunks": local_chunks,
             "streamopd/reverse_backward_calls": processed_backward_calls,
+            "streamopd/reverse_real_backward_calls": local_backward_calls,
+            "streamopd/reverse_dummy_backward_calls": dummy_backward_calls,
             "streamopd/reverse_microbatches": len(reverse_microbatches),
             "streamopd/reverse_planned_batch_size": planned_batch_size,
             "streamopd/reverse_max_parallel_trajectories": max_parallel_trajectories,
             "streamopd/lm_head_tokens": lm_head_tokens,
             "streamopd/lm_head_token_fraction": lm_head_tokens / max(1, dense_lm_head_tokens),
+            "streamopd/reverse_model_tokens": dense_lm_head_tokens,
+            "streamopd/reverse_model_token_fraction": dense_lm_head_tokens / max(1, padded_model_tokens),
+            "streamopd/reverse_padding_tokens_trimmed": padded_model_tokens - dense_lm_head_tokens,
             "streamopd/reverse_chunk_size_min": min(reverse_chunk_sizes, default=0),
             "streamopd/reverse_chunk_size_max": max(reverse_chunk_sizes, default=0),
             "streamopd/reverse_page_size": page_size,
             "streamopd/reverse_memory_budget_gib": (available_memory_bytes or 0) / (1024**3),
             "streamopd/reverse_slot_batch_size": planned_batch_size,
             "streamopd/reverse_slot_token_capacity": self._reverse_slot_plan.token_capacity,
+            "streamopd/reverse_slot_prefetch_kv": float(self._reverse_slot_plan.prefetch_kv),
             "streamopd/reverse_slot_backing_gib": slot_bytes_gib,
             "streamopd/reverse_slot_loaded_gib": slot_loaded_gib,
             "streamopd/reverse_slot_copy_cuda_seconds": slot_copy_seconds,
@@ -858,6 +941,11 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/reverse_slot_next_wait_seconds": slot_next_wait_seconds,
             "streamopd/reverse_slot_overlap_seconds": max(0.0, slot_next_copy_seconds - slot_next_wait_seconds),
             "streamopd/reverse_slot_next_loaded_pages": slot_next_loaded_pages,
+            "streamopd/reverse_slot_pinned_staging_seconds": slot_pinned_staging_seconds,
+            "streamopd/reverse_slot_pinned_staging_allocation_seconds": slot_pinned_staging_allocation_seconds,
+            "streamopd/reverse_slot_pinned_staging_gib": slot_pinned_staging_gib,
+            "streamopd/reverse_slot_pinned_staging_capacity_gib": slot_pinned_staging_capacity_gib,
+            "streamopd/reverse_slot_pinned_staging_groups": self._reverse_slot_pool.pinned_staging_groups,
             "streamopd/handoff_seconds": handoff_seconds,
             "streamopd/kv_prefetch_host_seconds": prefetch_host_seconds,
             "streamopd/kv_prefetch_wait_seconds": prefetch_wait_seconds,
@@ -870,7 +958,11 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "streamopd/accumulation_step": accumulation_step,
             "streamopd/accumulation_steps": accumulation_steps,
             "streamopd/optimizer_finalized": float(finalize),
-            "streamopd/gradient_syncs": 1.0,
+            "streamopd/gradient_syncs": gradient_syncs,
+            # MetricsAggregator sums names containing ``total`` across the
+            # controller's training units.
+            "streamopd/gradient_syncs_total": gradient_syncs,
+            "streamopd/defer_gradient_sync": float(defer_gradient_sync),
             "perf/max_memory_allocated_gb": get_torch_device().max_memory_allocated() / (1024**3),
             "perf/max_memory_reserved_gb": get_torch_device().max_memory_reserved() / (1024**3),
         }

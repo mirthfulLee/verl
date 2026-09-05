@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from .fsdp_worker import StreamOPDKVTrainingWorker
@@ -38,13 +39,6 @@ class StreamOPDActorWorker(ActorRolloutRefWorker):
         return self.actor.prepare_reverse_plan()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def configure_streamopd_reverse_preflight(self, batch_cap=None, additional_reserve_gib=0.0) -> None:
-        self.actor.configure_reverse_preflight(
-            batch_cap=batch_cap,
-            additional_reserve_gib=additional_reserve_gib,
-        )
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset_streamopd_memory_stats(self) -> None:
         get_torch_device().reset_peak_memory_stats()
 
@@ -58,3 +52,41 @@ class StreamOPDActorWorker(ActorRolloutRefWorker):
             "allocated_bytes": int(device.memory_allocated()),
             "reserved_bytes": int(device.memory_reserved()),
         }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_streamopd_allocator_cache(self) -> None:
+        """Return inactive Trainer allocations before the next Teacher wake."""
+
+        aggressive_empty_cache(force_sync=True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def offload_streamopd_trainer_state(self) -> None:
+        """Release the shared pool after one contiguous training phase."""
+
+        device = get_torch_device()
+        device.synchronize()
+        self.actor.release_reverse_slots()
+        optimizer = self.actor.engine.optimizer
+        if optimizer is not None:
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if hasattr(value, "device") and value.device.type != "cpu":
+                        # The generic helper uses an asynchronous pageable-host
+                        # copy, which is not supported by every CUDA runtime.
+                        state[key] = value.to("cpu", non_blocking=False)
+        self.actor.engine.to(device="cpu", model=True, optimizer=False, grad=True)
+        aggressive_empty_cache(force_sync=True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_streamopd_trainer_state(self) -> None:
+        """Claim a shared pool after its inference process enters level-2 sleep."""
+
+        aggressive_empty_cache(force_sync=True)
+        self.actor.engine.to(device=get_device_name(), model=True, optimizer=True, grad=True)
+        self.actor.allocate_reverse_slots()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def allocate_streamopd_reverse_slots(self) -> None:
+        """Allocate persistent reverse slots on a dedicated Trainer pool."""
+
+        self.actor.allocate_reverse_slots()

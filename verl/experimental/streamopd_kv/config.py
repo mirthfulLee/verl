@@ -19,8 +19,8 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
 
 
-_SHARED_TEACHER_MEMORY_FRACTION = 0.25
-_MAX_DEDICATED_VLLM_MEMORY_FRACTION = 0.90
+_EXCLUSIVE_VLLM_MEMORY_KEY = "verl_exclusive_gpu_memory"
+_STREAMING_TEACHER_MEMORY_KEY = "verl_streaming_teacher_logprobs"
 
 
 def _hydra_task_override_paths() -> set[str]:
@@ -46,6 +46,20 @@ def _set_derived(target, key: str, value, path: str, explicit_paths: set[str]) -
         target[key] = value
 
 
+def _enable_exclusive_vllm_memory(inference, *, streaming_teacher: bool = False) -> None:
+    """Tell the vLLM worker to size itself from its post-NCCL free memory."""
+
+    engine_kwargs = dict(inference.get("engine_kwargs", {}) or {})
+    vllm_kwargs = dict(engine_kwargs.get("vllm", {}) or {})
+    additional_config = dict(vllm_kwargs.get("additional_config", {}) or {})
+    additional_config[_EXCLUSIVE_VLLM_MEMORY_KEY] = True
+    if streaming_teacher:
+        additional_config[_STREAMING_TEACHER_MEMORY_KEY] = True
+    vllm_kwargs["additional_config"] = additional_config
+    engine_kwargs["vllm"] = vllm_kwargs
+    inference["engine_kwargs"] = engine_kwargs
+
+
 def _auto_streamopd_runtime_profile(
     config: DictConfig,
     *,
@@ -55,11 +69,32 @@ def _auto_streamopd_runtime_profile(
 
     explicit_paths = explicit_paths or set()
     stream_config = config.distillation.streamopd_kv
+    actor = config.actor_rollout_ref.actor
     rollout = config.actor_rollout_ref.rollout
     teacher = next(iter(config.distillation.teacher_models.values())).inference
-    placement = str(stream_config.get("trainer_placement", "teacher"))
+    placement = str(stream_config.get("trainer_placement", "union"))
     if placement not in {"teacher", "rollout", "union", "dedicated"}:
         raise ValueError(f"unsupported StreamOPD trainer placement: {placement}")
+
+    # A shared Trainer is resident only during its training phase.  Let the
+    # standard engine offload path clear model, gradient, and optimizer state
+    # before either standalone vLLM process owns the same GPU pool.
+    if placement != "dedicated":
+        _set_derived(
+            actor.fsdp_config,
+            "param_offload",
+            True,
+            "actor_rollout_ref.actor.fsdp_config.param_offload",
+            explicit_paths,
+        )
+
+        _set_derived(
+            actor.fsdp_config,
+            "optimizer_offload",
+            True,
+            "actor_rollout_ref.actor.fsdp_config.optimizer_offload",
+            explicit_paths,
+        )
 
     global_batch = int(config.data.train_batch_size)
     prompt_tokens = int(config.data.max_prompt_length)
@@ -69,7 +104,13 @@ def _auto_streamopd_runtime_profile(
         raise ValueError("automatic StreamOPD runtime planning requires positive batch and sequence lengths")
 
     page_size = 64
-    response_chunk = min(1024, max(256, _ceil_div(_ceil_div(response_tokens, 8), page_size) * page_size))
+    # Keep at least four opportunities for Teacher overlap while bounding each
+    # prefill fragment to 1024 tokens. Longer responses naturally create more
+    # fragments without token-length-specific tiers.
+    response_chunk = min(
+        1024,
+        max(256, _ceil_div(_ceil_div(response_tokens, 4), page_size) * page_size),
+    )
     teacher_max_batched_tokens = min(8192, max(2048, _ceil_div(trajectory_tokens, 256) * 256))
 
     _set_derived(
@@ -93,16 +134,7 @@ def _auto_streamopd_runtime_profile(
         "actor_rollout_ref.rollout.max_num_seqs",
         explicit_paths,
     )
-    # This is only a ceiling. The controller derives the minimum sufficient
-    # fraction and, if necessary, a smaller stable concurrency from physical
-    # memory, model weights, and the non-preemptible KV footprint.
-    _set_derived(
-        rollout,
-        "gpu_memory_utilization",
-        _MAX_DEDICATED_VLLM_MEMORY_FRACTION,
-        "actor_rollout_ref.rollout.gpu_memory_utilization",
-        explicit_paths,
-    )
+    _enable_exclusive_vllm_memory(rollout)
     _set_derived(
         rollout.checkpoint_engine,
         "backend",
@@ -139,26 +171,25 @@ def _auto_streamopd_runtime_profile(
         * int(teacher.get("pipeline_model_parallel_size", 1))
     )
     teacher_replicas = max(1, teacher_world_size // teacher_replica_size)
+    teacher_prefill_wave = max(1, teacher_max_batched_tokens // min(response_chunk, trajectory_tokens))
+    # Keep enough resumable sessions resident to avoid head-of-line blocking
+    # behind a cohort of long trajectories. Admission is tightened after vLLM
+    # reports the KV blocks it actually allocated.
+    teacher_target_concurrency = max(32, 1 << (2 * teacher_prefill_wave - 1).bit_length())
     _set_derived(
         teacher,
         "max_num_seqs",
-        _ceil_div(global_batch, teacher_replicas),
+        min(_ceil_div(global_batch, teacher_replicas), teacher_target_concurrency),
         "distillation.teacher_models.teacher_model.inference.max_num_seqs",
         explicit_paths,
     )
-    # Shared Teacher gets one conventional quarter of each GPU. Reverse
-    # preflight consumes the measured remainder; dedicated Teacher uses verl's
-    # standard half-GPU vLLM envelope.
-    _set_derived(
-        teacher,
-        "gpu_memory_utilization",
-        (_SHARED_TEACHER_MEMORY_FRACTION if placement in {"teacher", "union"} else _MAX_DEDICATED_VLLM_MEMORY_FRACTION),
-        "distillation.teacher_models.teacher_model.inference.gpu_memory_utilization",
-        explicit_paths,
-    )
+    _enable_exclusive_vllm_memory(teacher, streaming_teacher=True)
 
     derived_stream_values = {
         "token_chunk_size": response_chunk,
+        "rollout_kv_export_strategy": "eos_host",
+        "rollout_kv_export_chunk_size": min(trajectory_tokens, 2048),
+        "rollout_kv_writer_threads": 4,
         "reverse_chunk_size": 0,
         "reverse_chunk_min_size": 0,
         "reverse_page_size": page_size,
@@ -185,11 +216,10 @@ def _auto_streamopd_runtime_profile(
     return {
         "profile": "auto",
         "trajectory_tokens": trajectory_tokens,
-        "token_chunk_size": response_chunk,
-        "teacher_max_batched_tokens": teacher_max_batched_tokens,
-        "teacher_gpu_memory_utilization": float(teacher.gpu_memory_utilization),
+        "token_chunk_size": int(stream_config.token_chunk_size),
+        "teacher_max_batched_tokens": int(teacher.max_num_batched_tokens),
+        "vllm_memory_policy": "exclusive_free",
         "teacher_max_num_seqs": int(teacher.max_num_seqs),
-        "rollout_gpu_memory_utilization_ceiling": float(rollout.gpu_memory_utilization),
         "rollout_max_num_seqs": int(rollout.max_num_seqs),
     }
 
@@ -226,9 +256,14 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         raise NotImplementedError("StreamOPD-KV MVP requires rollout TP=1 and PP=1")
     if int(rollout.get("n", 1)) != 1:
         raise NotImplementedError("StreamOPD currently requires actor_rollout_ref.rollout.n=1")
+    trainer_placement = str(stream_config.get("trainer_placement", "union"))
     actor = config.actor_rollout_ref.actor
     if actor.strategy not in ("fsdp", "fsdp2"):
         raise NotImplementedError("StreamOPD-KV MVP requires an FSDP actor")
+    if trainer_placement != "dedicated" and (
+        not bool(actor.fsdp_config.param_offload) or not bool(actor.fsdp_config.optimizer_offload)
+    ):
+        raise ValueError("a Trainer-shared StreamOPD pool requires actor FSDP parameter and optimizer offload")
     if actor.ppo_epochs != 1:
         raise ValueError("strict StreamOPD-KV requires actor.ppo_epochs=1")
     if actor.use_torch_compile:
@@ -243,7 +278,8 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         )
     if config.trainer.nnodes != 1 or rollout.nnodes != 1 or config.distillation.nnodes != 1:
         raise NotImplementedError("StreamOPD currently supports one node only")
-    trainer_placement = str(stream_config.get("trainer_placement", "teacher"))
+    teacher_models = config.distillation.get("teacher_models", {})
+    teacher_inference = next(iter(teacher_models.values())).inference if teacher_models else {}
     if bool(config.distillation.get("colocate_teacher_with_student", False)):
         raise ValueError(
             "StreamOPD placement is controlled by streamopd_kv.trainer_placement; "
@@ -259,6 +295,10 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         raise ValueError("a union StreamOPD trainer pool must cover disjoint Teacher and Rollout GPU subsets")
     if rollout.n_gpus_per_node < 1:
         raise ValueError("StreamOPD requires a positive Rollout GPU count")
+    if trainer_placement in {"teacher", "union"} and not bool(teacher_inference.get("free_cache_engine", True)):
+        raise ValueError("a Trainer-shared Teacher requires inference.free_cache_engine=true for phase switching")
+    if trainer_placement in {"rollout", "union"} and not bool(rollout.get("free_cache_engine", True)):
+        raise ValueError("a Trainer-shared Rollout requires rollout.free_cache_engine=true for phase switching")
     checkpoint_backend = str(rollout.checkpoint_engine.backend)
     if checkpoint_backend == "naive":
         raise ValueError("StreamOPD requires a cross-process checkpoint engine such as host or nccl")
@@ -276,6 +316,8 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     slot_tokens = int(stream_config.reverse_slot_max_tokens)
     aligned_slot_tokens = ((slot_tokens + page_size - 1) // page_size) * page_size
     with open_dict(stream_config):
+        if int(stream_config.get("rollout_kv_export_chunk_size", 0)) == 0:
+            stream_config.rollout_kv_export_chunk_size = min(aligned_slot_tokens, 2048)
         # Zero-valued reverse knobs mean "derive the largest stable preflight
         # plan". Non-zero values remain optional user caps for experiments.
         if int(stream_config.get("reverse_batch_size", 0)) == 0:
@@ -283,19 +325,17 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         if int(stream_config.get("reverse_batch_max_tokens", 0)) == 0:
             stream_config.reverse_batch_max_tokens = train_batch_size * aligned_slot_tokens
         if int(stream_config.get("reverse_chunk_size", 0)) == 0:
-            # OOMB kernels benefit from reasonably large token tiles, while
-            # multi-thousand-token activation tiles reduce wavefront width and
-            # have not improved throughput in profiling. The joint GPU
-            # preflight still selects the largest divisor up to this cap.
-            stream_config.reverse_chunk_size = min(aligned_slot_tokens, 1024)
+            # The joint GPU preflight selects the largest useful token tile
+            # that fits the actual Trainer pool.
+            stream_config.reverse_chunk_size = aligned_slot_tokens
         if int(stream_config.get("reverse_chunk_min_size", 0)) == 0:
             stream_config.reverse_chunk_min_size = page_size
     with open_dict(config.trainer.v1.sampler):
         # ReplayBuffer measures the number of policy versions spanned by a
         # trajectory. A strict single-version trajectory therefore has span 1.
         config.trainer.v1.sampler.max_off_policy_threshold = 1
-        # Finished microbatches can train while the rest of the fixed policy
-        # batch is still rolling out; the policy barrier rejects stale work.
+        # Dedicated Trainer pools may consume ready units before the complete
+        # fixed policy batch finishes; the policy barrier rejects stale work.
         config.trainer.v1.sampler.max_off_policy_strategy = "drop"
     filter_groups = config.algorithm.get("filter_groups")
     if filter_groups is not None:
@@ -328,10 +368,11 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
         "kv_connector_module_path": "verl.experimental.streamopd_kv.vllm_connector",
         "kv_connector_extra_config": {
             "streamopd_kv_handoff_dir": stream_config.kv_handoff_dir,
-            "streamopd_kv_chunk_size": int(stream_config.get("token_chunk_size", 256)),
+            "streamopd_kv_chunk_size": int(stream_config.rollout_kv_export_chunk_size),
+            "streamopd_kv_export_strategy": str(stream_config.get("rollout_kv_export_strategy", "eos_host")),
             "streamopd_host_slot_count": int(config.data.train_batch_size),
             "streamopd_host_slot_tokens": int(stream_config.reverse_slot_max_tokens),
-            "streamopd_writer_threads": 4,
+            "streamopd_writer_threads": int(stream_config.get("rollout_kv_writer_threads", 4)),
         },
     }
     with open_dict(engine_kwargs):

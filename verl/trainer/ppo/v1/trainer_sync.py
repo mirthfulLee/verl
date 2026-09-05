@@ -13,12 +13,49 @@
 # limitations under the License.
 import logging
 import os
+import time
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.debug import marked_timer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _stage_timing_metrics_from_tags(
+    tags: list[dict], *, policy_started_at: float, training_seconds: float
+) -> dict[str, float]:
+    tags = [tag for tag in tags if not tag.get("is_padding", False)]
+    rollout_tags = [tag for tag in tags if "_stage_rollout_started_at" in tag and "_stage_rollout_completed_at" in tag]
+    metrics = {"stage/training_seconds": float(training_seconds)}
+    if rollout_tags:
+        rollout_started_at = min(float(tag["_stage_rollout_started_at"]) for tag in rollout_tags)
+        rollout_completed_at = max(float(tag["_stage_rollout_completed_at"]) for tag in rollout_tags)
+        request_seconds = [float(tag["_stage_rollout_request_seconds"]) for tag in rollout_tags]
+        metrics.update(
+            {
+                "stage/rollout_span_seconds": max(0.0, rollout_completed_at - rollout_started_at),
+                "stage/rollout_makespan_seconds": max(0.0, rollout_completed_at - policy_started_at),
+                "stage/rollout_request_seconds/mean": sum(request_seconds) / len(request_seconds),
+                "stage/rollout_request_seconds/max": max(request_seconds),
+            }
+        )
+    teacher_tags = [tag for tag in tags if "_stage_teacher_started_at" in tag and "_stage_teacher_completed_at" in tag]
+    if teacher_tags:
+        teacher_started_at = min(float(tag["_stage_teacher_started_at"]) for tag in teacher_tags)
+        teacher_completed_at = max(float(tag["_stage_teacher_completed_at"]) for tag in teacher_tags)
+        request_seconds = [float(tag["_stage_teacher_request_seconds"]) for tag in teacher_tags]
+        metrics.update(
+            {
+                "stage/teacher_span_seconds": max(0.0, teacher_completed_at - teacher_started_at),
+                "stage/teacher_makespan_seconds": max(0.0, teacher_completed_at - policy_started_at),
+                "stage/teacher_request_seconds/mean": sum(request_seconds) / len(request_seconds),
+                "stage/teacher_request_seconds/max": max(request_seconds),
+            }
+        )
+        if rollout_tags:
+            metrics["stage/teacher_tail_seconds"] = max(0.0, teacher_completed_at - rollout_completed_at)
+    return metrics
 
 
 @register_trainer("sync")
@@ -31,6 +68,21 @@ class PPOTrainerSync(PPOTrainer):
     def on_init_end(self):
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
+
+    def prepare_step(self) -> dict:
+        self._stage_policy_started_at = time.perf_counter()
+        return super().prepare_step()
+
+    def step(self, metrics: dict, timing_raw: dict):
+        batch = super().step(metrics, timing_raw)
+        metrics.update(
+            _stage_timing_metrics_from_tags(
+                batch.tags,
+                policy_started_at=self._stage_policy_started_at,
+                training_seconds=float(timing_raw.get("update_actor", 0.0)),
+            )
+        )
+        return batch
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):

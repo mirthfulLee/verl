@@ -149,6 +149,59 @@ class _ContiguousKVLayer:
         return instance
 
 
+class _ContiguousKVBuffer:
+    """Optional inactive K/V backing for one-chunk reverse prefetch."""
+
+    @classmethod
+    def allocate(
+        cls,
+        batch_size: int,
+        token_capacity: int,
+        num_kv_heads: int,
+        head_dim: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _ContiguousKVBuffer:
+        instance = cls.__new__(cls)
+        shape = (batch_size, token_capacity, num_kv_heads, head_dim)
+        instance.key = torch.empty(shape, dtype=dtype, device=device)
+        instance.value = torch.empty_like(instance.key)
+        return instance
+
+
+class _PinnedKVLayer:
+    """One layer of persistent Host staging for a single reverse group."""
+
+    @classmethod
+    def allocate(
+        cls,
+        batch_size: int,
+        token_capacity: int,
+        num_kv_heads: int,
+        head_dim: int,
+        *,
+        dtype: torch.dtype,
+    ) -> _PinnedKVLayer:
+        instance = cls.__new__(cls)
+        shape = (batch_size, token_capacity, num_kv_heads, head_dim)
+        instance.key = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        instance.value = torch.empty_like(instance.key, pin_memory=True)
+        return instance
+
+
+class _PinnedKVSource:
+    """Token-major view into one row of persistent pinned staging."""
+
+    def __init__(self, key: torch.Tensor, value: torch.Tensor) -> None:
+        self.key = key
+        self.value = value
+
+    @property
+    def length(self) -> int:
+        return self.key.shape[0]
+
+
 class FixedSlotPageState(str, Enum):
     FREE = "free"
     LOADING_NEXT = "loading_next"
@@ -158,13 +211,7 @@ class FixedSlotPageState(str, Enum):
 
 
 class ReverseKVSlotPool:
-    """Persistent row/page KV backing shared by consecutive reverse groups.
-
-    K/V and dK/dV addresses remain stable for the lifetime of the worker. The
-    current group owns prefix pages until their reverse depth commits. A
-    dedicated copy stream then overwrites those released pages with the next
-    group's host-resident rollout KV.
-    """
+    """Preallocated reverse KV with page reuse or full one-chunk prefetch."""
 
     def __init__(
         self,
@@ -177,6 +224,8 @@ class ReverseKVSlotPool:
         page_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        prefetch_kv: bool = False,
+        pinned_layers: list[_PinnedKVLayer] | None = None,
     ) -> None:
         if min(batch_size, token_capacity, num_layers, num_kv_heads, head_dim, page_size) < 1:
             raise ValueError("fixed reverse slot dimensions must be positive")
@@ -194,6 +243,7 @@ class ReverseKVSlotPool:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = dtype
+        self.prefetch_kv = bool(prefetch_kv)
         self.num_pages = token_capacity // page_size
         self.layers = [
             _ContiguousKVLayer.allocate(
@@ -206,6 +256,21 @@ class ReverseKVSlotPool:
             )
             for _ in range(num_layers)
         ]
+        self._inactive_layers = (
+            [
+                _ContiguousKVBuffer.allocate(
+                    batch_size,
+                    token_capacity,
+                    num_kv_heads,
+                    head_dim,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                for _ in range(num_layers)
+            ]
+            if self.prefetch_kv
+            else None
+        )
         device_module = get_torch_device()
         self.copy_stream = device_module.Stream(device=self.device)
         self.copy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="streamopd-slot-h2d")
@@ -217,6 +282,19 @@ class ReverseKVSlotPool:
         self._next_sources: Sequence[Sequence[Any]] | None = None
         self._next_lengths: list[int] = []
         self._next_padded_lengths: list[int] = []
+        self._pinned_layers = pinned_layers
+        if pinned_layers is not None:
+            expected_shape = (batch_size, token_capacity, num_kv_heads, head_dim)
+            if len(pinned_layers) != num_layers or any(
+                layer.key.shape != expected_shape
+                or layer.value.shape != expected_shape
+                or layer.key.dtype != dtype
+                or layer.value.dtype != dtype
+                or not layer.key.is_pinned()
+                or not layer.value.is_pinned()
+                for layer in pinned_layers
+            ):
+                raise ValueError("reused pinned reverse staging does not match the fixed slot plan")
         self._copy_records: list[tuple[Any, Any, bool]] = []
         self._activation_count = 0
         self.initial_wait_seconds = 0.0
@@ -225,9 +303,13 @@ class ReverseKVSlotPool:
         self.loaded_bytes = 0
         self.copy_enqueue_seconds = 0.0
         self.next_copy_enqueue_seconds = 0.0
+        self.pinned_staging_seconds = 0.0
+        self.pinned_staging_allocation_seconds = 0.0
+        self.pinned_staging_bytes = 0
+        self.pinned_staging_groups = 0
 
     @property
-    def slot_bytes(self) -> int:
+    def kv_pair_bytes(self) -> int:
         return (
             self.batch_size
             * self.token_capacity
@@ -235,8 +317,27 @@ class ReverseKVSlotPool:
             * self.num_kv_heads
             * self.head_dim
             * torch.tensor([], dtype=self.dtype).element_size()
-            * 4
+            * 2
         )
+
+    @property
+    def slot_bytes(self) -> int:
+        return self.kv_pair_bytes * (3 if self.prefetch_kv else 2)
+
+    @property
+    def pinned_staging_capacity_bytes(self) -> int:
+        if self._pinned_layers is None:
+            return 0
+        return self.kv_pair_bytes
+
+    def detach_pinned_layers(self) -> list[_PinnedKVLayer] | None:
+        """Keep Host staging alive while phase-shared GPU slots are released."""
+
+        if self._current_lengths or self._next_sources is not None or self._pending_enqueues:
+            raise RuntimeError("cannot detach pinned reverse staging while a group is active")
+        pinned_layers = self._pinned_layers
+        self._pinned_layers = None
+        return pinned_layers
 
     @staticmethod
     def _validate_sources(sources: Sequence[Sequence[Any]], lengths: Sequence[int]) -> None:
@@ -254,6 +355,70 @@ class ReverseKVSlotPool:
         self.loaded_bytes = 0
         self.copy_enqueue_seconds = 0.0
         self.next_copy_enqueue_seconds = 0.0
+        self.pinned_staging_seconds = 0.0
+        self.pinned_staging_allocation_seconds = 0.0
+        self.pinned_staging_bytes = 0
+        self.pinned_staging_groups = 0
+
+    def _requires_pinned_staging(self, sources: Sequence[Sequence[Any]]) -> bool:
+        return any(
+            not layer.key.is_pinned() or not layer.value.is_pinned() for trajectory in sources for layer in trajectory
+        )
+
+    def _ensure_pinned_layers(self) -> list[_PinnedKVLayer]:
+        if self._pinned_layers is None:
+            started = time.perf_counter()
+            self._pinned_layers = [
+                _PinnedKVLayer.allocate(
+                    self.batch_size,
+                    self.token_capacity,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    dtype=self.dtype,
+                )
+                for _ in range(self.num_layers)
+            ]
+            self.pinned_staging_allocation_seconds += time.perf_counter() - started
+        return self._pinned_layers
+
+    def _stage_pageable_sources(
+        self,
+        sources: Sequence[Sequence[Any]],
+        lengths: Sequence[int],
+    ) -> None:
+        """Materialize one group in reusable pinned storage before H2D."""
+
+        pinned_layers = self._ensure_pinned_layers()
+        started = time.perf_counter()
+        staged_sources: list[list[_PinnedKVSource]] = [[] for _ in sources]
+        for layer_idx, destination in enumerate(pinned_layers):
+            for row, (trajectory, length) in enumerate(zip(sources, lengths, strict=True)):
+                source = trajectory[layer_idx]
+                if source.key.ndim == 3:
+                    source_key = source.key[:length]
+                    source_value = source.value[:length]
+                else:
+                    source_key = source.key[0, :, :length].transpose(0, 1)
+                    source_value = source.value[0, :, :length].transpose(0, 1)
+                destination.key[row, :length].copy_(source_key)
+                destination.value[row, :length].copy_(source_value)
+                staged_sources[row].append(
+                    _PinnedKVSource(
+                        destination.key[row, :length],
+                        destination.value[row, :length],
+                    )
+                )
+        self._next_sources = staged_sources
+        self.pinned_staging_seconds += time.perf_counter() - started
+        self.pinned_staging_bytes += (
+            sum(lengths)
+            * self.num_layers
+            * self.num_kv_heads
+            * self.head_dim
+            * torch.tensor([], dtype=self.dtype).element_size()
+            * 2
+        )
+        self.pinned_staging_groups += 1
 
     def prepare_next(
         self,
@@ -276,18 +441,42 @@ class ReverseKVSlotPool:
         for trajectory in sources:
             if len(trajectory) != self.num_layers:
                 raise ValueError("fixed reverse source layer count mismatch")
+        for trajectory, length in zip(sources, lengths, strict=True):
             for layer in trajectory:
                 if layer.length > self.token_capacity or layer.key.ndim not in (3, 4):
                     raise ValueError("fixed reverse source does not fit one slot row")
+                if layer.length < length:
+                    raise ValueError("fixed reverse source is shorter than its trajectory")
                 if layer.key.shape != layer.value.shape:
                     raise ValueError("fixed reverse source K/V shapes differ")
                 if layer.key.ndim == 4 and layer.key.shape[0] != 1:
                     raise ValueError("fixed reverse batch-major source must contain one trajectory")
+                if layer.key.device.type != "cpu" or layer.value.device.type != "cpu":
+                    raise ValueError("fixed reverse source K/V must reside in Host memory")
+                if layer.key.dtype != self.dtype or layer.value.dtype != self.dtype:
+                    raise ValueError("fixed reverse source K/V dtype does not match its slot")
+                if layer.key.shape[-2:] != (self.num_kv_heads, self.head_dim) and not (
+                    layer.key.ndim == 4
+                    and layer.key.shape[1] == self.num_kv_heads
+                    and layer.key.shape[-1] == self.head_dim
+                ):
+                    raise ValueError("fixed reverse source K/V head shape does not match its slot")
         self._next_sources = sources
         self._next_lengths = list(lengths)
         self._next_padded_lengths = list(padded_lengths)
-        for row, padded_length in enumerate(self._next_padded_lengths):
-            self._schedule_free_ranges(row, padded_length)
+        if self._requires_pinned_staging(sources):
+            self._pending_enqueues.append(
+                self.copy_executor.submit(self._stage_pageable_sources, sources, list(lengths))
+            )
+        if self.prefetch_kv:
+            self._submit_copy_rows(
+                list(range(len(self._next_padded_lengths))),
+                0,
+                max(self._next_padded_lengths),
+            )
+        else:
+            for row, padded_length in enumerate(self._next_padded_lengths):
+                self._schedule_free_ranges(row, padded_length)
 
     def _schedule_free_ranges(self, row: int, padded_length: int) -> None:
         end_page = padded_length // self.page_size
@@ -314,21 +503,23 @@ class ReverseKVSlotPool:
         device_module.set_device(self.device)
         enqueue_started = time.perf_counter()
         start_page = start // self.page_size
-        wait_events = {
-            self.free_events[row][page]
-            for row in rows
-            for page in range(start_page, min(end, self._next_padded_lengths[row]) // self.page_size)
-            if self.free_events[row][page] is not None
-        }
-        for row in rows:
-            padded_end = min(end, self._next_padded_lengths[row])
-            for page in range(start_page, padded_end // self.page_size):
-                if self.page_states[row][page] not in (
-                    FixedSlotPageState.FREE,
-                    FixedSlotPageState.BACKWARD_DONE,
-                ):
-                    raise RuntimeError(f"fixed reverse page ({row}, {page}) is not free for next-group loading")
-                self.page_states[row][page] = FixedSlotPageState.LOADING_NEXT
+        wait_events = set()
+        if not self.prefetch_kv:
+            wait_events = {
+                self.free_events[row][page]
+                for row in rows
+                for page in range(start_page, min(end, self._next_padded_lengths[row]) // self.page_size)
+                if self.free_events[row][page] is not None
+            }
+            for row in rows:
+                padded_end = min(end, self._next_padded_lengths[row])
+                for page in range(start_page, padded_end // self.page_size):
+                    if self.page_states[row][page] not in (
+                        FixedSlotPageState.FREE,
+                        FixedSlotPageState.BACKWARD_DONE,
+                    ):
+                        raise RuntimeError(f"fixed reverse page ({row}, {page}) is not free for next-group loading")
+                    self.page_states[row][page] = FixedSlotPageState.LOADING_NEXT
         started = device_module.Event(enable_timing=True)
         completed = device_module.Event(enable_timing=True)
         with device_module.stream(self.copy_stream):
@@ -337,7 +528,9 @@ class ReverseKVSlotPool:
                 self.copy_stream.wait_event(event)
             started.record(self.copy_stream)
             for layer_idx in range(self.num_layers):
-                destination = self.layers[layer_idx]
+                destination = (
+                    self._inactive_layers[layer_idx] if self._inactive_layers is not None else self.layers[layer_idx]
+                )
                 for row in rows:
                     padded_end = min(end, self._next_padded_lengths[row])
                     valid_end = min(padded_end, self._next_lengths[row])
@@ -358,6 +551,8 @@ class ReverseKVSlotPool:
                             source_value = source.value[0, :, start:valid_end].transpose(0, 1)
                             destination.key[row, start:valid_end].copy_(source_key, non_blocking=True)
                             destination.value[row, start:valid_end].copy_(source_value, non_blocking=True)
+                if self.prefetch_kv:
+                    continue
                 if rows == list(range(len(rows))) and all(end <= self._next_padded_lengths[row] for row in rows):
                     runtime.memset_rows_async(
                         destination.key_grad,
@@ -426,6 +621,15 @@ class ReverseKVSlotPool:
             self.next_wait_seconds += wait_seconds
         else:
             self.initial_wait_seconds += wait_seconds
+        if self._inactive_layers is not None:
+            for layer, inactive in zip(self.layers, self._inactive_layers, strict=True):
+                layer.key, inactive.key = inactive.key, layer.key
+                layer.value, inactive.value = inactive.value, layer.value
+            current_stream = get_torch_device().current_stream(self.device)
+            runtime = _cuda_runtime()
+            for layer in self.layers:
+                runtime.memset_async(layer.key_grad, current_stream)
+                runtime.memset_async(layer.value_grad, current_stream)
         for row in range(self.batch_size):
             active_pages = (
                 self._next_padded_lengths[row] // self.page_size if row < len(self._next_padded_lengths) else 0
@@ -448,9 +652,11 @@ class ReverseKVSlotPool:
     def release_current_range(self, active: Sequence[int], start: int, end: int) -> None:
         if start % self.page_size or end % self.page_size:
             raise ValueError("fixed reverse release ranges must be page aligned")
-        device_module = get_torch_device()
-        free_event = device_module.Event(enable_timing=False)
-        free_event.record(device_module.current_stream(self.device))
+        free_event = None
+        if not self.prefetch_kv:
+            device_module = get_torch_device()
+            free_event = device_module.Event(enable_timing=False)
+            free_event.record(device_module.current_stream(self.device))
         for row in active:
             for page in range(start // self.page_size, end // self.page_size):
                 if self.page_states[row][page] != FixedSlotPageState.CURRENT_ACTIVE:
@@ -458,7 +664,7 @@ class ReverseKVSlotPool:
                 self.page_states[row][page] = FixedSlotPageState.BACKWARD_DONE
                 self.free_events[row][page] = free_event
                 self.page_states[row][page] = FixedSlotPageState.FREE
-        if self._next_sources is not None:
+        if not self.prefetch_kv and self._next_sources is not None:
             self._submit_copy_rows(active, start, end)
 
     def finish_current(self) -> None:
@@ -467,6 +673,26 @@ class ReverseKVSlotPool:
                 if self.page_states[row][page] == FixedSlotPageState.CURRENT_ACTIVE:
                     raise RuntimeError("fixed reverse group finished before every current page was released")
         self._current_lengths = []
+
+    def abort_groups(self) -> None:
+        """Drop group metadata after a failed backward before pool teardown."""
+
+        for future in self._pending_enqueues:
+            future.cancel()
+            try:
+                future.result()
+            except BaseException:
+                pass
+        self._pending_enqueues.clear()
+        self._current_lengths = []
+        self._next_sources = None
+        self._next_lengths = []
+        self._next_padded_lengths = []
+        for row in range(self.batch_size):
+            for page in range(self.num_pages):
+                self.page_states[row][page] = FixedSlotPageState.FREE
+                self.load_events[row][page] = None
+                self.free_events[row][page] = None
 
     def state(self) -> ReverseWavefrontState:
         if not self._current_lengths:
@@ -494,7 +720,6 @@ class _ContiguousKVBatchView:
         self.batch_size = len(active)
         self.num_kv_heads = layer.num_kv_heads
         self.head_dim = layer.head_dim
-        self.group_size = 0
         self._active_tensor: torch.Tensor | None = None
         self._prefix_active = self.active == tuple(range(self.batch_size))
 
@@ -505,23 +730,18 @@ class _ContiguousKVBatchView:
             self._active_tensor = torch.tensor(self.active, dtype=torch.long, device=tensor.device)
         return tensor.index_select(0, self._active_tensor)[:, : self.end]
 
-    def expanded_key_value(self, query_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def key_value(self, query_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
         if query_heads % self.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
-        self.group_size = query_heads // self.num_kv_heads
-        key = self._select(self.layer.key).transpose(1, 2)
-        value = self._select(self.layer.value).transpose(1, 2)
-        return key.repeat_interleave(self.group_size, dim=1), value.repeat_interleave(self.group_size, dim=1)
+        # CUDA FlashAttention kernels natively support GQA. Keep the compact
+        # KV-head dimension instead of materializing query-head copies for
+        # every layer and reverse depth.
+        return self._select(self.layer.key), self._select(self.layer.value)
 
-    def accumulate_expanded_gradients(self, key_grad: torch.Tensor, value_grad: torch.Tensor) -> None:
-        batch, _, tokens, head_dim = key_grad.shape
-        expected_heads = self.num_kv_heads * self.group_size
-        if batch != self.batch_size or key_grad.shape[1] != expected_heads or head_dim != self.head_dim:
+    def accumulate_gradients(self, key_grad: torch.Tensor, value_grad: torch.Tensor) -> None:
+        batch, tokens, heads, head_dim = key_grad.shape
+        if batch != self.batch_size or heads != self.num_kv_heads or head_dim != self.head_dim:
             raise RuntimeError("FlashAttention returned an invalid contiguous OOMB gradient shape")
-        key_grad = key_grad.view(batch, self.num_kv_heads, self.group_size, tokens, head_dim).sum(2)
-        value_grad = value_grad.view(batch, self.num_kv_heads, self.group_size, tokens, head_dim).sum(2)
-        key_grad = key_grad.transpose(1, 2)
-        value_grad = value_grad.transpose(1, 2)
         if self._prefix_active:
             self.layer.key_grad[:batch, :tokens].add_(key_grad)
             self.layer.value_grad[:batch, :tokens].add_(value_grad)
@@ -554,55 +774,105 @@ class _FlashContiguousAttention(torch.autograd.Function):
         expected = (manager.batch_size, manager.end - manager.start, manager.num_kv_heads, manager.head_dim)
         if current_key.shape != expected or current_value.shape != expected:
             raise ValueError(f"current recomputed KV shape does not match the OOMB wavefront: expected {expected}")
-        query = query.transpose(1, 2).contiguous()
-        key, value = manager.expanded_key_value(query.shape[1])
+        key, value = manager.key_value(query.shape[2])
         softmax_scale = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
         try:
-            result = torch.ops.aten._scaled_dot_product_flash_attention(
+            from flash_attn.flash_attn_interface import _wrapped_flash_attn_forward
+
+            output, lse, _, rng_state = _wrapped_flash_attn_forward(
                 query,
                 key,
                 value,
+                0.0,
+                softmax_scale,
+                causal=True,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                alibi_slopes=None,
+                return_softmax=False,
+            )
+            ctx.backend = "flash_attn"
+            ctx.save_for_backward(query, output, lse, rng_state)
+        except ImportError:
+            query_heads_first = query.transpose(1, 2).contiguous()
+            key_heads_first = key.transpose(1, 2)
+            value_heads_first = value.transpose(1, 2)
+            result = torch.ops.aten._scaled_dot_product_flash_attention(
+                query_heads_first,
+                key_heads_first,
+                value_heads_first,
                 0.0,
                 True,
                 False,
                 scale=softmax_scale,
             )
-        except (AttributeError, RuntimeError) as exc:
-            raise RuntimeError("the selected CUDA device does not support exact contiguous FlashAttention") from exc
-        output, lse, cum_q, cum_k, max_q, max_k, rng_state = result[:7]
-        ctx.save_for_backward(query, output, lse, rng_state)
+            output, lse, cum_q, cum_k, max_q, max_k, rng_state = result[:7]
+            ctx.backend = "aten"
+            ctx.cum_q = cum_q
+            ctx.cum_k = cum_k
+            ctx.max_q = max_q
+            ctx.max_k = max_k
+            ctx.save_for_backward(query_heads_first, output, lse, rng_state)
         ctx.manager = manager
-        ctx.cum_q = cum_q
-        ctx.cum_k = cum_k
-        ctx.max_q = max_q
-        ctx.max_k = max_k
         ctx.softmax_scale = softmax_scale
-        return output.transpose(1, 2)
+        return output if ctx.backend == "flash_attn" else output.transpose(1, 2)
 
     @staticmethod
     def backward(ctx, output_grad: torch.Tensor):
         query, output, lse, rng_state = ctx.saved_tensors
-        key, value = ctx.manager.expanded_key_value(query.shape[1])
-        query_grad, key_grad, value_grad = torch.ops.aten._scaled_dot_product_flash_attention_backward(
-            output_grad.transpose(1, 2).contiguous(),
-            query,
-            key,
-            value,
-            output,
-            lse,
-            ctx.cum_q,
-            ctx.cum_k,
-            ctx.max_q,
-            ctx.max_k,
-            0.0,
-            True,
-            rng_state[0],
-            rng_state[1],
-            scale=ctx.softmax_scale,
-        )
-        ctx.manager.accumulate_expanded_gradients(key_grad, value_grad)
+        if ctx.backend == "flash_attn":
+            from flash_attn.flash_attn_interface import _wrapped_flash_attn_backward
+
+            key, value = ctx.manager.key_value(query.shape[2])
+            query_grad = torch.empty_like(query)
+            key_grad = torch.empty_like(key)
+            value_grad = torch.empty_like(value)
+            _wrapped_flash_attn_backward(
+                output_grad.contiguous(),
+                query,
+                key,
+                value,
+                output,
+                lse,
+                query_grad,
+                key_grad,
+                value_grad,
+                0.0,
+                ctx.softmax_scale,
+                True,
+                -1,
+                -1,
+                0.0,
+                None,
+                False,
+                rng_state=rng_state,
+            )
+        else:
+            key, value = ctx.manager.key_value(query.shape[1])
+            query_grad, key_grad, value_grad = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+                output_grad.transpose(1, 2).contiguous(),
+                query,
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                output,
+                lse,
+                ctx.cum_q,
+                ctx.cum_k,
+                ctx.max_q,
+                ctx.max_k,
+                0.0,
+                True,
+                rng_state[0],
+                rng_state[1],
+                scale=ctx.softmax_scale,
+            )
+            query_grad = query_grad.transpose(1, 2)
+            key_grad = key_grad.transpose(1, 2)
+            value_grad = value_grad.transpose(1, 2)
+        ctx.manager.accumulate_gradients(key_grad, value_grad)
         current_key_grad, current_value_grad = ctx.manager.grad
-        return query_grad.transpose(1, 2), current_key_grad, current_value_grad, None, None
+        return query_grad, current_key_grad, current_value_grad, None, None
 
 
 flash_contiguous_attention = _FlashContiguousAttention.apply
@@ -631,7 +901,6 @@ class ReverseWavefrontState:
         state.start = 0
         state.end = 0
         state._visited = set()
-        state._current = {}
         return state
 
     def begin(self, active: Sequence[int], start: int, end: int) -> None:
@@ -643,7 +912,6 @@ class ReverseWavefrontState:
             raise RuntimeError("active FlashAttention wavefront trajectory is shorter than the reverse depth")
         self.active = list(active)
         self.start, self.end = start, end
-        self._current.clear()
 
     def attention(
         self,
@@ -667,18 +935,14 @@ class ReverseWavefrontState:
             manager,
             scale,
         )
-        self._current[layer_idx] = (current_key, current_value)
         return output.transpose(1, 2)
 
-    def gradient_injection(self) -> torch.Tensor:
+    def validate_complete(self) -> None:
         if len(self._visited) != self.num_layers:
             raise RuntimeError(f"expected {self.num_layers} visited layers, got {len(self._visited)}")
-        current_key, _ = next(iter(self._current.values()))
-        return torch.zeros((), device=current_key.device, dtype=current_key.dtype)
 
     def commit_prefix_gradients(self) -> None:
         if len(self._visited) != self.num_layers:
             raise RuntimeError(f"expected {self.num_layers} visited layers, got {len(self._visited)}")
         self.active = []
         self._visited.clear()
-        self._current.clear()

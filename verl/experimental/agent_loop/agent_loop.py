@@ -76,10 +76,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def resolve_do_sample(configured: bool, override: Any | None = None) -> bool:
+    """Resolve an optional per-sample override against rollout configuration."""
+
+    return bool(configured if override is None else override)
+
+
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
     generate_sequences: float = 0.0
+    teacher_logprobs: float = 0.0
     tool_calls: float = 0.0
     compute_score: float = 0.0
     num_preempted: int = -1  # -1 means not available
@@ -631,7 +638,8 @@ class AgentLoopWorker:
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
             sample_sampling_params = dict(sampling_params)
-            if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
+            override = None if per_sample_do_sample is None else per_sample_do_sample[i]
+            if not validate and not resolve_do_sample(config.do_sample, override):
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(
                 asyncio.create_task(
@@ -1033,7 +1041,10 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
-        if self.distillation_enabled and not validate:
+        if not self.distillation_enabled or validate:
+            return
+        timing = {}
+        with simple_timer("teacher_logprobs", timing):
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -1056,6 +1067,7 @@ class AgentLoopWorker:
                 )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+        output.metrics.teacher_logprobs = timing["teacher_logprobs"]
 
     def _postprocess(
         self,
@@ -1266,6 +1278,7 @@ class AgentLoopManager:
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
+        t_teacher_logprobs = np.array([metric["teacher_logprobs"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
         t_compute_score = np.array([metric["compute_score"] for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
@@ -1275,6 +1288,9 @@ class AgentLoopManager:
         timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
         timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
         timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
+        timing["agent_loop/teacher_logprobs/min"] = t_teacher_logprobs.min()
+        timing["agent_loop/teacher_logprobs/max"] = t_teacher_logprobs.max()
+        timing["agent_loop/teacher_logprobs/mean"] = t_teacher_logprobs.mean()
         timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
@@ -1286,6 +1302,7 @@ class AgentLoopManager:
         slowest = np.argmax(t_generate_sequences + t_tool_calls + t_compute_score)
         prompt_length = output.batch["prompts"].shape[1]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        timing["agent_loop/slowest/teacher_logprobs"] = t_teacher_logprobs[slowest]
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
         timing["agent_loop/slowest/compute_score"] = t_compute_score[slowest]
         timing["agent_loop/slowest/num_preempted"] = num_preempted[slowest]

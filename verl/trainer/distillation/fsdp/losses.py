@@ -23,17 +23,47 @@ from verl.utils.ulysses import (
 from verl.workers.config import DistillationConfig, DistillationLossConfig
 
 
+class _MemoryBoundTopKLogProbs(torch.autograd.Function):
+    """Recompute normalized vocabulary chunks instead of retaining them."""
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, topk_ids: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        outputs = []
+        for start in range(0, logits.shape[0], chunk_size):
+            end = min(start + chunk_size, logits.shape[0])
+            logits_fp32 = logits[start:end].float()
+            log_z = torch.logsumexp(logits_fp32, dim=-1, keepdim=True)
+            selected = torch.gather(logits_fp32, dim=-1, index=topk_ids[start:end])
+            outputs.append((selected - log_z).to(logits.dtype))
+        ctx.save_for_backward(logits, topk_ids)
+        ctx.chunk_size = chunk_size
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        logits, topk_ids = ctx.saved_tensors
+        grad_logits = torch.empty_like(logits)
+        with torch.no_grad():
+            for start in range(0, logits.shape[0], ctx.chunk_size):
+                end = min(start + ctx.chunk_size, logits.shape[0])
+                selected_grad = grad_output[start:end].float()
+                chunk_grad = F.softmax(logits[start:end], dim=-1, dtype=torch.float32)
+                chunk_grad.mul_(-selected_grad.sum(dim=-1, keepdim=True))
+                chunk_grad.scatter_add_(1, topk_ids[start:end], selected_grad)
+                grad_logits[start:end].copy_(chunk_grad)
+        return grad_logits, None, None
+
+
 def _chunked_topk_log_probs(
     logits: torch.Tensor,
     topk_ids: torch.Tensor,
     chunk_size: int = 4096,
 ) -> torch.Tensor:
-    """Compute log_softmax(logits).gather(topk_ids) without materializing [B, T, V].
+    """Compute log_softmax(logits).gather(topk_ids) with bounded workspace.
 
-    Uses the identity:
-        log_softmax(x).gather(idx) == x.gather(idx) - logsumexp(x, keepdim=True)
-    Streams the reduction in chunks of `chunk_size` tokens along (B*T) with fp32
-    logsumexp for numerical stability.
+    Forward and backward compute FP32 normalization one token chunk at a time.
+    Autograd retains only the original logits and top-k ids; full-vocabulary
+    normalized tensors are recomputed during backward.
 
     Args:
         logits:    [B, T, V] student logits.
@@ -43,23 +73,19 @@ def _chunked_topk_log_probs(
     Returns:
         [B, T, K] tensor with the same dtype as `logits`.
     """
+    if chunk_size < 1:
+        raise ValueError("top-k log-prob chunk size must be positive")
     B, T, V = logits.shape
     K = topk_ids.shape[-1]
     flat_logits = logits.reshape(-1, V)  # [N, V]
-    flat_topk = topk_ids.reshape(-1, K)  # [N, K]
+    flat_topk = topk_ids.reshape(-1, K).long()  # [N, K]
     N = flat_logits.shape[0]
 
     # Edge case: empty input (e.g. fully-padded micro-batch).
     if N == 0:
         return torch.empty((B, T, K), dtype=logits.dtype, device=logits.device)
 
-    out = torch.empty((N, K), dtype=logits.dtype, device=logits.device)
-    for s in range(0, N, chunk_size):
-        e = min(s + chunk_size, N)
-        chunk_logits_fp32 = flat_logits[s:e].float()
-        log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)  # [c, 1]
-        chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk[s:e])
-        out[s:e] = (chunk_topk_logits - log_z).to(logits.dtype)
+    out = _MemoryBoundTopKLogProbs.apply(flat_logits, flat_topk, chunk_size)
     return out.reshape(B, T, K)
 
 
@@ -103,11 +129,8 @@ def compute_forward_kl_topk(
     assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
 
     # 2. compute token-wise KL divergence across sp groups
-    # ``use_chunked_topk`` (opt-in, default off) trades latency for memory:
-    # the chunked path streams logsumexp + gather to avoid the [B, T, V]
-    # log_softmax buffer, enabling long-context (>=64K) where the default
-    # F.log_softmax path OOMs. See ``DistillationLossConfig.use_chunked_topk``
-    # for trade-offs and benchmark numbers.
+    # ``use_chunked_topk`` trades a small amount of recomputation for bounded
+    # normalized-vocabulary storage in both forward and backward.
     loss_config: DistillationLossConfig = config.distillation_loss
     use_chunked_topk = getattr(loss_config, "use_chunked_topk", False)
     if use_chunked_topk:
@@ -116,7 +139,7 @@ def compute_forward_kl_topk(
         student_topk_log_probs = _chunked_topk_log_probs(
             student_logits,
             teacher_topk_ids,
-            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+            chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 512),
         )
     else:
         student_log_probs = F.log_softmax(student_logits, dim=-1)

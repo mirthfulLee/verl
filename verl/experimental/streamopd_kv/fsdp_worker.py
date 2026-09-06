@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
+from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name, get_torch_device
@@ -32,6 +33,36 @@ def _reverse_backward_calls(lengths: list[int], chunk_size: int) -> int:
     if not lengths:
         return 0
     return max(math.ceil(length / chunk_size) for length in lengths)
+
+
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _unique_tensor_storage_bytes(tensors: Iterable[torch.Tensor | None]) -> int:
+    """Count local physical storage once, including views of FSDP flat buffers."""
+
+    seen: set[tuple[torch.device, int]] = set()
+    total = 0
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        tensor = _local_tensor(tensor)
+        if tensor.numel() == 0:
+            continue
+        storage = tensor.untyped_storage()
+        key = (tensor.device, storage._cdata)
+        if key not in seen:
+            seen.add(key)
+            total += storage.nbytes()
+    return total
+
+
+def _optimizer_state_tensors(optimizer: torch.optim.Optimizer) -> Iterable[torch.Tensor]:
+    for state in optimizer.state.values():
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                yield value
 
 
 def _reverse_memory_estimate(
@@ -83,7 +114,7 @@ def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.opti
             if not parameter.requires_grad or id(parameter) in seen:
                 continue
             seen.add(id(parameter))
-            parameter_bytes = parameter.numel() * parameter.element_size()
+            parameter_bytes = _local_tensor(parameter).numel() * parameter.element_size()
             if parameter.grad is None or parameter.grad.device.type != get_device_name():
                 reserve += parameter_bytes
 
@@ -105,10 +136,14 @@ def _unsharded_gradient_reserve_bytes(model: torch.nn.Module, data_parallel_size
 
     if data_parallel_size < 1:
         raise ValueError("data_parallel_size must be positive")
-    local_gradient_bytes = sum(
-        parameter.numel() * parameter.element_size() for parameter in model.parameters() if parameter.requires_grad
-    )
-    return local_gradient_bytes * (data_parallel_size - 1)
+    reserve = 0
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        local_numel = _local_tensor(parameter).numel()
+        full_numel = parameter.numel() if isinstance(parameter, DTensor) else local_numel * data_parallel_size
+        reserve += (full_numel - local_numel) * parameter.element_size()
+    return reserve
 
 
 @dataclass(frozen=True)
@@ -401,10 +436,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                     model,
                     self.engine.get_data_parallel_size(),
                 )
-            offloaded_parameter_bytes = sum(
-                parameter.numel() * parameter.element_size()
-                for parameter in model.parameters()
-                if parameter.device.type != get_device_name()
+            offloaded_parameter_bytes = _unique_tensor_storage_bytes(
+                parameter for parameter in model.parameters() if parameter.device.type != get_device_name()
             )
             metrics["deferred_training_state_gib"] = deferred_training_state_bytes / (1024**3)
             metrics["unsharded_gradient_reserve_gib"] = unsharded_gradient_reserve_bytes / (1024**3)
@@ -853,6 +886,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
 
             self._accum_global_valid_tokens += global_valid_tokens.item()
             self._accum_next_step = accumulation_step + 1
+            # Sample gradients before the final optimizer step and explicit
+            # cleanup; optimizer state may only materialize during that step.
+            parameter_storage_bytes = _unique_tensor_storage_bytes(model.parameters())
+            gradient_storage_bytes = _unique_tensor_storage_bytes(parameter.grad for parameter in model.parameters())
             if finalize:
                 scale = self.engine.get_data_parallel_size() / self._accum_global_valid_tokens
                 for parameter in model.parameters():
@@ -863,6 +900,13 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             else:
                 grad_norm = 0.0
                 lr = self.engine.optimizer.param_groups[0]["lr"]
+            optimizer_state_bytes = _unique_tensor_storage_bytes(_optimizer_state_tensors(self.engine.optimizer))
+            storage_bytes = torch.tensor(
+                [parameter_storage_bytes, gradient_storage_bytes, optimizer_state_bytes],
+                dtype=torch.int64,
+                device=self.device_name,
+            )
+            dist.all_reduce(storage_bytes, op=dist.ReduceOp.MAX, group=self.engine.get_data_parallel_group())
         except Exception:
             self._reverse_slot_pool.abort_groups()
             self._reset_accumulation(zero_grad=True)
@@ -963,6 +1007,9 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             # controller's training units.
             "streamopd/gradient_syncs_total": gradient_syncs,
             "streamopd/defer_gradient_sync": float(defer_gradient_sync),
+            "streamopd/rank_parameter_storage_gb_max": storage_bytes[0].item() / (1024**3),
+            "streamopd/rank_gradient_storage_gb_max": storage_bytes[1].item() / (1024**3),
+            "streamopd/rank_optimizer_state_gb_max": storage_bytes[2].item() / (1024**3),
             "perf/max_memory_allocated_gb": get_torch_device().max_memory_allocated() / (1024**3),
             "perf/max_memory_reserved_gb": get_torch_device().max_memory_reserved() / (1024**3),
         }

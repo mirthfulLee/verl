@@ -8,21 +8,27 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from tensordict import TensorDict
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from verl.experimental.streamopd_kv.fsdp_worker import (
     StreamOPDKVTrainingWorker,
     _deferred_training_state_bytes,
     _forward_kl_topk_sum,
     _has_valid_response,
+    _optimizer_state_tensors,
     _partition_reverse_microbatches,
     _reverse_backward_calls,
+    _unique_tensor_storage_bytes,
     _unsharded_gradient_reserve_bytes,
 )
 from verl.experimental.streamopd_kv.qwen3 import _build_reverse_wavefront, _wavefront_compute_end
@@ -99,6 +105,52 @@ def test_reverse_preflight_reserves_lazy_adam_state_and_gradients() -> None:
     model.weight.grad = torch.zeros_like(model.weight)
     optimizer.state[model.weight]["exp_avg"] = torch.zeros_like(model.weight)
     assert _deferred_training_state_bytes(model, optimizer) == 3 * parameter_bytes
+
+
+def test_storage_accounting_counts_flat_buffer_views_once() -> None:
+    storage = torch.zeros(16, dtype=torch.float32)
+    independent = torch.zeros(4, dtype=torch.float16)
+
+    assert _unique_tensor_storage_bytes([storage[:8], storage[8:], independent, None, storage[:0]]) == 72
+    assert _unique_tensor_storage_bytes([]) == 0
+
+
+def _check_distributed_storage(rank: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        mesh = init_device_mesh("cpu", (2,))
+        for placement in (Shard(0), Replicate()):
+            model = nn.Module()
+            model.weight = nn.Parameter(distribute_tensor(torch.ones(5, 4), mesh, [placement]))
+            local = model.weight.to_local()
+            local_bytes = local.numel() * local.element_size()
+            optimizer = torch.optim.AdamW(model.parameters())
+
+            # Uneven distributed shards may retain padding in their backing
+            # allocation even though the local tensor exposes fewer elements.
+            assert _unique_tensor_storage_bytes([model.weight, local]) == local.untyped_storage().nbytes()
+            assert _deferred_training_state_bytes(model, optimizer) == 3 * local_bytes
+            assert _unsharded_gradient_reserve_bytes(model, 2) == 80 - local_bytes
+            assert _unique_tensor_storage_bytes(_optimizer_state_tensors(optimizer)) == 0
+
+            model.weight.grad = torch.ones_like(model.weight)
+            optimizer.step()
+            assert _unique_tensor_storage_bytes(parameter.grad for parameter in model.parameters()) == local_bytes
+            state = optimizer.state[model.weight]
+            step_bytes = state["step"].numel() * state["step"].element_size()
+            assert _unique_tensor_storage_bytes(_optimizer_state_tensors(optimizer)) == 2 * local_bytes + step_bytes
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr("verl.experimental.streamopd_kv.fsdp_worker.get_device_name", lambda: "cpu")
+                assert _deferred_training_state_bytes(model, optimizer) == 0
+
+            optimizer.zero_grad(set_to_none=True)
+            assert _unique_tensor_storage_bytes(parameter.grad for parameter in model.parameters()) == 0
+    finally:
+        dist.destroy_process_group()
+
+
+def test_storage_accounting_and_preflight_use_dtensor_local_shards(tmp_path) -> None:
+    torch.multiprocessing.spawn(_check_distributed_storage, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2)
 
 
 def test_trainer_rejects_a_second_gpu_kv_lease() -> None:

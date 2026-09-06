@@ -217,6 +217,14 @@ The exposed transfer metrics separate pinned allocation, mmap-to-pinned staging,
 wait. In particular, `reverse_slot_next_wait_seconds` is the transfer time visible on the training critical path;
 aggregate staging and CUDA durations may overlap backward and must not be added to step time.
 
+Training-state metrics `rank_parameter_storage_gb_max`, `rank_gradient_storage_gb_max`, and
+`rank_optimizer_state_gb_max` under `streamopd/` report GiB of actual local backing storage, reduced by maximum across
+Trainer ranks and training units. Shared FSDP buffer views count once, and FSDP2 DTensors contribute only their local
+shard. Gradients are sampled before the final optimizer step and cleanup; optimizer state is sampled after the step
+so lazily created Adam buffers are included. These are storage snapshots, including any CPU-offloaded tensors, not
+CUDA allocator peaks or total process memory. Reverse preflight likewise uses local shard sizes for deferred
+training state and counts shared offloaded parameter storage once.
+
 Preflight enumerates power-of-two reverse widths and chunks up to the trajectory length under the fixed-slot,
 activation, LM-head, optimizer, and transfer reserve. It first maximizes the useful `batch * chunk` token tile. Equal
 tiles prefer at least two trajectories when feasible, then the longer chunk to reduce wavefront depth. The memory

@@ -62,7 +62,7 @@ class _CrossEntropy:
 @pytest.mark.skipif(
     bool(MODEL_PATH) and not os.path.isdir(MODEL_PATH), reason="requested local Qwen3 model is unavailable"
 )
-def test_qwen3_fixed_slot_wavefront_matches_full_sequence() -> None:
+def test_qwen3_fixed_slot_wavefront_matches_full_sequence(record_property) -> None:
     from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
     torch.manual_seed(23)
@@ -131,9 +131,35 @@ def test_qwen3_fixed_slot_wavefront_matches_full_sequence() -> None:
     assert result.lm_head_tokens < result.dense_lm_head_tokens
     assert result.dense_lm_head_tokens == 120
     assert result.padded_model_tokens == 128
+    expected_parameters = dict(baseline.named_parameters())
+    actual_parameters = dict(reverse.named_parameters())
+    assert expected_parameters.keys() == actual_parameters.keys()
+    dot = torch.zeros((), device="cuda", dtype=torch.float64)
+    expected_squared_norm = torch.zeros_like(dot)
+    actual_squared_norm = torch.zeros_like(dot)
+    error_squared_norm = torch.zeros_like(dot)
+    for name, parameter in expected_parameters.items():
+        assert parameter.grad is not None, name
+        assert actual_parameters[name].grad is not None, name
+        expected = parameter.grad.float()
+        actual = actual_parameters[name].grad.float()
+        dot += (actual * expected).sum(dtype=torch.float64)
+        expected_squared_norm += expected.square().sum(dtype=torch.float64)
+        actual_squared_norm += actual.square().sum(dtype=torch.float64)
+        error_squared_norm += (actual - expected).square().sum(dtype=torch.float64)
+
+    # Audit the full gradient vector without retaining a second model-sized
+    # concatenation. BF16 tolerances apply to the vector, not each small tensor.
+    cosine = dot / (expected_squared_norm.sqrt() * actual_squared_norm.sqrt()).clamp_min(1e-30)
+    relative_error = (error_squared_norm / expected_squared_norm.clamp_min(1e-30)).sqrt()
+    record_property("gradient_cosine", cosine.item())
+    record_property("gradient_relative_l2", relative_error.item())
+    assert cosine.item() > 0.995
+    assert relative_error.item() < 0.09
+
     parameter_name = "model.layers.0.self_attn.q_proj.weight"
-    expected = dict(baseline.named_parameters())[parameter_name].grad.float()
-    actual = dict(reverse.named_parameters())[parameter_name].grad.float()
+    expected = expected_parameters[parameter_name].grad.float()
+    actual = actual_parameters[parameter_name].grad.float()
     cosine = F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
     assert cosine.item() > 0.995
     relative_error = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected).clamp_min(1e-8)

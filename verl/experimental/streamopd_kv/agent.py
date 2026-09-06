@@ -27,8 +27,10 @@ logger = logging.getLogger(__name__)
 class StreamOPDAgentSession:
     """StreamOPD integration owned by one generic AgentLoop worker."""
 
-    def __init__(self, config, rollout_config, tokenizer, model_type, teacher_manager) -> None:
-        stream_config = config.distillation.streamopd_kv
+    def __init__(
+        self, config, rollout_config, tokenizer, model_type, teacher_manager, stream_config=None, export_kv=True
+    ) -> None:
+        stream_config = config.distillation.streamopd_kv if stream_config is None else stream_config
         if rollout_config.agent.default_agent_loop != "single_turn_agent":
             raise NotImplementedError("StreamOPD supports the single_turn_agent loop only")
         if model_type != "qwen3":
@@ -45,6 +47,8 @@ class StreamOPDAgentSession:
                 raise ValueError("StreamOPD requires identical student and Teacher token-id vocabularies")
 
         self.config = stream_config
+        training_stream_name = stream_config.get("training_stream_actor_name", "") if not export_kv else ""
+        self._training_stream = ray.get_actor(training_stream_name) if training_stream_name else None
         self.teacher_manager = teacher_manager
         teacher_key, teacher_config = get_streamopd_teacher(teacher_manager.distillation_config)
         client = teacher_manager.teacher_client[teacher_key]
@@ -62,9 +66,11 @@ class StreamOPDAgentSession:
             max_active_kv_tokens=int(stream_config.teacher_prefill_max_active_kv_tokens),
             kv_page_size=int(stream_config.teacher_prefill_kv_page_size),
             kv_reservation_tokens=int(rollout_config.prompt_length + rollout_config.response_length),
+            max_response_tokens=int(rollout_config.response_length) if not export_kv else None,
         )
         self.rollout_kwargs = {
             "streamopd_callback": ray.get_runtime_context().current_actor,
+            "streamopd_export_kv": export_kv,
             "streamopd_chunk_size": int(stream_config.token_chunk_size),
             "streamopd_page_size": int(stream_config.teacher_prefill_kv_page_size),
         }
@@ -79,9 +85,25 @@ class StreamOPDAgentSession:
         return torch.as_tensor(output["prompt_ids"], dtype=torch.int32), torch.as_tensor(output["prompt_logprobs"])
 
     async def submit(self, value: dict[str, Any]) -> None:
-        await self.coordinator.submit(CommittedTokenChunk.from_dict(value))
+        try:
+            if self._training_stream is not None:
+                await self._training_stream.submit.remote(value)
+            await self.coordinator.submit(CommittedTokenChunk.from_dict(value))
+        except Exception as exc:
+            if self._training_stream is not None:
+                await self._training_stream.abort.remote(value["policy_version"], str(exc))
+            raise
 
-    async def result(
+    async def result(self, output, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            return await self._result(output, **kwargs)
+        except Exception as exc:
+            if self._training_stream is not None:
+                version = output.extra_fields.get("streamopd_policy_version", -1)
+                await self._training_stream.abort.remote(version, str(exc))
+            raise
+
+    async def _result(
         self,
         output,
         *,
@@ -119,4 +141,14 @@ class StreamOPDAgentSession:
                     f"max_abs_error={error}, tolerance={self.config.validation_atol}"
                 )
             logger.info("StreamOPD Teacher validation max_abs_error=%g", error)
+        if self._training_stream is not None:
+            await self._training_stream.finish.remote(
+                int(policy_version),
+                str(trajectory_id),
+                prompt_ids,
+                response_ids,
+                output.response_mask,
+                teacher_ids,
+                teacher_logprobs,
+            )
         return teacher_ids, teacher_logprobs

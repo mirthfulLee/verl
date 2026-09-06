@@ -116,8 +116,9 @@ def plan_teacher_admission(
     teacher_replicas: int = 1,
     trajectory_cap: int = 0,
     token_cap: int = 0,
+    variable_reservations: bool = False,
 ) -> dict[str, int]:
-    """Choose one stable Teacher session cohort before policy version zero."""
+    """Plan Teacher session/token caps, optionally allowing per-prompt reservations."""
 
     values = (
         expected_trajectories,
@@ -144,12 +145,12 @@ def plan_teacher_admission(
     # vLLM already batches live requests according to max_batched_tokens.
     # Restricting live sessions to a small number of prefill waves creates
     # head-of-line blocking when the first admitted trajectories are long.
-    width = min(expected_trajectories, capacity_width)
+    width = expected_trajectories if variable_reservations else min(expected_trajectories, capacity_width)
     if trajectory_cap:
         width = min(width, trajectory_cap)
     return {
         "active_trajectories": width,
-        "active_kv_tokens": width * trajectory_tokens,
+        "active_kv_tokens": min(safe_capacity, width * trajectory_tokens),
         "vllm_capacity_tokens": vllm_capacity_tokens,
         "safe_capacity_tokens": safe_capacity,
         "trajectory_tokens": trajectory_tokens,

@@ -1,6 +1,12 @@
-# StreamOPD benchmark
+# StreamOPD-KV benchmark
 
-The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD supports four
+StreamOPD-KV names the rollout-KV reuse and reverse-training method; StreamOPD-CF
+names the ascending chunked-forward method. Use `MODE=streamopd-kv` or a
+placement-specific mode such as `streamopd-kv-dedicated`. The combined
+benchmark wrapper accepts `CASE=streamopd-kv` for the union-placement case;
+see [the comparison instructions](../streamopd_cf/README.md).
+
+The end-to-end comparison uses this repository's V1 Native OPD as the sync baseline. StreamOPD-KV supports four
 physical Trainer placements: phase-shared with Teacher GPUs, phase-shared with Rollout GPUs, spanning disjoint
 Teacher and Rollout subsets (`union`), or dedicated GPUs. A shared pool has one owner at a time: its vLLM process
 enters level-2 sleep before Trainer state is loaded, and Trainer FSDP state is offloaded before vLLM wakes again.
@@ -8,7 +14,7 @@ The reverse planner measures the pool after the first sleep and accounts for CUD
 other process allocations that vLLM sleep retains; sleep is not treated as an empty-GPU guarantee.
 The default is `union`: with a 2 + 2 Teacher/Rollout topology, Trainer uses all four GPUs during training.
 
-StreamOPD is under active development. Benchmark outputs under `benchmarks/streamopd_kv/results/` remain local
+StreamOPD-KV is under active development. Benchmark outputs under `benchmarks/streamopd_kv/results/` remain local
 because scheduler, memory-planning, and transport changes can quickly invalidate them. Once the method stabilizes,
 publication-quality comparisons and their complete experimental settings should be recorded in dedicated
 documentation.
@@ -24,18 +30,18 @@ source .venv/bin/activate
 
 The earlier development measurements used CUDA 12.8, vLLM 0.15.1, Transformers 4.57.6, FlashAttention 2, and A800-80GB
 GPUs. That optional legacy environment has a Transformers metadata conflict with this repository; it should not be
-used as evidence for the current dependency stack. Record package versions for every new comparison. StreamOPD's
+used as evidence for the current dependency stack. Record package versions for every new comparison. StreamOPD-KV's
 legacy Teacher patch is scoped to 0.15.1; vLLM 0.24.0 provides the required Teacher artifacts natively. The default
 `eos_host` Rollout uses the legacy model runner for its cross-layer KV layout, selected inside its own server process.
 
 The benchmark and production example default to `distillation.streamopd_kv.runtime_profile=auto` and reuse verl's
-existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD adds no separate GPU-count configuration;
+existing Student/Trainer, Teacher, and Rollout resource options. StreamOPD-KV adds no separate GPU-count configuration;
 its topology setting is `trainer_placement`. Baseline modes ignore `MICRO_BATCH_SIZE`.
 
 The auto profile gives each Rollout and Teacher vLLM instance exclusive ownership of its assigned pool during its
 active phase. Each vLLM worker sizes its byte budget from the free memory measured after CUDA and NCCL initialization,
 reserves one measured activation peak for runtime and each configured CUDA graph mode plus deterministic sampler and
-StreamOPD workspaces, and preserves vLLM's native 150 MiB profiling-error allowance before reporting the KV blocks it
+StreamOPD-KV workspaces, and preserves vLLM's native 150 MiB profiling-error allowance before reporting the KV blocks it
 actually allocated. Allocation never exceeds the worst-case KV footprint of the entire global batch on each
 replica. No model-size heuristic or
 `gpu_memory_utilization` tier is used. A shared Rollout uses a durable two-phase Host checkpoint so Trainer state is
@@ -67,7 +73,7 @@ running their full Cartesian product. Set `FULL_MATRIX=1` for the exhaustive mat
 with space-separated `student:teacher:teacher_tp:tokens:batch:topology` records.
 
 Both implementations use FlashAttention 2, Liger, vLLM CUDA graphs, and FSDP `no_sync` gradient accumulation by
-default. These are common execution settings, not StreamOPD optimizations. StreamOPD reverse attention uses
+default. These are common execution settings, not StreamOPD-KV optimizations. StreamOPD-KV reverse attention uses
 FlashAttention's native GQA path. Auto preflight considers reverse chunks up to the trajectory length and maximizes
 the total token tile; for equal tiles it avoids a singleton batch before preferring a longer chunk. A one-chunk plan
 has no page-reuse window, so preflight also reserves an inactive K/V buffer and enables whole-group prefetch only when
@@ -77,29 +83,29 @@ baseline is not measured with artificially lower inference concurrency.
 
 Every matrix case enables memory-bounded top-k normalization. The sync baseline's small custom autograd function
 recomputes each 512-token FP32 chunk during backward, so vocabulary intermediates do not accumulate across the token
-dimension. StreamOPD instead bounds the same normalization to the valid rows of its active reverse tile. Neither path
-selects behavior from a StreamOPD topology or model name; set `TOPK_CHUNK_SIZE` to change the baseline workspace cap.
+dimension. StreamOPD-KV instead bounds the same normalization to the valid rows of its active reverse tile. Neither path
+selects behavior from a StreamOPD-KV topology or model name; set `TOPK_CHUNK_SIZE` to change the baseline workspace cap.
 
 Gradient checkpointing is likewise applied uniformly to every matrix case and both implementations. Set
 `ENABLE_GRADIENT_CHECKPOINTING=False` for a matrix-wide ablation; the runner never selects it from a model name.
 Teacher `max_num_seqs` is also matched at 32 by default and can be changed for both sides with
 `MATCHED_TEACHER_MAX_NUM_SEQS`. Rollout and Teacher model-length, batch-token, and sequence limits are passed through
-one common override list, so StreamOPD auto planning cannot silently drift from the baseline controls. Record any changes to these controls with the result; old development measurements are not a
+one common override list, so StreamOPD-KV auto planning cannot silently drift from the baseline controls. Record any changes to these controls with the result; old development measurements are not a
 performance guarantee for the current code or dependency versions.
 
 ### Attribution boundary
 
-StreamOPD performance work is limited to its KV export and handoff, streaming Teacher scheduling, reverse Trainer,
+StreamOPD-KV performance work is limited to its KV export and handoff, streaming Teacher scheduling, reverse Trainer,
 and the phase transitions required by shared pools. Changes to kernels, losses, batching, data loading, or other
 paths also used by `verl-sync-opd` are environment controls: the matrix must apply them identically to both methods,
-and their effect must be reported separately rather than counted as StreamOPD speedup. A common-path optimization is
+and their effect must be reported separately rather than counted as StreamOPD-KV speedup. A common-path optimization is
 included in this harness only when it is required to make a covered workload feasible or to keep the comparison
 symmetric; it is not used to tune one side of an ablation.
 
 | Category | Matched or intentionally different settings |
 | --- | --- |
 | Matched execution controls | Dataset and seed, greedy sampling, batch and token limits, FlashAttention 2, Liger, gradient checkpointing, FSDP `no_sync`, forward-KL top-k objective and `topk=32`, CUDA graphs, worker count, and Teacher `max_num_seqs` |
-| StreamOPD method | Stateful streaming Teacher requests and scheduling; EOS KV export followed by chunked reverse backward over the Rollout KV cache |
+| StreamOPD-KV method | Stateful streaming Teacher requests and scheduling; EOS KV export followed by chunked reverse backward over the Rollout KV cache |
 | Required pool mechanics | Exclusive-phase vLLM sizing, level-2 sleep/wake, Trainer state offload for shared placements, and the Host weight checkpoint |
 | Resource-allocation difference | Only the GPU split implied by `union` or `dedicated`; comparisons keep the total physical GPU count equal |
 
@@ -111,9 +117,9 @@ Within the vLLM 0.15.1 streaming-Teacher compatibility patch, prompt-logprob LM-
 tile. This matches the auto profile's maximum fragment size and has a runtime free-memory fallback for larger manual
 fragments; it does not select a tile from a model name, GPU type, batch size, or token limit. The legacy compatibility patch does not add another cross-request batching layer on top of vLLM's scheduler.
 
-The sync baseline retains its native bounded Rollout allocation. Giving that Rollout the StreamOPD
+The sync baseline retains its native bounded Rollout allocation. Giving that Rollout the StreamOPD-KV
 `exclusive_free` policy is not valid: the decode phase can consume the measured free memory, but native weight sync
-tries to restore the KV allocation while actor/training state is still resident. This can fail at wake with a CUDA OOM. StreamOPD can use `exclusive_free` because its phase-exclusive Host checkpoint
+tries to restore the KV allocation while actor/training state is still resident. This can fail at wake with a CUDA OOM. StreamOPD-KV can use `exclusive_free` because its phase-exclusive Host checkpoint
 releases Trainer state before waking Rollout. This lifecycle difference is reported as pool
 mechanics, not attributed to streaming Teacher scoring or reverse backward.
 
@@ -126,7 +132,7 @@ Every run records the three stages separately. `Rollout EOS` and `Teacher done` 
 from policy dispatch, while `rollout_span` and `teacher_span` cover the first start through the last completion of
 each overlapping stage. `teacher_tail` is the interval from the final Rollout EOS to the final Teacher score. The
 training value is the actor update duration for the sync baseline and scheduler-accounted Trainer busy time for
-StreamOPD. Per-trajectory Rollout and Teacher request mean/max values are retained in `summary.json`; overlapping
+StreamOPD-KV. Per-trajectory Rollout and Teacher request mean/max values are retained in `summary.json`; overlapping
 stage times must not be added to estimate total step time.
 
 The auto scheduler counts Teacher prefill capacity across all inference replicas. Shared Trainer placements submit

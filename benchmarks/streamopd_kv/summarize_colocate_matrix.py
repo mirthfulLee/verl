@@ -208,7 +208,7 @@ def _stage_value(stable: dict[str, float], baseline_name: str, streamopd_name: s
 
 def write_markdown(path: Path, runs: dict[str, dict]) -> None:
     rows = [
-        "# StreamOPD benchmark",
+        "# StreamOPD-KV benchmark",
         "",
         "| Total tokens | Batch | Mode | Status | Microbatch | Step (s) | Gen (s) | "
         "Rollout EOS (s) | Teacher done (s) | Train busy (s) | Tokens/s | "
@@ -270,14 +270,14 @@ def write_markdown(path: Path, runs: dict[str, dict]) -> None:
     path.write_text("\n".join(rows) + "\n")
 
 
-def parse_steps(path: Path) -> list[dict[str, float]]:
+def parse_steps(path: Path, metric_names=None) -> list[dict[str, float]]:
     steps: list[dict[str, float]] = []
     for line in path.read_text(errors="replace").splitlines():
         match = re.search(r"\bstep:(\d+)\s+-", line)
         if match is None:
             continue
         values: dict[str, float] = {"step": float(match.group(1))}
-        for name in METRICS:
+        for name in METRICS if metric_names is None else metric_names:
             metric = re.search(rf"(?:^|\s)-\s+{re.escape(name)}:([^\s]+)", line)
             if metric is None:
                 continue

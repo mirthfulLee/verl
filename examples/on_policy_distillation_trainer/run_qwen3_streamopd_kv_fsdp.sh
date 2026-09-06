@@ -73,7 +73,7 @@ fi
   actor_rollout_ref.rollout.n_gpus_per_node="$ROLLOUT_GPUS" \
   actor_rollout_ref.rollout.nnodes=1 \
   trainer.use_v1=True \
-  trainer.v1.trainer_mode=streamopd \
+  trainer.v1.trainer_mode="${TRAINER_MODE:-streamopd_kv}" \
   trainer.n_gpus_per_node="$STUDENT_GPUS" \
   trainer.nnodes=1 \
   trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
@@ -92,7 +92,7 @@ fi
   distillation.distillation_loss.topk=32 \
   distillation.distillation_loss.use_task_rewards=False \
   distillation.distillation_loss.use_policy_gradient=False \
-  distillation.streamopd_kv.enabled=True \
+  distillation.streamopd_kv.enabled="${STREAMOPD_KV_ENABLED:-True}" \
   distillation.streamopd_kv.trainer_placement="$TRAINER_PLACEMENT" \
   "${RAY[@]}" \
   "$@"

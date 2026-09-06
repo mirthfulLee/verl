@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-@register_trainer("streamopd")
-class PPOTrainerStreamOPD(PPOTrainer):
+@register_trainer("streamopd_kv")
+class PPOTrainerStreamOPDKV(PPOTrainer):
     """Strict placement-aware StreamOPD trainer.
 
     The actor worker is trainer-only. Teacher and Rollout remain independent

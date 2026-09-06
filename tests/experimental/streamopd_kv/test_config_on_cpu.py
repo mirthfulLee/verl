@@ -28,8 +28,8 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd",
-                    "streamopd": {},
+                    "trainer_mode": "streamopd_kv",
+                    "streamopd_kv": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -78,7 +78,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
     assert connector.kv_connector_extra_config.streamopd_host_slot_count == 128
     assert connector.kv_connector_extra_config.streamopd_host_slot_tokens == 4096
-    assert OmegaConf.to_container(config.trainer.v1.streamopd) == {}
+    assert OmegaConf.to_container(config.trainer.v1.streamopd_kv) == {}
     assert config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
     assert config.algorithm.filter_groups.enable is False
@@ -91,7 +91,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
 
     stale_config = copy.deepcopy(config)
     stale_config.trainer.v1.trainer_mode = "sync"
-    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd"):
+    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd_kv"):
         prepare_streamopd_kv_config(stale_config)
 
     multi_sample_config = copy.deepcopy(config)
@@ -334,8 +334,8 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd",
-                    "streamopd": {},
+                    "trainer_mode": "streamopd_kv",
+                    "streamopd_kv": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -478,7 +478,7 @@ def streamopd_job(monkeypatch):
 
     overrides = [
         "trainer.use_v1=true",
-        "trainer.v1.trainer_mode=streamopd",
+        "trainer.v1.trainer_mode=streamopd_kv",
         "trainer.n_gpus_per_node=2",
         "trainer.nnodes=1",
         "data.train_batch_size=4",

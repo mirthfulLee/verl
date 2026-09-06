@@ -59,9 +59,9 @@ def test_sync_stage_timing_aggregates_rollout_teacher_and_training() -> None:
 
 
 def test_streamopd_trainer_does_not_expose_unused_reward_handles() -> None:
-    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
-    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     assert trainer.get_reward_handles() is None
     assert trainer._get_required_batch_multiple(dp_size=3) == 3
     assert trainer._optimizer_updates_per_global_step() == 1
@@ -91,7 +91,7 @@ def test_streamopd_resource_pools_follow_trainer_placement(
 ) -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
     from verl.trainer.ppo.utils import Role
-    from verl.trainer.ppo.v1 import trainer_streamopd
+    from verl.trainer.ppo.v1 import trainer_streamopd_kv
     from verl.trainer.ppo.v1.trainer_base import PPOTrainer
 
     def fake_base_init(self) -> None:
@@ -100,9 +100,9 @@ def test_streamopd_resource_pools_follow_trainer_placement(
         self.resource_pool_manager = SimpleNamespace(resource_pool_spec={"global_pool": [2], "teacher_pool": [1]})
 
     monkeypatch.setattr(PPOTrainer, "_init_resource_pool_mgr", fake_base_init)
-    monkeypatch.setattr(trainer_streamopd.ray, "remote", lambda cls: cls)
-    monkeypatch.setattr(trainer_streamopd, "need_reference_policy", lambda _config: False)
-    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
+    monkeypatch.setattr(trainer_streamopd_kv.ray, "remote", lambda cls: cls)
+    monkeypatch.setattr(trainer_streamopd_kv, "need_reference_policy", lambda _config: False)
+    trainer = trainer_streamopd_kv.PPOTrainerStreamOPDKV.__new__(trainer_streamopd_kv.PPOTrainerStreamOPDKV)
     trainer.config = OmegaConf.create(
         {
             "actor_rollout_ref": {"rollout": {"n_gpus_per_node": 3, "nnodes": 1}},
@@ -120,10 +120,10 @@ def test_streamopd_resource_pools_follow_trainer_placement(
 @pytest.mark.parametrize("placement", ["teacher", "rollout", "union"])
 def test_shared_trainer_state_has_one_load_offload_pair(placement: str) -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
     transitions = []
-    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement(placement)
     trainer._trainer_state_offloaded = True
     trainer._reverse_plan_result = [{"slot_batch_size": 8.0}]
@@ -143,11 +143,11 @@ def test_shared_trainer_state_has_one_load_offload_pair(placement: str) -> None:
 
 def test_shared_trainer_plans_against_sleeping_pool_before_loading() -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
     transitions = []
     plan_result = [{"slot_batch_size": 2.0}]
-    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement.UNION
     trainer._trainer_state_offloaded = True
     trainer._teacher_sleeping = True
@@ -171,9 +171,9 @@ def test_shared_trainer_plans_against_sleeping_pool_before_loading() -> None:
 
 def test_shared_trainer_cannot_load_before_inference_pool_sleeps() -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
-    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement.UNION
     trainer._trainer_state_offloaded = True
     trainer._teacher_sleeping = True
@@ -190,14 +190,14 @@ def test_shared_trainer_cannot_load_before_inference_pool_sleeps() -> None:
 )
 def test_initial_weight_sync_releases_shared_teacher_first(placement: str, expected: list[str], monkeypatch) -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1.trainer_streamopd import PPOTrainerStreamOPD
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
     monkeypatch.setattr(
-        "verl.trainer.ppo.v1.trainer_streamopd.update_streamopd_weights",
+        "verl.trainer.ppo.v1.trainer_streamopd_kv.update_streamopd_weights",
         lambda manager, step, **kwargs: manager.update_weights(step),
     )
     transitions = []
-    trainer = PPOTrainerStreamOPD.__new__(PPOTrainerStreamOPD)
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement(placement)
     trainer.global_steps = 0
     trainer._maybe_sleep_teacher = lambda _state: transitions.append("sleep")
@@ -318,7 +318,7 @@ def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeyp
 
 def test_shared_rollout_sleeps_once_after_all_trajectories_finish(monkeypatch: pytest.MonkeyPatch) -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1 import trainer_streamopd
+    from verl.trainer.ppo.v1 import trainer_streamopd_kv
 
     class Snapshot:
         @staticmethod
@@ -326,7 +326,7 @@ def test_shared_rollout_sleeps_once_after_all_trajectories_finish(monkeypatch: p
             return object()
 
     sleep_levels = []
-    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
+    trainer = trainer_streamopd_kv.PPOTrainerStreamOPDKV.__new__(trainer_streamopd_kv.PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement.ROLLOUT
     trainer._shared_rollout_sleeping = False
     trainer.config = OmegaConf.create(
@@ -337,7 +337,7 @@ def test_shared_rollout_sleeps_once_after_all_trajectories_finish(monkeypatch: p
     trainer._rollout_runtime = SimpleNamespace(wait_for_streamopd_kv_transfers=lambda: transfer_drains.append(True))
     trainer.checkpoint_manager = SimpleNamespace(sleep_replicas=lambda *, level: sleep_levels.append(level))
     monkeypatch.setattr(
-        trainer_streamopd.ray,
+        trainer_streamopd_kv.ray,
         "get",
         lambda _value: {"terminal_trajectories": 128, "expected_trajectories": 128},
     )
@@ -352,9 +352,9 @@ def test_shared_rollout_sleeps_once_after_all_trajectories_finish(monkeypatch: p
 
 def test_auto_shared_teacher_runtime_defers_reverse_plan_until_pool_sleep() -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
-    from verl.trainer.ppo.v1 import trainer_streamopd
+    from verl.trainer.ppo.v1 import trainer_streamopd_kv
 
-    trainer = trainer_streamopd.PPOTrainerStreamOPD.__new__(trainer_streamopd.PPOTrainerStreamOPD)
+    trainer = trainer_streamopd_kv.PPOTrainerStreamOPDKV.__new__(trainer_streamopd_kv.PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement.TEACHER
     trainer._reverse_plan_result = None
     reverse_plans = []

@@ -1,6 +1,11 @@
-# StreamOPD
+# StreamOPD-KV
 
-StreamOPD is an experimental strict on-policy distillation path for verl V1. Teacher and Rollout remain separate
+StreamOPD-KV is the rollout-KV reuse and reverse-training variant.
+StreamOPD-CF is the ascending chunked-forward variant; see its
+[implementation guide](../streamopd_cf/README.md). GPU placement is a separate
+choice, not part of the method name. Use `trainer_mode=streamopd_kv`.
+
+StreamOPD-KV is an experimental strict on-policy distillation path for verl V1. Teacher and Rollout remain separate
 model processes; their physical GPU placement relative to Trainer is user-selected:
 
 ```text
@@ -19,7 +24,7 @@ work on disjoint sets to overlap. The trainer is registered as `streamopd`.
 
 The default `runtime_profile=auto` treats scheduling and memory layout as
 implementation details. GPU pools remain entirely user-controlled through the
-existing verl resource options; StreamOPD does not introduce parallel GPU-count
+existing verl resource options; StreamOPD-KV does not introduce parallel GPU-count
 settings:
 
 ```bash
@@ -30,11 +35,11 @@ TRAINER_PLACEMENT=union TEACHER_GPUS=2 ROLLOUT_GPUS=2 \
 
 The aliases above map to `trainer.n_gpus_per_node`,
 `distillation.n_gpus_per_node`, and
-`actor_rollout_ref.rollout.n_gpus_per_node`; they do not count as StreamOPD
+`actor_rollout_ref.rollout.n_gpus_per_node`; they do not count as StreamOPD-KV
 options. Node counts and model parallelism likewise retain their existing verl
 configuration. In the command above, the example derives `STUDENT_GPUS=4` for the default `union` placement, letting
 Trainer use the combined Teacher and Rollout pools after inference;
-`trainer_placement` is the only optional StreamOPD topology choice. Before any model server starts, the auto profile
+`trainer_placement` is the only optional StreamOPD-KV topology choice. Before any model server starts, the auto profile
 derives context limits, Rollout and Teacher concurrency, Teacher fragment size, Teacher batched-token capacity,
 checkpoint transport, and zero-valued reverse-plan sentinels from the global batch, maximum trajectory length, GPU
 allocation, and placement. Existing verl options explicitly supplied as Hydra overrides are hard constraints rather
@@ -48,7 +53,7 @@ Rollout starts; auto mode uses
 `/dev/shm`, while an explicitly selected path fails closed if it lacks capacity. Teacher session admission is refined
 after vLLM reports its actual paged-KV capacity, so group/session widths are not fixed to the reference hardware.
 Common Trainer execution choices such as gradient checkpointing, Liger, and FSDP `no_sync` remain ordinary verl
-options and are never changed by the StreamOPD auto planner.
+options and are never changed by the StreamOPD-KV auto planner.
 
 Auto deliberately does not select Teacher TP or replica count. Model parallelism remains a normal user resource
 choice: more replicas can improve Teacher prefill throughput, while a shared Trainer may receive less reverse
@@ -66,7 +71,7 @@ values are logged under `streamopd/runtime_profile_*`.
 
 The implementation fails closed outside the following configuration:
 
-- `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd`;
+- `trainer.use_v1=true` and `trainer.v1.trainer_mode=streamopd_kv`;
 - `trainer_placement=teacher`, `rollout`, `union`, or `dedicated` on one node;
 - text-only, single-turn Qwen3 with one frozen teacher;
 - vLLM rollout with TP=1, PP=1, `n=1`, and a non-quantized KV cache;
@@ -75,7 +80,7 @@ The implementation fails closed outside the following configuration:
 - exact dense attention using native-GQA CUDA FlashAttention for batched wavefront reverse, with no SDPA fallback;
 - BF16 CUDA KV/query tensors, `head_dim <= 256`, right-padded batches, and page-aligned reverse chunks.
 
-`distillation.streamopd_kv.enabled=true` is rejected unless `trainer.v1.trainer_mode=streamopd` is selected.
+`distillation.streamopd_kv.enabled=true` is rejected unless `trainer.v1.trainer_mode=streamopd_kv` is selected.
 The default `union` placement runs Teacher and Rollout on disjoint pools, then lends both pools to Trainer after
 their inference phases finish. `dedicated` keeps a separate Trainer pool for overlap experiments.
 
@@ -83,7 +88,7 @@ their inference phases finish. `dedicated` keeps a separate Trainer pool for ove
 
 Use the repository's Python 3.12 / vLLM / FSDP environment (`uv sync --extra vllm --extra fsdp`).
 vLLM 0.24.0 supports the Teacher StreamingInput artifacts natively. The experimental `vllm_patch.py` also retains
-a narrowly scoped compatibility patch for vLLM 0.15.1; it is installed only on StreamOPD Teacher workers.
+a narrowly scoped compatibility patch for vLLM 0.15.1; it is installed only on StreamOPD-KV Teacher workers.
 The older CUDA 12.8 development environment is optional and is not the repository's default dependency stack.
 
 The default `eos_host` exporter requires vLLM's uniform cross-layer cache. Its Rollout server selects
@@ -112,7 +117,7 @@ entry replaces the `teacher_model` template, and auto mode preserves overrides u
 | `replica_group.py` | Shared Teacher/Rollout telemetry, capacity accounting, and KV export barriers |
 | `checkpoint.py` | Serialized weight handoff for shared Trainer/Rollout pools |
 | `vllm_patch.py` | Opt-in, version-specific vLLM integration |
-| `verl/trainer/ppo/v1/trainer_streamopd.py` | V1 trainer registration and orchestration through base trainer hooks |
+| `verl/trainer/ppo/v1/trainer_streamopd_kv.py` | V1 trainer registration and orchestration through base trainer hooks |
 
 The public `verl.workers.config.StreamOPDKVConfig` import remains an alias for the experimental schema. General V1
 trainer hooks retain their baseline defaults. The ordinary LLM client has no streaming-session state; the Teacher
@@ -165,7 +170,7 @@ ragged response controls extend that adapter in `benchmarks/streamopd_kv`.
    chunks leave the wavefront, and dK/dV continues into earlier chunks.
 7. Before policy version zero, each phase-exclusive vLLM worker uses the free memory measured after CUDA/NCCL setup
    and reserves one measured activation peak for runtime and each configured CUDA graph mode plus deterministic sampler
-   and StreamOPD connector/logit workspaces, then reports its profiled KV block capacity. Teacher admission and a
+   and StreamOPD-KV connector/logit workspaces, then reports its profiled KV block capacity. Teacher admission and a
    dedicated Trainer's reverse plan are derived at startup. A shared Trainer freezes its reverse plan after the first
    inference sleep and before its first training phase, using the retained process footprint measured on every rank.
    These plans select a stable session budget, fixed `B_slot`, page-aligned `T_slot`, chunk size, and accumulation count
@@ -225,10 +230,10 @@ caps remain available for controlled ablations.
 
 ## Baseline isolation
 
-When `distillation.streamopd_kv.enabled=false`, StreamOPD config preparation returns without modifying the rollout
+When `distillation.streamopd_kv.enabled=false`, StreamOPD-KV config preparation returns without modifying the rollout
 engine, KV connector, checkpoint backend, replay settings, or optimizer synchronization. The V1 `sync` baseline uses
 its native rollout/trainer path. Its optional teacher placement is configured separately with
-`distillation.colocate_teacher_with_student`; StreamOPD does not read that option.
+`distillation.colocate_teacher_with_student`; StreamOPD-KV does not read that option.
 
 ## Transport and numerical behavior
 

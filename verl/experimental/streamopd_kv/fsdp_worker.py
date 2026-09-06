@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
+from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name, get_torch_device
@@ -70,6 +71,12 @@ def _reverse_memory_estimate(
     return kv_bytes, activation_bytes_per_token + lm_head_bytes_per_token
 
 
+def _local_parameter_bytes(parameter: torch.Tensor) -> int:
+    """DTensor's logical numel is global; optimizer storage follows the local shard."""
+    local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+    return local.numel() * local.element_size()
+
+
 def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> int:
     """Estimate gradient and optimizer tensors that must be loaded onto the GPU."""
 
@@ -83,7 +90,7 @@ def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.opti
             if not parameter.requires_grad or id(parameter) in seen:
                 continue
             seen.add(id(parameter))
-            parameter_bytes = parameter.numel() * parameter.element_size()
+            parameter_bytes = _local_parameter_bytes(parameter)
             if parameter.grad is None or parameter.grad.device.type != get_device_name():
                 reserve += parameter_bytes
 
@@ -106,7 +113,7 @@ def _unsharded_gradient_reserve_bytes(model: torch.nn.Module, data_parallel_size
     if data_parallel_size < 1:
         raise ValueError("data_parallel_size must be positive")
     local_gradient_bytes = sum(
-        parameter.numel() * parameter.element_size() for parameter in model.parameters() if parameter.requires_grad
+        _local_parameter_bytes(parameter) for parameter in model.parameters() if parameter.requires_grad
     )
     return local_gradient_bytes * (data_parallel_size - 1)
 

@@ -386,11 +386,11 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     stream_config = config.distillation.get("streamopd_kv", {})
     trainer_mode = config.trainer.v1.trainer_mode if config.trainer.use_v1 else None
     if not stream_config.get("enabled", False):
-        if trainer_mode == "streamopd":
-            raise ValueError("trainer_mode=streamopd requires distillation.streamopd_kv.enabled=true")
+        if trainer_mode == "streamopd_kv":
+            raise ValueError("StreamOPD-KV requires distillation.streamopd_kv.enabled=true")
         return
-    if not config.trainer.use_v1 or trainer_mode != "streamopd":
-        raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd")
+    if not config.trainer.use_v1 or trainer_mode != "streamopd_kv":
+        raise ValueError("StreamOPD-KV requires trainer.v1.trainer_mode=streamopd_kv")
     if not config.distillation.get("enabled", False):
         raise ValueError("streamopd_kv.enabled requires distillation.enabled=true")
     # Check raw settings before auto planning can mask invalid values or divide

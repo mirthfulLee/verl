@@ -16,7 +16,9 @@ from .agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQ
 from .trainer_base import PPOTrainer, get_trainer_cls, register_trainer
 from .trainer_colocate_async import PPOTrainerColocateAsync
 from .trainer_separate_async import PPOTrainerSeparateAsync
-from .trainer_streamopd import PPOTrainerStreamOPD
+from .trainer_separate_sync import PPOTrainerSeparateSync
+from .trainer_streamopd_cf import PPOTrainerStreamOPDCF
+from .trainer_streamopd_kv import PPOTrainerStreamOPDKV
 from .trainer_sync import PPOTrainerSync
 
 __all__ = [
@@ -24,9 +26,11 @@ __all__ = [
     "register_trainer",
     "get_trainer_cls",
     "PPOTrainerSync",
+    "PPOTrainerStreamOPDCF",
     "PPOTrainerColocateAsync",
     "PPOTrainerSeparateAsync",
-    "PPOTrainerStreamOPD",
+    "PPOTrainerSeparateSync",
+    "PPOTrainerStreamOPDKV",
     "AgentLoopWorkerTQ",
     "AgentLoopManagerTQ",
 ]

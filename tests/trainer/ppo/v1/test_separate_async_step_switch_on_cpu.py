@@ -206,6 +206,42 @@ def test_hybrid_rollout_switch_config_target_instantiates_dataclass():
     assert switch_config.switch_threshold_ratio == 0.25
 
 
+@pytest.mark.parametrize("standalone_memory", [None, 0.85])
+def test_standalone_memory_override_does_not_change_hybrid_config(monkeypatch, standalone_memory):
+    from types import SimpleNamespace
+
+    trainer = PPOTrainerSeparateAsync.__new__(PPOTrainerSeparateAsync)
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "gpu_memory_utilization": 0.35,
+                    "standalone_gpu_memory_utilization": standalone_memory,
+                    "prometheus": {"enable": False},
+                    "checkpoint_engine": {},
+                }
+            }
+        }
+    )
+    trainer.llm_server_manager = SimpleNamespace(rollout_replicas=[None, None])
+    trainer.actor_rollout_wg = object()
+    trainer.add_replicas_to_balancer = lambda: None
+    configs = []
+
+    def create(config, start_rank):
+        configs.append(config)
+        assert start_rank == 2
+        return SimpleNamespace(get_replicas=lambda: [])
+
+    monkeypatch.setattr(trainer_module.PPOTrainer, "_setup", lambda self: None)
+    monkeypatch.setattr(trainer_module.LLMServerManager, "create", create)
+    monkeypatch.setattr(trainer_module, "omega_conf_to_dataclass", lambda value: value)
+    monkeypatch.setattr(trainer_module, "CheckpointEngineManager", lambda **kwargs: None)
+    trainer._setup()
+    assert trainer.config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.35
+    assert configs[0].actor_rollout_ref.rollout.gpu_memory_utilization == (standalone_memory or 0.35)
+
+
 @pytest.mark.parametrize("window_size", [0, -1])
 def test_hybrid_rollout_switch_config_rejects_nonpositive_cost_window(window_size):
     with pytest.raises(ValueError, match="switch_cost_window_size must be positive"):

@@ -230,7 +230,7 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async", "streamopd"
+    # Trainer mode: sync, colocate_async, separate_async, streamopd_kv, streamopd_cf, separate_sync
     trainer_mode: sync
 
     # Synchronous PPO trainer
@@ -278,9 +278,9 @@ trainer:
         # Window size for calculating average switch cost.
         switch_cost_window_size: 3
 
-    # Strict StreamOPD. Runtime preflight derives reverse-unit width and the
+    # Strict StreamOPD-KV. Runtime preflight derives reverse-unit width and the
     # number of accumulation units before policy version zero.
-    streamopd: {}
+    streamopd_kv: {}
 
     # Replay buffer sampling strategy
     sampler:

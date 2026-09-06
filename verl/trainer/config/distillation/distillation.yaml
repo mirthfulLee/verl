@@ -158,3 +158,28 @@ teacher_models:
 
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
+
+# Dedicated Trainer/Rollout/Teacher with differentiable chunked forward.
+batching:
+  _target_: verl.experimental.streamopd_cf.config.OPDBatchingConfig
+  memory_fraction: 0.8
+  reserve_gib: 4.0
+
+streamopd_cf:
+  _target_: verl.experimental.streamopd_cf.config.StreamOPDCFConfig
+  enabled: false
+  forward_chunk_size: 1024
+  loss_chunk_size: 2048
+  attention_backend: flash_attention_2
+  token_chunk_size: 1024
+  teacher_prefill_max_active_trajectories: 0
+  teacher_prefill_max_active_kv_tokens: 0
+  teacher_prefill_kv_page_size: 64
+  max_pending_teacher_chunks: 128
+  scheduler_actor_name: ""
+  training_stream_actor_name: ""
+  timeline_dir: ""
+  scheduler_timeout_seconds: 600.0
+  require_same_tokenizer: true
+  validate_teacher_artifacts: false
+  validation_atol: 1.0e-4

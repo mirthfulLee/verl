@@ -4,10 +4,18 @@
 
 Last updated: 09/05/2026.
 
-StreamOPD is an experimental V1 execution mode for strict direct on-policy distillation. It streams committed
+StreamOPD-KV is an experimental V1 execution mode for strict direct on-policy distillation. It streams committed
 student tokens to a frozen Teacher and reuses Rollout KV during reverse training, with one optimizer update per
 policy batch. It is opt-in and currently supports text-only Qwen3 students with vLLM and FSDP/FSDP2. See the
-[StreamOPD guide](../../verl/experimental/streamopd_kv/README.md) for its supported envelope and example.
+[StreamOPD-KV guide](../../verl/experimental/streamopd_kv/README.md) for its supported envelope and example.
+
+StreamOPD-CF (chunked forward) uses independent Trainer,
+Rollout and Teacher GPUs. Committed rollout tokens drive concurrent Teacher
+prefill and ascending Trainer forwards with differentiable KV. Each bounded
+microbatch waits for complete trajectories and Teacher targets before its final
+input chunk, loss and single backward. Gradients accumulate into one optimizer
+update per policy batch with global valid-token normalization.
+See the [StreamOPD-CF guide](../../verl/experimental/streamopd_cf/README.md).
 
 ## Background
 

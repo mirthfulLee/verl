@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
@@ -26,7 +27,7 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 
 
-def _check_policy_update(rank, rendezvous, strategy):
+def _check_policy_update(rank, rendezvous, strategy, use_orig_params):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
     try:
@@ -44,11 +45,14 @@ def _check_policy_update(rank, rendezvous, strategy):
         reference = Qwen3ForCausalLM(config).cuda().train()
         model = copy.deepcopy(reference)
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        if strategy == "fsdp":
+        if strategy in ("fsdp", "fsdp_shard_grad_op"):
             model = FSDP(
                 model,
                 device_id=rank,
-                use_orig_params=True,
+                use_orig_params=use_orig_params,
+                sharding_strategy=(
+                    ShardingStrategy.SHARD_GRAD_OP if strategy == "fsdp_shard_grad_op" else ShardingStrategy.FULL_SHARD
+                ),
                 auto_wrap_policy=partial(transformer_auto_wrap_policy, transformer_layer_cls={Qwen3DecoderLayer}),
             )
         else:
@@ -110,7 +114,7 @@ def _check_policy_update(rank, rendezvous, strategy):
         assert metrics["loss"] == pytest.approx(loss.item(), rel=2e-5)
         timeline = tu.get_non_tensor_data(output, "gpu_timeline", {})
         assert all(end > start for intervals in timeline.values() for start, end in intervals)
-        context = FSDP.summon_full_params(model) if strategy == "fsdp" else nullcontext()
+        context = FSDP.summon_full_params(model) if strategy != "fsdp2" else nullcontext()
         with context:
             for expected, actual in zip(reference.parameters(), model.parameters(), strict=True):
                 actual = actual.full_tensor() if hasattr(actual, "full_tensor") else actual
@@ -119,8 +123,11 @@ def _check_policy_update(rank, rendezvous, strategy):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
-def test_streamed_policy_update_matches_global_token_mean_after_clipping(tmp_path, strategy):
+@pytest.mark.parametrize(
+    ("strategy", "use_orig_params"),
+    [("fsdp", True), ("fsdp", False), ("fsdp_shard_grad_op", True), ("fsdp_shard_grad_op", False), ("fsdp2", True)],
+)
+def test_streamed_policy_update_matches_global_token_mean_after_clipping(tmp_path, strategy, use_orig_params):
     torch.multiprocessing.spawn(
-        _check_policy_update, args=(str(tmp_path / "rendezvous"), strategy), nprocs=2, join=True
+        _check_policy_update, args=(str(tmp_path / "rendezvous"), strategy, use_orig_params), nprocs=2, join=True
     )

@@ -288,6 +288,7 @@ def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeyp
             assert metrics == {}
         else:
             assert events == [
+                ("rollout-sleep", 2),
                 "abort",
                 "weights-wake",
                 "build",

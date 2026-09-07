@@ -30,6 +30,7 @@ SYNC_METRICS = (
     "actor/grad_norm",
     "streamopd_cf/scheduler_terminal_trajectories",
     "streamopd_cf/scheduler_completed_teacher_trajectories",
+    "streamopd_cf/scheduler_training_trajectories_started",
     "actor/streamopd_cf/training_seconds",
     "actor/streamopd_cf/forward_gpu_seconds",
     "actor/streamopd_cf/loss_gpu_seconds",

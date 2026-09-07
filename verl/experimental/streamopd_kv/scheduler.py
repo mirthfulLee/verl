@@ -447,6 +447,7 @@ class StreamOPDTaskScheduler:
             "rollout_end": self.all_rollouts_terminal_at,
             "teacher_end": self.all_teacher_completed_at,
             "teacher": _merge_intervals(self._teacher_score_intervals),
+            "training": list(self._training_intervals),
         }
 
     def end_policy(self, policy_version: int) -> dict[str, float]:

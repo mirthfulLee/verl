@@ -77,8 +77,13 @@ def main():
                 except subprocess.TimeoutExpired:
                     pass
         finally:
-            if process.poll() is None:
+            # A failed driver can exit while spawned vLLM children remain.
+            # The process group is private to this benchmark invocation.
+            try:
                 os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if process.poll() is None:
                 try:
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:

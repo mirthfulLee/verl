@@ -76,14 +76,14 @@ def prepare_streamopd_cf_config(config):
     settings = config.distillation.get("streamopd_cf", {})
     trainer_mode = config.trainer.get("v1", {}).get("trainer_mode")
     selected = trainer_mode == "streamopd_cf"
-    if config.trainer.get("v1", {}).get("trainer_mode") == "separate_sync":
+    if trainer_mode in ("separate_sync", "union_sync"):
         if not config.trainer.use_v1 or not config.distillation.enabled:
             raise ValueError("separate_sync requires V1 and distillation.enabled=true")
         if settings.get("enabled", False) or config.distillation.get("streamopd_kv", {}).get("enabled", False):
             raise ValueError("separate_sync requires both streaming strategies disabled")
         validate_dedicated_opd_config(config)
         with open_dict(config):
-            config.trainer.v1.separate_sync = {"parameter_sync_step": 1}
+            config.trainer.v1[trainer_mode] = {"parameter_sync_step": 1}
             config.trainer.v1.sampler.max_off_policy_threshold = 1
             if config.algorithm.get("filter_groups"):
                 config.algorithm.filter_groups.enable = False
@@ -148,7 +148,7 @@ def validate_dedicated_opd_config(config):
     if actor.use_dynamic_bsz:
         if actor.ppo_max_token_len_per_gpu is None or actor.ppo_max_token_len_per_gpu < 0:
             raise ValueError("ppo_max_token_len_per_gpu must be positive, or 0 for automatic planning")
-        if config.trainer.v1.trainer_mode == "separate_sync" and actor.ppo_max_token_len_per_gpu == 0:
+        if config.trainer.v1.trainer_mode in ("separate_sync", "union_sync") and actor.ppo_max_token_len_per_gpu == 0:
             if not config.actor_rollout_ref.model.use_remove_padding or not loss.use_chunked_topk:
                 raise ValueError("baseline auto planning requires use_remove_padding=True and use_chunked_topk=True")
     else:

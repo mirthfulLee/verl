@@ -59,7 +59,7 @@ def test_streamopd_cf_config_keeps_reverse_connector_disabled():
     assert cfg.trainer.v1.streamopd_cf.parameter_sync_step == 1
 
 
-@pytest.mark.parametrize("mode", ["streamopd_cf", "separate_sync"])
+@pytest.mark.parametrize("mode", ["streamopd_cf", "separate_sync", "union_sync"])
 def test_inference_limits_are_independent_of_training(mode):
     cfg = config()
     cfg.trainer.v1.trainer_mode = mode
@@ -89,6 +89,54 @@ def test_baseline_auto_budget_rejects_unprofiled_memory_paths(path):
     OmegaConf.update(cfg, path, False)
     with pytest.raises(ValueError, match="baseline auto planning requires"):
         prepare_streamopd_cf_config(cfg)
+
+
+def test_union_sync_uses_strict_replay_without_streaming():
+    from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerUnionSync
+
+    cfg = config()
+    cfg.trainer.v1.trainer_mode = "union_sync"
+    prepare_streamopd_cf_config(cfg)
+    assert cfg.trainer.v1.union_sync.parameter_sync_step == 1
+    assert not cfg.distillation.streamopd_cf.enabled
+    assert not cfg.distillation.streamopd_kv.enabled
+    trainer = PPOTrainerUnionSync.__new__(PPOTrainerUnionSync)
+    trainer.config = cfg
+    trainer._add_prompts_to_generate = lambda *args, **kwargs: None
+    buffer = trainer._build_replay_buffer()
+    assert buffer.trainer_mode == "sync"
+    assert buffer.max_off_policy_threshold == 1
+
+
+def test_union_sync_reserves_eight_physical_gpus(monkeypatch):
+    from verl.experimental.streamopd_cf.topology import DedicatedOPDPools
+    from verl.single_controller.ray import ResourcePoolManager
+    from verl.trainer.ppo.utils import Role
+    from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerUnionSync
+
+    cfg = config()
+    cfg.trainer.n_gpus_per_node = 8
+    cfg.distillation.n_gpus_per_node = 2
+    cfg.actor_rollout_ref.rollout.n_gpus_per_node = 6
+    cfg.actor_rollout_ref.actor.fsdp_config.param_offload = True
+    cfg.actor_rollout_ref.actor.fsdp_config.optimizer_offload = True
+    trainer = PPOTrainerUnionSync.__new__(PPOTrainerUnionSync)
+    trainer.config = cfg
+
+    def dedicated_pools(self):
+        self.mapping = {Role.Actor: "global_pool", Role.TeacherModel: "teacher_pool"}
+        self.resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec={"global_pool": [8], "rollout_pool": [6], "teacher_pool": [2]},
+            mapping=self.mapping,
+        )
+
+    monkeypatch.setattr(DedicatedOPDPools, "_init_resource_pool_mgr", dedicated_pools)
+    trainer._init_resource_pool_mgr()
+    assert trainer.resource_pool_manager.resource_pool_spec == {"global_pool": [8]}
+    assert trainer.mapping[Role.TeacherModel] == trainer.mapping[Role.Actor]
+    cfg.actor_rollout_ref.rollout.n_gpus_per_node = 8
+    with pytest.raises(ValueError, match="span the disjoint"):
+        trainer._init_resource_pool_mgr()
 
 
 @pytest.mark.parametrize(

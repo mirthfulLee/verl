@@ -20,7 +20,8 @@ the single-teacher scripts. The MOPD script exposes per-teacher overrides.
 It streams committed student tokens to one Teacher and reuses exported Rollout KV for reverse training.
 Set `DATASET` to a training parquet file and use `STUDENT_MODEL` / `TEACHER_MODEL` for local paths or Hugging Face IDs.
 See the [StreamOPD-KV guide](../../verl/experimental/streamopd_kv/README.md) for supported placements, dependencies,
-configuration, and tests. The benchmark comparison controls live in `benchmarks/streamopd_kv`.
+configuration, and tests. See the [experiment instructions](../../benchmarks/STREAMOPD_EXPERIMENTS.md)
+for benchmark controls and commands.
 
 ## Key Flags
 
@@ -42,6 +43,6 @@ Trainer forwards. The final input chunk, loss and one backward per microbatch
 wait for complete trajectories and Teacher supervision; each policy batch has
 one optimizer update. See the
 [StreamOPD-CF implementation guide](../../verl/experimental/streamopd_cf/README.md)
-and [matched benchmark instructions](../../benchmarks/streamopd_cf/README.md).
+and [experiment instructions](../../benchmarks/STREAMOPD_EXPERIMENTS.md).
 
 The recommended trainer modes are `streamopd_cf` and `streamopd_kv`.

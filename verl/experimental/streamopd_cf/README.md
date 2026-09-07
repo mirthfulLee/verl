@@ -191,4 +191,5 @@ CUDA_VISIBLE_DEVICES='' uv run --active --no-sync pytest -q tests/experimental/s
 CUDA_VISIBLE_DEVICES=0 uv run --active --no-sync pytest -q tests/experimental/streamopd_cf/test_chunked_forward_on_gpu.py
 ```
 
-Performance scripts and comparison instructions are in `benchmarks/streamopd_cf`.
+Performance scripts are in `benchmarks/streamopd_cf`; see the
+[experiment instructions](../../../benchmarks/STREAMOPD_EXPERIMENTS.md) for controls and commands.

@@ -222,6 +222,14 @@ The exposed transfer metrics separate pinned allocation, mmap-to-pinned staging,
 wait. In particular, `reverse_slot_next_wait_seconds` is the transfer time visible on the training critical path;
 aggregate staging and CUDA durations may overlap backward and must not be added to step time.
 
+Training-state metrics `rank_parameter_storage_gb_max`, `rank_gradient_storage_gb_max`, and
+`rank_optimizer_state_gb_max` under `streamopd/` report GiB of actual local backing storage, reduced by maximum across
+Trainer ranks and training units. Shared FSDP buffer views count once, and FSDP2 DTensors contribute only their local
+shard. Gradients are sampled before the final optimizer step and cleanup; optimizer state is sampled after the step
+so lazily created Adam buffers are included. These are storage snapshots, including any CPU-offloaded tensors, not
+CUDA allocator peaks or total process memory. Reverse preflight likewise uses local shard sizes for deferred
+training state and counts shared offloaded parameter storage once.
+
 Preflight enumerates power-of-two reverse widths and chunks up to the trajectory length under the fixed-slot,
 activation, LM-head, optimizer, and transfer reserve. It first maximizes the useful `batch * chunk` token tile. Equal
 tiles prefer at least two trajectories when feasible, then the longer chunk to reduce wavefront depth. The memory
@@ -271,6 +279,7 @@ CUDA_VISIBLE_DEVICES=0 uv run --no-sync pytest -q tests/experimental/streamopd_k
 
 Set `STREAMOPD_TEST_MODEL_PATH=/path/to/Qwen3` to repeat the numerical comparison with a local pretrained model.
 Runtime Teacher artifact validation compares every supervised row; the final native-API dummy row has no target
-and is excluded. For Teacher fragment-boundary validation and end-to-end benchmark commands, see
-[the benchmark guide](../../../benchmarks/streamopd_kv/README.md). These numerical and smoke checks do not establish
+and is excluded. Teacher fragment-boundary validation uses
+`benchmarks/streamopd_kv/validate_vllm_streaming_input.py`. For end-to-end benchmark commands, see
+[the experiment instructions](../../../benchmarks/STREAMOPD_EXPERIMENTS.md). These numerical and smoke checks do not establish
 throughput gains; performance comparisons require matched resource allocations and execution settings.

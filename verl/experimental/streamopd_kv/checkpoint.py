@@ -26,6 +26,11 @@ async def update_streamopd_weights(
     StreamOPD scheduler admits the next policy version.
     """
     if not shares_rollout:
+        # Actor-only rollout replicas use COLOCATED mode even on dedicated
+        # GPUs. Their release_kv_cache() skips awake replicas, so explicitly
+        # sleep before the ordinary weights-only wake and transfer sequence.
+        if manager.backend != "naive":
+            await manager.sleep_replicas(level=2)
         return await manager.update_weights(global_steps)
     if manager.backend != "host":
         raise ValueError("phase-exclusive weight sync requires checkpoint_engine.backend=host")

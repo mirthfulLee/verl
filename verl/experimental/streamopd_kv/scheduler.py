@@ -439,6 +439,17 @@ class StreamOPDTaskScheduler:
             "training_trajectories_started": self.training_trajectories_started,
         }
 
+    def timeline(self, policy_version: int) -> dict:
+        """Host-clock service intervals; Teacher intervals include RPC/queue time."""
+        self._check_version(policy_version)
+        return {
+            "started": self.policy_started_at,
+            "rollout_end": self.all_rollouts_terminal_at,
+            "teacher_end": self.all_teacher_completed_at,
+            "teacher": _merge_intervals(self._teacher_score_intervals),
+            "training": list(self._training_intervals),
+        }
+
     def end_policy(self, policy_version: int) -> dict[str, float]:
         self._check_version(policy_version)
         if self.training_active or self.teacher_sessions or self.teacher_admission_waiters or self.training_waiters:

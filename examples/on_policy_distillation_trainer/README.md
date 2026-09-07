@@ -14,13 +14,14 @@ This trainer jointly trains a student model with policy-gradient on-policy rollo
 Override `STUDENT_MODEL` and `TEACHER_MODEL` via env vars to swap model pairs in
 the single-teacher scripts. The MOPD script exposes per-teacher overrides.
 
-## Experimental StreamOPD
+## Experimental StreamOPD-KV
 
-`run_qwen3_streamopd_kv_fsdp.sh` runs strict direct `forward_kl_topk` distillation using the V1 StreamOPD trainer.
+`run_qwen3_streamopd_kv_fsdp.sh` runs strict direct `forward_kl_topk` distillation using the V1 StreamOPD-KV trainer.
 It streams committed student tokens to one Teacher and reuses exported Rollout KV for reverse training.
 Set `DATASET` to a training parquet file and use `STUDENT_MODEL` / `TEACHER_MODEL` for local paths or Hugging Face IDs.
-See the [StreamOPD guide](../../verl/experimental/streamopd_kv/README.md) for supported placements, dependencies,
-configuration, and tests. The benchmark comparison controls live in `benchmarks/streamopd_kv`.
+See the [StreamOPD-KV guide](../../verl/experimental/streamopd_kv/README.md) for supported placements, dependencies,
+configuration, and tests. See the [experiment instructions](../../benchmarks/STREAMOPD_EXPERIMENTS.md)
+for benchmark controls and commands.
 
 ## Key Flags
 
@@ -30,3 +31,18 @@ configuration, and tests. The benchmark comparison controls live in `benchmarks/
 - `distillation.distillation_loss.loss_mode={k1, k3, forward_kl_topk, ...}`
 - `distillation.distillation_loss.use_policy_gradient=True|False`
 - `distillation.distillation_loss.topk=64`
+
+
+## Experimental StreamOPD-CF
+
+StreamOPD-CF (chunked forward) uses independent Trainer,
+Rollout and Teacher GPU pools. Run
+[`run_qwen3_streamopd_cf_fsdp.sh`](run_qwen3_streamopd_cf_fsdp.sh). This strategy
+streams committed rollout tokens into concurrent Teacher prefill and ascending
+Trainer forwards. The final input chunk, loss and one backward per microbatch
+wait for complete trajectories and Teacher supervision; each policy batch has
+one optimizer update. See the
+[StreamOPD-CF implementation guide](../../verl/experimental/streamopd_cf/README.md)
+and [experiment instructions](../../benchmarks/STREAMOPD_EXPERIMENTS.md).
+
+The recommended trainer modes are `streamopd_cf` and `streamopd_kv`.

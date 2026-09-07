@@ -101,6 +101,12 @@ def _reverse_memory_estimate(
     return kv_bytes, activation_bytes_per_token + lm_head_bytes_per_token
 
 
+def _local_parameter_bytes(parameter: torch.Tensor) -> int:
+    """DTensor's logical numel is global; optimizer storage follows the local shard."""
+    local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+    return local.numel() * local.element_size()
+
+
 def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> int:
     """Estimate gradient and optimizer tensors that must be loaded onto the GPU."""
 

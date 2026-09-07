@@ -386,11 +386,11 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     stream_config = config.distillation.get("streamopd_kv", {})
     trainer_mode = config.trainer.v1.trainer_mode if config.trainer.use_v1 else None
     if not stream_config.get("enabled", False):
-        if trainer_mode == "streamopd":
-            raise ValueError("trainer_mode=streamopd requires distillation.streamopd_kv.enabled=true")
+        if trainer_mode == "streamopd_kv":
+            raise ValueError("StreamOPD-KV requires distillation.streamopd_kv.enabled=true")
         return
-    if not config.trainer.use_v1 or trainer_mode != "streamopd":
-        raise ValueError("strict StreamOPD requires trainer.v1.trainer_mode=streamopd")
+    if not config.trainer.use_v1 or trainer_mode != "streamopd_kv":
+        raise ValueError("StreamOPD-KV requires trainer.v1.trainer_mode=streamopd_kv")
     if not config.distillation.get("enabled", False):
         raise ValueError("streamopd_kv.enabled requires distillation.enabled=true")
     # Check raw settings before auto planning can mask invalid values or divide
@@ -428,8 +428,8 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     runtime_profile = str(stream_config.get("runtime_profile", "auto"))
     if runtime_profile not in {"auto", "manual"}:
         raise ValueError("streamopd_kv.runtime_profile must be 'auto' or 'manual'")
+    explicit_paths = _hydra_task_override_paths()
     if runtime_profile == "auto":
-        explicit_paths = _hydra_task_override_paths()
         with open_dict(config):
             stream_config.planner_explicit_options = sorted(explicit_paths)
             _auto_streamopd_runtime_profile(config, explicit_paths=explicit_paths)
@@ -444,6 +444,14 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     actor = config.actor_rollout_ref.actor
     if actor.strategy not in ("fsdp", "fsdp2"):
         raise NotImplementedError("StreamOPD-KV MVP requires an FSDP actor")
+    if trainer_placement != "dedicated" and actor.strategy == "fsdp":
+        # Keep full parameters across reverse chunks during the shared training
+        # phase. Explicit engine overrides remain available for comparisons.
+        with open_dict(actor.fsdp_config):
+            for key, value in (("reshard_after_forward", False), ("use_no_sync_for_gradient_accumulation", True)):
+                _set_derived(
+                    actor.fsdp_config, key, value, f"actor_rollout_ref.actor.fsdp_config.{key}", explicit_paths
+                )
     if trainer_placement != "dedicated" and (
         not bool(actor.fsdp_config.param_offload) or not bool(actor.fsdp_config.optimizer_offload)
     ):

@@ -84,6 +84,7 @@ class StreamingTeacherCoordinator:
         max_active_kv_tokens: int = 65536,
         kv_page_size: int = 64,
         kv_reservation_tokens: int | None = None,
+        max_response_tokens: int | None = None,
     ) -> None:
         if max_pending_chunks < 1:
             raise ValueError("max_pending_chunks must be positive")
@@ -97,6 +98,9 @@ class StreamingTeacherCoordinator:
         self._max_active_kv_tokens = max_active_kv_tokens
         self._kv_page_size = kv_page_size
         self._kv_reservation_tokens = kv_reservation_tokens
+        self._max_response_tokens = max_response_tokens
+        if max_response_tokens is not None and max_response_tokens < 1:
+            raise ValueError("teacher response reservation must be positive")
         if kv_reservation_tokens is not None and kv_reservation_tokens < 1:
             raise ValueError("teacher KV reservation must be positive")
         self._local_admission = _LocalTeacherAdmission(max_active_trajectories, max_active_kv_tokens)
@@ -166,6 +170,11 @@ class StreamingTeacherCoordinator:
 
     async def _run_session(self, key: TrajectoryKey, session: _TeacherSession) -> None:
         reservation = self._kv_reservation_tokens or self._max_active_kv_tokens
+        if self._max_response_tokens is not None:
+            # CF knows each prompt when the stream arrives. Reserve its actual
+            # prefix plus worst-case response and vLLM's final sampled token.
+            tokens = len(session.prompt_ids) + self._max_response_tokens + 1
+            reservation = (tokens + self._kv_page_size - 1) // self._kv_page_size * self._kv_page_size
         try:
             while True:
                 await session.updated.wait()

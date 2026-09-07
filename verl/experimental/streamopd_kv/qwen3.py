@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import types
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -193,7 +193,7 @@ class Qwen3ReverseTrainer:
         lm_head_tokens = 0
         dense_lm_head_tokens = 0
         total_chunks = sum(math.ceil(length / self.chunk_size) for length in sequence_lengths)
-        with use_qwen3_reverse_attention(self.model, state):
+        with use_qwen3_reverse_attention(self.model, state), ExitStack() as traversal_context:
             for call_idx, (depth, active) in enumerate(schedule):
                 start = (depth - 1) * self.chunk_size
                 slot_end = depth * self.chunk_size
@@ -209,6 +209,10 @@ class Qwen3ReverseTrainer:
                 else:
                     lm_head_tokens += len(active) * (end - start)
                 dense_lm_head_tokens += len(active) * (end - start)
+                # FSDP SHARD_GRAD_OP decides whether to retain full parameters
+                # during forward, so accumulation must cover forward as well.
+                sync_context = backward_context(call_idx, len(schedule)) if backward_context else nullcontext()
+                traversal_context.enter_context(sync_context)
                 output = self.model(
                     input_ids=chunk_ids,
                     position_ids=position_ids.expand(len(active), -1),
@@ -244,10 +248,9 @@ class Qwen3ReverseTrainer:
                         raise ValueError("loss_fn must return a scalar loss sum and a non-negative token count")
                     chunk_loss = chunk_loss + sample_loss
                     chunk_valid_tokens += sample_valid_tokens
-                sync_context = backward_context(call_idx, len(schedule)) if backward_context else nullcontext()
                 state.validate_complete()
-                with sync_context:
-                    chunk_loss.backward()
+                chunk_loss.backward()
+                traversal_context.close()
                 state.commit_prefix_gradients()
                 if on_depth_committed is not None:
                     # The unused suffix is still owned by this slot depth. It can

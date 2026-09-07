@@ -30,16 +30,16 @@ run_case() {
       mode=verl-sync-opd
       trainer_gpus=2
       ;;
-    union:streamopd)
-      mode=streamopd-union
+    union:streamopd-kv)
+      mode=streamopd-kv-union
       trainer_gpus=4
       ;;
     dedicated:baseline)
       mode=verl-sync-opd
       trainer_gpus=4
       ;;
-    dedicated:streamopd)
-      mode=streamopd-dedicated
+    dedicated:streamopd-kv)
+      mode=streamopd-kv-dedicated
       trainer_gpus=2
       ;;
     *)
@@ -56,7 +56,7 @@ run_case() {
     distillation.teacher_models.teacher_model.inference.max_num_seqs="$MATCHED_TEACHER_MAX_NUM_SEQS"
     actor_rollout_ref.model.enable_gradient_checkpointing="$ENABLE_GRADIENT_CHECKPOINTING"
   )
-  if [[ $implementation == streamopd ]]; then
+  if [[ $implementation == streamopd-kv ]]; then
     log_file="$case_dir/${mode}_total${total_tokens}_bs${batch_size}_mb${MICRO_BATCH_SIZE:-16}.log"
   else
     log_file="$case_dir/${mode}_total${total_tokens}_bs${batch_size}.log"
@@ -69,7 +69,7 @@ run_case() {
       return
     fi
   fi
-  local handoff="/dev/shm/verl-streamopd-${topology}-${student_name}-${teacher_name}-${total_tokens}-${batch_size}"
+  local handoff="/dev/shm/verl-streamopd-kv-${topology}-${student_name}-${teacher_name}-${total_tokens}-${batch_size}"
   if ! MODE=$mode \
     STUDENT_MODEL="/nasdata/Model/Qwen3-${student_name}" \
     TEACHER_MODEL="/nasdata/Model/Qwen3-${teacher_name}" \
@@ -93,7 +93,7 @@ if [[ ${FULL_MATRIX:-0} == 1 ]]; then
       for batch_size in $BATCH_SIZES; do
         for topology in $POOL_SCHEMES; do
           run_case "$topology" baseline "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
-          run_case "$topology" streamopd "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
+          run_case "$topology" streamopd-kv "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
         done
       done
     done
@@ -102,7 +102,7 @@ else
   for case_spec in $COVERING_CASES; do
     IFS=: read -r student_name teacher_name teacher_tp total_tokens batch_size topology <<< "$case_spec"
     run_case "$topology" baseline "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
-    run_case "$topology" streamopd "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
+    run_case "$topology" streamopd-kv "$total_tokens" "$batch_size" "$student_name" "$teacher_name" "$teacher_tp"
   done
 fi
 

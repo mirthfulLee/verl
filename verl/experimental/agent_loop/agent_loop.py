@@ -500,7 +500,8 @@ class AgentLoopWorker:
                 teacher_client=teacher_client,
             )
             streamopd_enabled = bool(config.distillation.get("streamopd_kv", {}).get("enabled", False))
-            if streamopd_enabled:
+            streamopd_cf_enabled = bool(config.distillation.get("streamopd_cf", {}).get("enabled", False))
+            if streamopd_enabled or streamopd_cf_enabled:
                 from verl.experimental.streamopd_kv.agent import StreamOPDAgentSession
 
                 self._streamopd = StreamOPDAgentSession(
@@ -509,6 +510,8 @@ class AgentLoopWorker:
                     self.tokenizer,
                     self.hf_model_type,
                     self.teacher_server_manager,
+                    stream_config=config.distillation.streamopd_cf if streamopd_cf_enabled else None,
+                    export_kv=not streamopd_cf_enabled,
                 )
             else:
                 self._streamopd = None

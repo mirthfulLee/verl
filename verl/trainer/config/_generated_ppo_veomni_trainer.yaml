@@ -922,6 +922,28 @@ distillation:
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
         temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
   teacher_key: data_source
+  batching:
+    _target_: verl.experimental.streamopd_cf.config.OPDBatchingConfig
+    memory_fraction: 0.8
+    reserve_gib: 4.0
+  streamopd_cf:
+    _target_: verl.experimental.streamopd_cf.config.StreamOPDCFConfig
+    enabled: false
+    forward_chunk_size: 1024
+    loss_chunk_size: 2048
+    attention_backend: flash_attention_2
+    token_chunk_size: 1024
+    teacher_prefill_max_active_trajectories: 0
+    teacher_prefill_max_active_kv_tokens: 0
+    teacher_prefill_kv_page_size: 64
+    max_pending_teacher_chunks: 128
+    scheduler_actor_name: ''
+    training_stream_actor_name: ''
+    timeline_dir: ''
+    scheduler_timeout_seconds: 600.0
+    require_same_tokenizer: true
+    validate_teacher_artifacts: false
+    validation_atol: 0.0001
 transfer_queue:
   enable: false
   metrics:
@@ -989,7 +1011,7 @@ trainer:
         switch_threshold_step_down: 0.03
         switch_threshold_release_steps: 2
         switch_cost_window_size: 3
-    streamopd: {}
+    streamopd_kv: {}
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

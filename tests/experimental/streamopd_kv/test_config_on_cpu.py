@@ -28,8 +28,8 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd",
-                    "streamopd": {},
+                    "trainer_mode": "streamopd_kv",
+                    "streamopd_kv": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -78,7 +78,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
     assert connector.kv_connector_extra_config.streamopd_kv_handoff_dir == "/tmp/test-streamopd"
     assert connector.kv_connector_extra_config.streamopd_host_slot_count == 128
     assert connector.kv_connector_extra_config.streamopd_host_slot_tokens == 4096
-    assert OmegaConf.to_container(config.trainer.v1.streamopd) == {}
+    assert OmegaConf.to_container(config.trainer.v1.streamopd_kv) == {}
     assert config.trainer.v1.sampler.max_off_policy_threshold == 1
     assert config.trainer.v1.sampler.max_off_policy_strategy == "drop"
     assert config.algorithm.filter_groups.enable is False
@@ -91,7 +91,7 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
 
     stale_config = copy.deepcopy(config)
     stale_config.trainer.v1.trainer_mode = "sync"
-    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd"):
+    with pytest.raises(ValueError, match="trainer.v1.trainer_mode=streamopd_kv"):
         prepare_streamopd_kv_config(stale_config)
 
     multi_sample_config = copy.deepcopy(config)
@@ -334,8 +334,8 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
                 "n_gpus_per_node": 2,
                 "nnodes": 1,
                 "v1": {
-                    "trainer_mode": "streamopd",
-                    "streamopd": {},
+                    "trainer_mode": "streamopd_kv",
+                    "streamopd_kv": {},
                     "sampler": {"max_off_policy_threshold": 8, "max_off_policy_strategy": "drop"},
                 },
             },
@@ -414,7 +414,8 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
     )
     assert config.actor_rollout_ref.actor.fsdp_config.param_offload is True
     assert config.actor_rollout_ref.actor.fsdp_config.optimizer_offload is True
-    assert config.actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation is False
+    assert config.actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation is True
+    assert config.actor_rollout_ref.actor.fsdp_config.reshard_after_forward is False
     assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 4096
     assert config.distillation.streamopd_kv.reverse_chunk_size == 4096
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
@@ -478,7 +479,7 @@ def streamopd_job(monkeypatch):
 
     overrides = [
         "trainer.use_v1=true",
-        "trainer.v1.trainer_mode=streamopd",
+        "trainer.v1.trainer_mode=streamopd_kv",
         "trainer.n_gpus_per_node=2",
         "trainer.nnodes=1",
         "data.train_batch_size=4",
@@ -514,6 +515,53 @@ def test_public_config_preparation_is_idempotent(streamopd_job):
     once = OmegaConf.to_container(streamopd_job, resolve=True)
     prepare_streamopd_kv_config(streamopd_job)
     assert OmegaConf.to_container(streamopd_job, resolve=True) == once
+
+
+@pytest.mark.parametrize("profile", ["auto", "manual"])
+@pytest.mark.parametrize("placement", ["teacher", "rollout", "union", "dedicated"])
+def test_shared_fsdp_defaults_retain_parameters(streamopd_job, profile, placement):
+    config = streamopd_job
+    config.distillation.streamopd_kv.runtime_profile = profile
+    config.distillation.streamopd_kv.trainer_placement = placement
+    actor = config.actor_rollout_ref.actor
+    actor.fsdp_config.param_offload = True
+    actor.fsdp_config.optimizer_offload = True
+    actor.fsdp_config.reshard_after_forward = True
+    actor.fsdp_config.use_no_sync_for_gradient_accumulation = False
+    config.actor_rollout_ref.rollout.checkpoint_engine.backend = "host"
+    prepare_streamopd_kv_config(config)
+    shared = placement != "dedicated"
+    assert actor.fsdp_config.reshard_after_forward is not shared
+    assert actor.fsdp_config.use_no_sync_for_gradient_accumulation is shared
+
+
+def test_shared_fsdp_defaults_preserve_explicit_engine_overrides(streamopd_job, monkeypatch):
+    from verl.experimental.streamopd_kv import config as stream_config_module
+
+    actor = streamopd_job.actor_rollout_ref.actor
+    actor.fsdp_config.reshard_after_forward = True
+    actor.fsdp_config.use_no_sync_for_gradient_accumulation = False
+    monkeypatch.setattr(
+        stream_config_module,
+        "_hydra_task_override_paths",
+        lambda: {
+            "actor_rollout_ref.actor.fsdp_config.reshard_after_forward",
+            "actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation",
+        },
+    )
+    prepare_streamopd_kv_config(streamopd_job)
+    assert actor.fsdp_config.reshard_after_forward is True
+    assert actor.fsdp_config.use_no_sync_for_gradient_accumulation is False
+
+
+def test_shared_fsdp1_defaults_do_not_change_fsdp2(streamopd_job):
+    actor = streamopd_job.actor_rollout_ref.actor
+    actor.strategy = "fsdp2"
+    actor.fsdp_config.reshard_after_forward = True
+    actor.fsdp_config.use_no_sync_for_gradient_accumulation = False
+    prepare_streamopd_kv_config(streamopd_job)
+    assert actor.fsdp_config.reshard_after_forward is True
+    assert actor.fsdp_config.use_no_sync_for_gradient_accumulation is False
 
 
 def test_repreparation_refreshes_connector_transport(streamopd_job, monkeypatch):

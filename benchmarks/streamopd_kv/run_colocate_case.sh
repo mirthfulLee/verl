@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODE=${MODE:-streamopd}
+MODE=${MODE:-streamopd-kv}
 export STUDENT_MODEL=${STUDENT_MODEL:-/nasdata/Model/Qwen3-1.7B}
 export TEACHER_MODEL=${TEACHER_MODEL:-/nasdata/Model/Qwen3-4B}
 export DATASET=${DATASET:-/nasdata/Model/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet}
@@ -19,7 +19,7 @@ RESULT_DIR=${RESULT_DIR:-benchmarks/streamopd_kv/results/colocate_matrix}
 AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-8}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-0}
 KV_HANDOFF_DIR=${KV_HANDOFF_DIR:-/data1/huanli/tmp/${MODE}_total${TOTAL_TRAJECTORY_LENGTH}_mb${MICRO_BATCH_SIZE}}
-CHECKPOINT_HOST_DIR=${CHECKPOINT_HOST_DIR:-/dev/shm/verl-streamopd-checkpoint-${MODE}-$$}
+CHECKPOINT_HOST_DIR=${CHECKPOINT_HOST_DIR:-/dev/shm/verl-streamopd-kv-checkpoint-${MODE}-$$}
 export USE_LIGER=${USE_LIGER:-True}
 export ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 export TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
@@ -74,8 +74,8 @@ case "$MODE" in
     export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.85}
     export CHECKPOINT_HOST_ROLLOUT_DTYPE=${CHECKPOINT_HOST_ROLLOUT_DTYPE:-null}
     ;;
-  streamopd|streamopd-teacher|streamopd-rollout|streamopd-union|streamopd-dedicated)
-    export TRAINER_MODE=streamopd STREAMOPD_KV_ENABLED=True
+  streamopd-kv|streamopd-kv-teacher|streamopd-kv-rollout|streamopd-kv-union|streamopd-kv-dedicated)
+    export TRAINER_MODE=streamopd_kv STREAMOPD_KV_ENABLED=True
     export TEACHER_GPUS=${TEACHER_GPUS:-2}
     export ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
     export ROLLOUT_NNODES=1
@@ -83,23 +83,23 @@ case "$MODE" in
     export CHECKPOINT_ENGINE_BACKEND=${CHECKPOINT_ENGINE_BACKEND:-host}
     export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.65}
     export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.90}
-    if [[ $MODE == streamopd ]]; then
+    if [[ $MODE == streamopd-kv ]]; then
       TRAINER_PLACEMENT=union
       STUDENT_GPUS=${STUDENT_GPUS:-$((TEACHER_GPUS + ROLLOUT_GPUS))}
     fi
-    if [[ $MODE == streamopd-teacher ]]; then
+    if [[ $MODE == streamopd-kv-teacher ]]; then
       TRAINER_PLACEMENT=teacher
       STUDENT_GPUS=${STUDENT_GPUS:-$TEACHER_GPUS}
     fi
-    if [[ $MODE == streamopd-rollout ]]; then
+    if [[ $MODE == streamopd-kv-rollout ]]; then
       TRAINER_PLACEMENT=rollout
       STUDENT_GPUS=${STUDENT_GPUS:-$ROLLOUT_GPUS}
     fi
-    if [[ $MODE == streamopd-union ]]; then
+    if [[ $MODE == streamopd-kv-union ]]; then
       TRAINER_PLACEMENT=union
       STUDENT_GPUS=${STUDENT_GPUS:-$((TEACHER_GPUS + ROLLOUT_GPUS))}
     fi
-    if [[ $MODE == streamopd-dedicated ]]; then
+    if [[ $MODE == streamopd-kv-dedicated ]]; then
       TRAINER_PLACEMENT=dedicated
       STUDENT_GPUS=${STUDENT_GPUS:-2}
     fi
@@ -132,7 +132,7 @@ if (( ROLLOUT_MAX_NUM_SEQS < 1 )); then
 fi
 
 mkdir -p "$RESULT_DIR"
-if [[ $MODE == streamopd* ]]; then
+if [[ $MODE == streamopd-kv* ]]; then
   CASE_NAME="${MODE}_total${TOTAL_TRAJECTORY_LENGTH}_bs${BATCH_SIZE}_mb${MICRO_BATCH_SIZE}"
 else
   CASE_NAME="${MODE}_total${TOTAL_TRAJECTORY_LENGTH}_bs${BATCH_SIZE}"
@@ -174,7 +174,7 @@ profile_overrides=(
   distillation.streamopd_kv.kv_prefetch_workers="$KV_PREFETCH_WORKERS"
   distillation.streamopd_kv.kv_handoff_dir="$KV_HANDOFF_DIR"
 )
-if [[ $MODE == streamopd* && $STREAMOPD_RUNTIME_PROFILE == auto ]]; then
+if [[ $MODE == streamopd-kv* && $STREAMOPD_RUNTIME_PROFILE == auto ]]; then
   profile_overrides=(
     distillation.streamopd_kv.runtime_profile=auto
     distillation.streamopd_kv.rollout_kv_export_strategy="$ROLLOUT_KV_EXPORT_STRATEGY"

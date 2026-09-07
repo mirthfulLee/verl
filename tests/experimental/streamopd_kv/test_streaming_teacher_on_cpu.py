@@ -512,6 +512,7 @@ async def test_teacher_reference_validation_ignores_only_unsupervised_final_row(
         return expected_ids, expected_logprobs
 
     session = StreamOPDAgentSession.__new__(StreamOPDAgentSession)
+    session._training_stream = None
     session.config = SimpleNamespace(validate_teacher_artifacts=True, validation_atol=1e-4)
     session.coordinator = SimpleNamespace(result=streamed)
     session.teacher_manager = SimpleNamespace(compute_teacher_logprobs_single=full)

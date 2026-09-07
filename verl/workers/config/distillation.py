@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from verl.base_config import BaseConfig
+from verl.experimental.streamopd_cf.config import OPDBatchingConfig, StreamOPDCFConfig
 from verl.experimental.streamopd_kv.config import StreamOPDKVConfig
 from verl.utils.config import omega_conf_to_dataclass
 
@@ -271,15 +272,17 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
     streamopd_kv: StreamOPDKVConfig = field(default_factory=StreamOPDKVConfig)
+    streamopd_cf: StreamOPDCFConfig = field(default_factory=StreamOPDCFConfig)
+    batching: OPDBatchingConfig = field(default_factory=OPDBatchingConfig)
 
     def __post_init__(self):
-        object.__setattr__(
-            self,
-            "streamopd_kv",
-            omega_conf_to_dataclass(self.streamopd_kv, dataclass_type=StreamOPDKVConfig),
-        )
-        if self.streamopd_kv.enabled and not self.enabled:
-            raise ValueError("streamopd_kv.enabled requires distillation.enabled=true")
+        object.__setattr__(self, "batching", omega_conf_to_dataclass(self.batching, dataclass_type=OPDBatchingConfig))
+        for name, schema in (("streamopd_kv", StreamOPDKVConfig), ("streamopd_cf", StreamOPDCFConfig)):
+            object.__setattr__(self, name, omega_conf_to_dataclass(getattr(self, name), dataclass_type=schema))
+            if getattr(self, name).enabled and not self.enabled:
+                raise ValueError(f"{name}.enabled requires distillation.enabled=true")
+        if self.streamopd_kv.enabled and self.streamopd_cf.enabled:
+            raise ValueError("streamopd_cf and streamopd_kv cannot both be enabled")
         if not self.enabled:
             return
 

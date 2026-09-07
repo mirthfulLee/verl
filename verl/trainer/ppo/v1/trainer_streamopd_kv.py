@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 
 import ray
 import torch
@@ -47,8 +49,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-@register_trainer("streamopd")
-class PPOTrainerStreamOPD(PPOTrainer):
+@register_trainer("streamopd_kv")
+class PPOTrainerStreamOPDKV(PPOTrainer):
     """Strict placement-aware StreamOPD trainer.
 
     The actor worker is trainer-only. Teacher and Rollout remain independent
@@ -418,6 +420,18 @@ class PPOTrainerStreamOPD(PPOTrainer):
                 combined_tags.extend(batch.tags)
             metrics.update(metrics_aggregator.get_aggregated_metrics())
             result = KVBatchMeta(partition_id="train", keys=combined_keys, tags=combined_tags)
+            timeline_dir = os.environ.get("OPD_BENCH_TIMELINE_DIR")
+            if timeline_dir:
+                timeline = ray.get(self._scheduler.timeline.remote(self._policy_version))
+                timeline["trajectories"] = [
+                    {key: value for key, value in tag.items() if key.startswith("_stage_")}
+                    for tag in combined_tags
+                    if not tag.get("is_padding", False)
+                ]
+                timeline["clock"] = "single-host perf_counter seconds; service intervals include waits"
+                destination = Path(timeline_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / f"step-{self.global_steps}.json").write_text(json.dumps(timeline, indent=2) + "\n")
         except BaseException:
             try:
                 self._offload_trainer_state()

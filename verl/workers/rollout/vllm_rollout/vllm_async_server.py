@@ -606,6 +606,7 @@ class vLLMHttpServer:
         streamopd_callback: Optional[ray.actor.ActorHandle] = None,
         streamopd_chunk_size: Optional[int] = None,
         streamopd_page_size: int = 1,
+        streamopd_export_kv: bool = True,
         prompt_logprobs_start: int = 0,
         prompt_logprobs_as_tensors: bool = False,
     ) -> TokenOutput:
@@ -647,18 +648,19 @@ class vLLMHttpServer:
                 submit=submit_streamopd_chunk,
                 page_size=streamopd_page_size,
             )
-            kv_transfer_params = dict(kv_transfer_params or {})
-            kv_transfer_params.update(
-                {
-                    "streamopd_kv": True,
-                    "policy_version": policy_version,
-                    "prompt_length": len(prompt_ids),
-                    # vLLM may append an internal suffix in
-                    # InputProcessor.assign_request_id(). Preserve the protocol
-                    # identity separately from that backend request id.
-                    "trajectory_id": request_id,
-                }
-            )
+            if streamopd_export_kv:
+                kv_transfer_params = dict(kv_transfer_params or {})
+                kv_transfer_params.update(
+                    {
+                        "streamopd_kv": True,
+                        "policy_version": policy_version,
+                        "prompt_length": len(prompt_ids),
+                        # vLLM may append an internal suffix in
+                        # InputProcessor.assign_request_id(). Preserve the protocol
+                        # identity separately from that backend request id.
+                        "trajectory_id": request_id,
+                    }
+                )
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`

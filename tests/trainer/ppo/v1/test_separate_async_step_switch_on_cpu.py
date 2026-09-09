@@ -206,8 +206,7 @@ def test_hybrid_rollout_switch_config_target_instantiates_dataclass():
     assert switch_config.switch_threshold_ratio == 0.25
 
 
-@pytest.mark.parametrize("standalone_memory", [None, 0.85])
-def test_standalone_memory_override_does_not_change_hybrid_config(monkeypatch, standalone_memory):
+def test_standalone_uses_native_shared_rollout_config(monkeypatch):
     from types import SimpleNamespace
 
     trainer = PPOTrainerSeparateAsync.__new__(PPOTrainerSeparateAsync)
@@ -215,8 +214,7 @@ def test_standalone_memory_override_does_not_change_hybrid_config(monkeypatch, s
         {
             "actor_rollout_ref": {
                 "rollout": {
-                    "gpu_memory_utilization": 0.35,
-                    "standalone_gpu_memory_utilization": standalone_memory,
+                    "gpu_memory_utilization": 0.5,
                     "prometheus": {"enable": False},
                     "checkpoint_engine": {},
                 }
@@ -238,8 +236,8 @@ def test_standalone_memory_override_does_not_change_hybrid_config(monkeypatch, s
     monkeypatch.setattr(trainer_module, "omega_conf_to_dataclass", lambda value: value)
     monkeypatch.setattr(trainer_module, "CheckpointEngineManager", lambda **kwargs: None)
     trainer._setup()
-    assert trainer.config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.35
-    assert configs[0].actor_rollout_ref.rollout.gpu_memory_utilization == (standalone_memory or 0.35)
+    assert configs[0] is trainer.config
+    assert configs[0].actor_rollout_ref.rollout.gpu_memory_utilization == 0.5
 
 
 @pytest.mark.parametrize("window_size", [0, -1])

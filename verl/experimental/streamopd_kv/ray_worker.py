@@ -68,10 +68,10 @@ class StreamOPDActorWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_streamopd_trainer_state(self) -> None:
-        """Claim a shared pool after its inference process enters level-2 sleep."""
+        """Claim a shared pool after its inference processes enter sleep."""
 
         aggressive_empty_cache(force_sync=True)
-        self.actor.engine.to(device=get_device_name(), model=True, optimizer=True, grad=True)
+        self.actor.engine.to(device=get_device_name(), model=True, optimizer=False, grad=True)
         self.actor.allocate_reverse_slots()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

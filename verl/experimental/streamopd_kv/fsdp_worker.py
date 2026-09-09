@@ -107,7 +107,9 @@ def _local_parameter_bytes(parameter: torch.Tensor) -> int:
     return local.numel() * local.element_size()
 
 
-def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> int:
+def _deferred_training_state_bytes(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer | None, *, include_optimizer: bool = True
+) -> int:
     """Estimate gradient and optimizer tensors that must be loaded onto the GPU."""
 
     if optimizer is None:
@@ -123,6 +125,9 @@ def _deferred_training_state_bytes(model: torch.nn.Module, optimizer: torch.opti
             parameter_bytes = _local_tensor(parameter).numel() * parameter.element_size()
             if parameter.grad is None or parameter.grad.device.type != get_device_name():
                 reserve += parameter_bytes
+
+            if not include_optimizer:
+                continue
 
             state = optimizer.state.get(parameter, {})
             if "adam" in optimizer_name:
@@ -174,6 +179,7 @@ def _fixed_reverse_slot_plan(
     dtype: torch.dtype,
     available_memory_bytes: int | None,
     reserve_bytes: int = 4 * 1024**3,
+    optimizer_reserve_bytes: int = 0,
 ) -> ReverseSlotPlan:
     """Choose one stable row count and kernel shape before the first training phase."""
 
@@ -209,7 +215,11 @@ def _fixed_reverse_slot_plan(
             proposed_slot_bytes = base_slot_bytes + (base_slot_bytes // 2 if proposed_prefetch_kv else 0)
             if (
                 available_memory_bytes is not None
-                and reserve_bytes + proposed_slot_bytes + proposed * bytes_per_token > available_memory_bytes
+                and max(
+                    reserve_bytes + proposed_slot_bytes + proposed * bytes_per_token,
+                    optimizer_reserve_bytes + proposed_slot_bytes,
+                )
+                > available_memory_bytes
             ):
                 continue
             chunk_size = proposed
@@ -243,7 +253,8 @@ def _fixed_reverse_slot_plan(
     candidate, slot_bytes, bytes_per_token, chunk_limit = smallest_attempt or (0, 0, 0, 0)
     raise RuntimeError(
         "preflight could not fit one fixed reverse slot with the minimum chunk size: "
-        f"available={available_memory_bytes}, reserve={reserve_bytes}, candidate_rows={candidate}, "
+        f"available={available_memory_bytes}, reserve={reserve_bytes}, "
+        f"optimizer_reserve={optimizer_reserve_bytes}, candidate_rows={candidate}, "
         f"slot_bytes={slot_bytes}, workspace_bytes_per_token={bytes_per_token}, "
         f"chunk_limit={chunk_limit}, minimum_chunk={min_chunk_size}"
     )
@@ -435,7 +446,9 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             "available_memory_gib": (self._reverse_available_memory_bytes or 0) / (1024**3),
         }
         if self._reverse_slot_plan is None:
-            deferred_training_state_bytes = _deferred_training_state_bytes(model, self.engine.optimizer)
+            deferred_training_state_bytes = _deferred_training_state_bytes(
+                model, self.engine.optimizer, include_optimizer=not self._defer_optimizer_load
+            )
             unsharded_gradient_reserve_bytes = 0
             if bool(self.engine_config.use_no_sync_for_gradient_accumulation):
                 unsharded_gradient_reserve_bytes = _unsharded_gradient_reserve_bytes(
@@ -445,9 +458,21 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
             offloaded_parameter_bytes = _unique_tensor_storage_bytes(
                 parameter for parameter in model.parameters() if parameter.device.type != get_device_name()
             )
+            reserve_bytes = int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
+            optimizer_reserve_bytes = 0
+            if self._defer_optimizer_load:
+                # Final FSDP backward shards gradients before Adam is restored.
+                # Keep room for its state, foreach workspace, and the fixed KV slots.
+                optimizer_reserve_bytes = (
+                    reserve_bytes
+                    + offloaded_parameter_bytes
+                    + _deferred_training_state_bytes(model, self.engine.optimizer)
+                    + _unique_tensor_storage_bytes(model.parameters())
+                )
             metrics["deferred_training_state_gib"] = deferred_training_state_bytes / (1024**3)
             metrics["unsharded_gradient_reserve_gib"] = unsharded_gradient_reserve_bytes / (1024**3)
             metrics["offloaded_parameter_gib"] = offloaded_parameter_bytes / (1024**3)
+            metrics["optimizer_phase_reserve_gib"] = optimizer_reserve_bytes / (1024**3)
             parameter_dtype = next(model.parameters()).dtype
             forward_dtype = getattr(self.engine, "_autocast_dtype", parameter_dtype)
             page_size = int(self.streamopd_config.reverse_page_size)
@@ -464,11 +489,12 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 dtype=forward_dtype,
                 available_memory_bytes=self._reverse_available_memory_bytes or None,
                 reserve_bytes=(
-                    int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
+                    reserve_bytes
                     + deferred_training_state_bytes
                     + unsharded_gradient_reserve_bytes
                     + offloaded_parameter_bytes
                 ),
+                optimizer_reserve_bytes=optimizer_reserve_bytes,
             )
             metrics.update(
                 {
@@ -478,13 +504,14 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                     "slot_prefetch_kv": float(self._reverse_slot_plan.prefetch_kv),
                     "slot_gib": self._reverse_slot_plan.slot_bytes / (1024**3),
                     "estimated_workspace_gib": self._reverse_slot_plan.estimated_workspace_bytes / (1024**3),
-                    "runtime_required_free_gib": (
+                    "runtime_required_free_gib": max(
                         self._reverse_slot_plan.estimated_workspace_bytes
                         + self._reverse_slot_plan.slot_bytes
                         + deferred_training_state_bytes
                         + unsharded_gradient_reserve_bytes
                         + offloaded_parameter_bytes
-                        + int(float(self.streamopd_config.reverse_slot_reserve_gib) * 1024**3)
+                        + reserve_bytes,
+                        optimizer_reserve_bytes + self._reverse_slot_plan.slot_bytes,
                     )
                     / (1024**3),
                 }
@@ -501,6 +528,10 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 }
             )
         return metrics
+
+    @property
+    def _defer_optimizer_load(self) -> bool:
+        return self.streamopd_config.trainer_placement != "dedicated"
 
     def allocate_reverse_slots(self) -> None:
         """Allocate Trainer-only KV slots after shared inference enters sleep."""
@@ -901,6 +932,8 @@ class StreamOPDKVTrainingWorker(TrainingWorker):
                 for parameter in model.parameters():
                     if parameter.grad is not None:
                         parameter.grad.mul_(scale)
+                if self._defer_optimizer_load:
+                    self.engine.to(device=get_device_name(), model=False, optimizer=True, grad=False)
                 grad_norm = self.engine.optimizer_step()
                 lr = self.engine.lr_scheduler_step()
             else:

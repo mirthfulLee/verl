@@ -139,6 +139,21 @@ class vLLMColocateWorkerExtension:
     2. Online FP8 quantization
     """
 
+    def enable_static_teacher_weight_cache(self):
+        """Retain one CPU backup of the finalized, immutable Teacher weights."""
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        from .static_teacher import StaticTeacherWeightCache
+
+        if not hasattr(self, "_static_teacher_weight_cache"):
+            allocator = CuMemAllocator.get_instance()
+            self._static_teacher_weight_cache = StaticTeacherWeightCache(allocator)
+            allocator.sleep = self._static_teacher_weight_cache.sleep
+
+    def get_static_teacher_weight_cache_stats(self):
+        """Expose backup counts for checking that wake-up does not cause re-offload."""
+        return self._static_teacher_weight_cache.stats()
+
     def __new__(cls, **kwargs):
         set_death_signal()
 

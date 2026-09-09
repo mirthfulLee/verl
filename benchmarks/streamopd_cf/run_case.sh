@@ -14,8 +14,15 @@ export RESULT_DIR=${RESULT_DIR:-benchmarks/streamopd_cf/results}
 export CHECKPOINT_HOST_DIR=${CHECKPOINT_HOST_DIR:-/dev/shm/verl-streamopd-cf-$$}
 mkdir -p "$RESULT_DIR"
 
-# Identical trajectories per Trainer GPU; disable the baseline's dynamic token
-# packing so the requested training microbatch is actually honored.
+if [[ $CASE == verl-async-opd || $CASE == verl-sync-opd-separate ]]; then
+  export NATIVE_MODE=separate_async
+  if [[ $CASE == verl-sync-opd-separate ]]; then export NATIVE_MODE=separate_sync; fi
+  export STUDENT_GPUS=${STUDENT_GPUS:-2} ROLLOUT_GPUS=${ROLLOUT_GPUS:-1} TEACHER_GPUS=${TEACHER_GPUS:-1}
+  exec bash benchmarks/streamopd_cf/run_native_opd.sh "$@"
+fi
+
+# Fixed-microbatch ablations for the streaming methods and legacy controls.
+# Native baselines above inherit their own packing defaults.
 fixed_args=()
 if [[ -n ${FIXED_MICRO_BATCH_SIZE:-} ]]; then
   if [[ ! $FIXED_MICRO_BATCH_SIZE =~ ^[1-9][0-9]*$ ]]; then
@@ -44,32 +51,6 @@ fi
 export TEACHER_GPUS=${TEACHER_GPUS:-1} ROLLOUT_GPUS=${ROLLOUT_GPUS:-1} STUDENT_GPUS=${STUDENT_GPUS:-2}
 export TEACHER_TP_SIZE=${TEACHER_TP_SIZE:-1}
 export EXPERIMENT_NAME=streamopd_cf_total${TOTAL_TRAJECTORY_LENGTH}_bs${BATCH_SIZE}
-strategy_args=()
-if [[ $CASE == verl-sync-opd-separate ]]; then
-  export EXPERIMENT_NAME=separate_sync_total${TOTAL_TRAJECTORY_LENGTH}_bs${BATCH_SIZE}
-  strategy_args=(trainer.v1.trainer_mode=separate_sync distillation.streamopd_cf.enabled=False)
-fi
-if [[ $CASE == verl-async-opd ]]; then
-  export EXPERIMENT_NAME=separate_async_total${TOTAL_TRAJECTORY_LENGTH}_bs${BATCH_SIZE}
-  # Native separate_async retains hybrid inference workers, sleeps them before
-  # training, and uses only the standalone Rollout pool in steady state.
-  export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-$BATCH_SIZE}
-  export ROLLOUT_MAX_BATCHED_TOKENS=${ROLLOUT_MAX_BATCHED_TOKENS:-4096}
-  export TEACHER_MAX_NUM_SEQS=${TEACHER_MAX_NUM_SEQS:-32}
-  export TEACHER_MAX_BATCHED_TOKENS=${TEACHER_MAX_BATCHED_TOKENS:-4096}
-  export TRAIN_MAX_TOKENS_PER_GPU=${ASYNC_TRAIN_MAX_TOKENS_PER_GPU:-16384}
-  strategy_args=(
-    trainer.v1.trainer_mode=separate_async
-    distillation.streamopd_cf.enabled=False
-    trainer.v1.separate_async.parameter_sync_step=1
-    trainer.v1.separate_async.num_warmup_batches=1
-    trainer.v1.separate_async.hybrid_rollout.enable_switch=False
-    trainer.v1.sampler.max_off_policy_threshold=8
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.35
-    +actor_rollout_ref.rollout.standalone_gpu_memory_utilization=0.85
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$TRAIN_MAX_TOKENS_PER_GPU"
-  )
-fi
 
 bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_cf_fsdp.sh \
   actor_rollout_ref.model.use_liger="$USE_LIGER" \
@@ -87,4 +68,4 @@ bash examples/on_policy_distillation_trainer/run_qwen3_streamopd_cf_fsdp.sh \
   data.custom_cls.path=benchmarks/streamopd_kv/dapo_math_dataset.py \
   data.dataloader_num_workers=0 \
   distillation.distillation_loss.chunked_topk_chunk_size=512 \
-  "${fixed_args[@]}" "${strategy_args[@]}" "$@" 2>&1 | tee "$RESULT_DIR/${EXPERIMENT_NAME}.log"
+  "${fixed_args[@]}" "$@" 2>&1 | tee "$RESULT_DIR/${EXPERIMENT_NAME}.log"

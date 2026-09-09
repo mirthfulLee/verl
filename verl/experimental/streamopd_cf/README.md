@@ -169,13 +169,14 @@ Trainer uses the ordinary FSDP training worker and full-trajectory model forward
 The synchronous replay buffer admits one complete policy batch before each
 update; blocking weight synchronization finishes before the next batch is
 submitted. Both minimum and maximum behavior-policy versions must equal the
-current update's source version. This mode omits PPO-only preparation for the
-same direct distillation objective. It does not use `separate_async`.
+current update's source version. This mode retains verl's native old-logprob/advantage preparation and Trainer
+for the same direct distillation objective. It does not use `separate_async`.
 
-Use `CASE=verl-sync-opd-separate` in the benchmark wrapper and match
-`FIXED_MICRO_BATCH_SIZE` with StreamOPD-CF to control for GPU placement and
-microbatch size. Loss evaluation may still use native vocabulary-workspace
-bounded tiles; "full trajectory" refers to the Transformer forward/backward.
+Use `CASE=verl-sync-opd-separate` in the benchmark wrapper and match GPU placement
+and global batch size with StreamOPD-CF. The baseline inherits native microbatch
+packing; explicit ablations can use ordinary Hydra overrides. Loss evaluation may
+still use vocabulary-workspace bounded tiles; "full trajectory" refers to the
+Transformer forward/backward.
 
 ## Validation
 

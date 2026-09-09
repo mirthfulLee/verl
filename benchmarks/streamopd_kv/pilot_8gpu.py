@@ -168,7 +168,6 @@ def comparison_settings(root):
 
 
 def environment(args, case, directory):
-    native_8b = case["method"].startswith("verl-sync-opd") and case["student"] == "Qwen3-8B"
     return {
         "METHOD": case["method"],
         "STUDENT_MODEL": str(args.models / case["student"]),
@@ -181,10 +180,9 @@ def environment(args, case, directory):
         "RESULT_DIR": str(directory),
         "BATCH_SIZE": str(args.batch),
         "TOTAL_TRAJECTORY_LENGTH": str(case["tokens"]),
-        "TOTAL_TRAINING_STEPS": str(args.warmup + 1),
+        "TOTAL_TRAINING_STEPS": str(args.warmup + getattr(args, "measure", 1)),
         "CUDA_VISIBLE_DEVICES": args.devices,
-        "TRAIN_MAX_TOKENS_PER_GPU": "8192" if native_8b else "0",
-        "ASYNC_TRAIN_MAX_TOKENS_PER_GPU": "8192",
+        "TRAIN_MAX_TOKENS_PER_GPU": "0",
         "CHECKPOINT_BUCKET_MB": "128",
     }
 
@@ -194,7 +192,9 @@ def completed_summary(args, directory):
     if len(logs) != 1:
         raise ValueError(f"Expected one method log, got {logs}")
     try:
-        return summarize_run(logs[0], expected_steps=args.warmup + 1, warmup_steps=args.warmup)
+        return summarize_run(
+            logs[0], expected_steps=args.warmup + getattr(args, "measure", 1), warmup_steps=args.warmup
+        )
     except ValueError as console_error:
         runtime = directory / "runtime.json"
         if not runtime.exists():
@@ -209,7 +209,9 @@ def completed_summary(args, directory):
             raise ValueError(f"{console_error}; expected one original Trainer log, got {candidates}") from console_error
         destination = directory / "trainer_stdout.txt"
         shutil.copyfile(candidates[0], destination)
-        summary = summarize_run(destination, expected_steps=args.warmup + 1, warmup_steps=args.warmup)
+        summary = summarize_run(
+            destination, expected_steps=args.warmup + getattr(args, "measure", 1), warmup_steps=args.warmup
+        )
         summary["console_log_error"] = str(console_error)
         summary["original_worker_log"] = str(candidates[0].resolve())
         return summary
@@ -339,6 +341,8 @@ def report(root):
                 "teacher_tp",
                 "status",
                 "step_seconds",
+                "measured_steps",
+                "step_time_stddev",
                 "trained_response_tokens_per_second",
                 "tuning",
                 "hydra_overrides",
@@ -361,6 +365,8 @@ def report(root):
                     case["tp"],
                     result["status"],
                     result.get("step_seconds"),
+                    result.get("summary", {}).get("measured_steps"),
+                    result.get("summary", {}).get("step_time_stddev"),
                     result.get("response_tokens_per_second"),
                     case.get("tuning", "auto"),
                     json.dumps(case.get("overrides", [])),
@@ -372,10 +378,10 @@ def report(root):
     lines = [
         "# Eight-GPU OPD pilot",
         "",
-        "One measured step after warmup; no variance estimate.",
+        "Warmup excluded; each result records the measured steps and sample standard deviation.",
         "",
-        "| Student | Teacher | Tokens | Method / T:R:H / TP | Status | Step s | Response tokens/s |",
-        "| --- | --- | ---: | --- | --- | ---: | ---: |",
+        "| Student | Teacher | Tokens | Method / T:R:H / TP | Status | Mean step s | Sample SD s | Response tokens/s |",
+        "| --- | --- | ---: | --- | --- | ---: | ---: | ---: |",
     ]
     for result in results:
         case = result["case"]
@@ -385,6 +391,7 @@ def report(root):
         lines.append(
             f"| {case['student']} | {case['teacher_model']} | {case['tokens']} | {name(case)} | "
             f"{status} | {result.get('step_seconds', '-')} | "
+            f"{result.get('summary', {}).get('step_time_stddev', '-')} | "
             f"{result.get('response_tokens_per_second', '-')} |"
         )
     (root / "summary.md").write_text("\n".join(lines) + "\n")
@@ -405,6 +412,7 @@ def main():
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--measure", type=int, default=1, help="Number of measured steps after warmup")
     parser.add_argument("--max-tokens", type=int, nargs="+", choices=[4096, 8192], default=[4096])
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--dedicated-min-gain", type=float, default=0.1)
@@ -418,8 +426,8 @@ def main():
         report(args.root)
         return
     device_count = len(args.devices.split(","))
-    if args.warmup < 1 or args.timeout <= 0 or device_count < 1:
-        parser.error("devices, a positive timeout and at least one warmup step are required")
+    if args.warmup < 1 or args.measure < 1 or args.timeout <= 0 or device_count < 1:
+        parser.error("devices, a positive timeout and at least one warmup and measured step are required")
     if args.stage not in ("single", "recover") and device_count != 8:
         parser.error("allocation and comparison matrices require eight devices; use single for smaller experiments")
     if not 0 <= args.dedicated_min_gain < 1:

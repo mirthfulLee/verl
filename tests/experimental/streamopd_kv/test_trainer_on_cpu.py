@@ -154,6 +154,7 @@ def test_shared_trainer_plans_against_sleeping_pool_before_loading() -> None:
     trainer._shared_rollout_sleeping = True
     trainer._reverse_plan_result = None
     trainer.actor_rollout_wg = SimpleNamespace(
+        release_streamopd_allocator_cache=lambda: transitions.append("clear"),
         prepare_streamopd_reverse_plan=lambda: transitions.append("plan") or plan_result,
         load_streamopd_trainer_state=lambda: transitions.append("load"),
     )
@@ -166,22 +167,41 @@ def test_shared_trainer_plans_against_sleeping_pool_before_loading() -> None:
     trainer._configure_reverse_plan = configure_reverse_plan
 
     assert trainer._load_trainer_state() >= 0.0
-    assert transitions == ["plan", "configure", "load"]
+    assert transitions == ["clear", "plan", "configure", "load"]
 
 
-def test_shared_trainer_cannot_load_before_inference_pool_sleeps() -> None:
+@pytest.mark.parametrize("awake_role", ["teacher", "rollout"])
+def test_shared_trainer_cannot_load_before_inference_pool_sleeps(awake_role) -> None:
     from verl.experimental.streamopd_kv.placement import TrainerPlacement
     from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
 
     trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
     trainer.placement = TrainerPlacement.UNION
     trainer._trainer_state_offloaded = True
-    trainer._teacher_sleeping = True
-    trainer._shared_rollout_sleeping = False
+    trainer._teacher_sleeping = awake_role != "teacher"
+    trainer._shared_rollout_sleeping = awake_role != "rollout"
     trainer.actor_rollout_wg = SimpleNamespace(load_streamopd_trainer_state=lambda: None)
 
-    with pytest.raises(RuntimeError, match="shared Rollout"):
+    with pytest.raises(RuntimeError, match=f"shared {awake_role.title()}"):
         trainer._load_trainer_state()
+
+
+def test_shared_teacher_preserves_weights_with_level_one_sleep():
+    from verl.experimental.streamopd_kv.placement import TrainerPlacement
+    from verl.trainer.ppo.v1.trainer_streamopd_kv import PPOTrainerStreamOPDKV
+
+    levels = []
+    trainer = PPOTrainerStreamOPDKV.__new__(PPOTrainerStreamOPDKV)
+    trainer.placement = TrainerPlacement.UNION
+    trainer._teacher_sleeping = False
+    trainer._policy_lifecycle_metrics = {}
+    trainer._check_teacher_wake = lambda **kwargs: None
+    trainer.teacher_model_manager = SimpleNamespace(sleep=lambda level: levels.append(level))
+    assert trainer._maybe_sleep_teacher({"teacher_drained": False}) == 0
+    trainer._maybe_sleep_teacher({"teacher_drained": True})
+    trainer._maybe_sleep_teacher({"teacher_drained": True})
+    assert levels == [1]
+    assert trainer._teacher_sleeping
 
 
 @pytest.mark.parametrize(
@@ -212,7 +232,7 @@ def test_initial_weight_sync_releases_shared_teacher_first(placement: str, expec
 @pytest.mark.parametrize(
     ("backend", "shares_rollout"), [("host", True), ("host", False), ("nccl", False), ("naive", False)]
 )
-def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeypatch, backend, shares_rollout) -> None:
+def test_shared_weight_sync_overlaps_transfer_before_restoring_kv(monkeypatch, backend, shares_rollout) -> None:
     from verl.checkpoint_engine import base as checkpoint_base
     from verl.experimental.streamopd_kv.checkpoint import update_streamopd_weights
 
@@ -267,7 +287,13 @@ def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeyp
             return [None]
 
     monkeypatch.setattr(checkpoint_base, "RayWorkerGroup", RolloutGroup)
-    monkeypatch.setattr(checkpoint_base.ray, "get", lambda values: values)
+    waits = []
+
+    def get(values):
+        waits.append(values)
+        return values
+
+    monkeypatch.setattr(checkpoint_base.ray, "get", get)
     manager = checkpoint_base.CheckpointEngineManager.__new__(checkpoint_base.CheckpointEngineManager)
     manager.backend = backend
     manager.actor_wg = ActorGroup()
@@ -304,15 +330,19 @@ def test_phase_exclusive_host_weight_sync_serializes_trainer_and_rollout(monkeyp
     assert events == [
         ("rollout-sleep", 2),
         "build",
-        ("trainer-publish", "host"),
-        "trainer-release",
         "weights-wake",
+        ("trainer-publish", "host"),
         "rollout-receive",
+        "trainer-release",
         "trainer-finalize",
         "rollout-finalize",
         "kv-wake",
     ]
+    # Both RPCs must be submitted before waiting on either: waiting for the
+    # sender first would silently restore the old serial handoff.
+    assert waits[0] == [{"sender_metric": 1.0}, None]
     assert metrics["sender_metric"] == 1.0
+    assert metrics["checkpoint/phase_exclusive_publish_receive_seconds"] >= 0
     assert "abort" not in events
     assert "resume-generation" not in events
 

@@ -87,7 +87,7 @@ def plan_training_unit_size(
     if min(train_batch_size, reverse_wave_size) < 1 or kv_prefetch_depth < 0:
         raise ValueError("StreamOPD training-unit inputs must be positive and prefetch depth non-negative")
     if resources_overlap:
-        # Shared inference has already entered level-2 sleep. Splitting the
+        # Shared inference has already entered sleep. Splitting the
         # batch cannot expose additional overlap and only defeats slot reuse.
         return train_batch_size
     # A unit needs the current wave plus every configured prefetched wave.

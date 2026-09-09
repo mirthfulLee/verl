@@ -335,10 +335,9 @@ def test_stream_summary_checks_complete_policy_update(tmp_path, trained, updates
 
 
 def test_separate_sync_uses_native_trainer_and_sync_sampling():
-    from verl.experimental.streamopd_cf.batching import AutoBatchActorWorker
     from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
     from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerSeparateSync
-    from verl.workers.engine_workers import TrainingWorker
+    from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
     cfg = config()
     cfg.trainer.v1.trainer_mode = "separate_sync"
@@ -351,26 +350,41 @@ def test_separate_sync_uses_native_trainer_and_sync_sampling():
     assert type(trainer.replay_buffer) is ReplayBuffer
     assert not isinstance(trainer.replay_buffer, ReplayBufferAsync)
     assert trainer.parameter_sync_step == 1
-    assert trainer.actor_worker_cls is AutoBatchActorWorker
+    assert trainer.actor_worker_cls is ActorRolloutRefWorker
     assert trainer.actor_worker_cls.actor_worker_cls.train_mini_batch is TrainingWorker.train_mini_batch
     assert trainer._uses_external_checkpoint_engine()
 
 
-@pytest.mark.parametrize("versions,accepted", [((4, 4), True), ((3, 4), False), ((3, 3), False), ((4, 5), False)])
-def test_separate_sync_rejects_stale_or_mixed_version_batches(versions, accepted):
-    from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerSeparateSync
+def test_sync_placement_adapters_inherit_native_training_pipeline():
+    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+    from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerSeparateSync, PPOTrainerUnionSync
 
-    trainer = PPOTrainerSeparateSync.__new__(PPOTrainerSeparateSync)
-    trainer.global_steps = 5
-    batch = SimpleNamespace(tags=[{"min_global_steps": versions[0], "max_global_steps": versions[1]}])
+    for cls in (PPOTrainerSeparateSync, PPOTrainerUnionSync):
+        assert cls._step_once is PPOTrainer._step_once
+        assert cls.get_reward_handles is PPOTrainer.get_reward_handles
+        assert cls._prepare_metric_tensors is PPOTrainer._prepare_metric_tensors
+
+
+def test_union_sync_uses_native_weight_manager_after_inference_sleep():
+    from verl.trainer.ppo.v1.trainer_separate_sync import PPOTrainerUnionSync
+
+    trainer = PPOTrainerUnionSync.__new__(PPOTrainerUnionSync)
     events = []
-    trainer.replay_buffer = SimpleNamespace(sample=lambda **kwargs: events.append("supervision") or (batch, {}))
-    trainer._balance_batch = lambda value, **kwargs: value
-    trainer._update_actor = lambda value, metrics: events.append("full_forward_backward") or value
-    if accepted:
-        assert trainer._step_once({}, {}, 1) is batch
-        assert events == ["supervision", "full_forward_backward"]
-    else:
-        with pytest.raises(RuntimeError, match="stale rollout"):
-            trainer._step_once({}, {}, 1)
-        assert events == ["supervision"]
+    trainer.global_steps = 2
+    trainer.timing_raw = {}
+    trainer.teacher_model_manager = SimpleNamespace(
+        sleep=lambda **kwargs: events.append(("teacher_sleep", kwargs)),
+        wake_up=lambda: events.append("teacher_wake"),
+    )
+    trainer.checkpoint_manager = SimpleNamespace(
+        sleep_replicas=lambda **kwargs: events.append(("rollout_sleep", kwargs)),
+        update_weights=lambda step: events.append(("update_weights", step)) or {},
+    )
+    trainer.on_sample_end()
+    trainer.on_step_end()
+    assert events == [
+        ("teacher_sleep", {"level": 1}),
+        ("rollout_sleep", {"level": 2}),
+        ("update_weights", 2),
+        "teacher_wake",
+    ]

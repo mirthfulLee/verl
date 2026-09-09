@@ -276,8 +276,8 @@ class PPOTrainerStreamOPDKV(PPOTrainer):
 
     def _publish_initial_weights(self) -> None:
         # FSDP state-dict materialization uses every Trainer rank. Release the
-        # Teacher first; the phase-exclusive host checkpoint path also sleeps
-        # Rollout while Trainer publishes, then wakes Rollout to receive it.
+        # Teacher first; the Host checkpoint path also keeps Rollout KV asleep
+        # while publishing and receiving the updated Student weights.
         if self.placement.shares_teacher:
             self._maybe_sleep_teacher({"teacher_drained": True})
         update_streamopd_weights(
@@ -362,11 +362,9 @@ class PPOTrainerStreamOPDKV(PPOTrainer):
             return 0.0
         self._check_teacher_wake(wait=True)
         started = time.perf_counter()
-        # Teacher servers are standalone vLLM replicas. Their default sleep()
-        # is intentionally a no-op, so request level 2 explicitly before the
-        # next Trainer/Teacher role transition. Reverse preflight accounts for
-        # any process allocations retained after sleep.
-        self.teacher_model_manager.sleep(level=2)
+        # Preserve the immutable Teacher weights for native wake-up. Its
+        # level-1 CPU backup is retained and reused after the first sleep.
+        self.teacher_model_manager.sleep(level=1)
         elapsed = time.perf_counter() - started
         self._teacher_sleeping = True
         self._policy_lifecycle_metrics["streamopd/teacher_sleep_seconds"] = elapsed
@@ -384,11 +382,12 @@ class PPOTrainerStreamOPDKV(PPOTrainer):
         if self.placement is TrainerPlacement.DEDICATED or not self._trainer_state_offloaded:
             return 0.0
         if self.placement.shares_teacher and not self._teacher_sleeping:
-            raise RuntimeError("cannot restore Trainer state before the shared Teacher enters level-2 sleep")
+            raise RuntimeError("cannot restore Trainer state before the shared Teacher enters level-1 sleep")
         if self.placement.shares_rollout and not self._shared_rollout_sleeping:
             raise RuntimeError("cannot restore Trainer state before the shared Rollout enters level-2 sleep")
         started = time.perf_counter()
         if self._reverse_plan_result is None:
+            self.actor_rollout_wg.release_streamopd_allocator_cache()
             self._configure_reverse_plan(self.actor_rollout_wg.prepare_streamopd_reverse_plan())
         self.actor_rollout_wg.load_streamopd_trainer_state()
         self._trainer_state_offloaded = False

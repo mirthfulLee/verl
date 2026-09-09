@@ -32,6 +32,7 @@ from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
+from vllm.platforms import current_platform
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -302,6 +303,10 @@ class vLLMHttpServer:
         logger.info(f"override_generation_config: {override_generation_config}")
 
         logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
+        if self.config.enable_sleep_mode and _VLLM_VERSION == version.parse("0.15.1") and current_platform.is_cuda():
+            # Native 0.15.1 never enters its weights memory-pool context.
+            # Use the worker_cls interface, retaining explicit user overrides.
+            engine_kwargs.setdefault("worker_cls", "verl.workers.rollout.vllm_rollout.sleep_worker.SleepManagedWorker")
         if not self.config.enable_sleep_mode:
             from verl.utils.device import set_expandable_segments
 
@@ -525,6 +530,8 @@ class vLLMHttpServer:
         )
         if self._is_teacher_model and (vllm_config.additional_config or {}).get("verl_streaming_teacher_logprobs"):
             await engine_client.collective_rpc(method="enable_streaming_prompt_logprobs")
+        if self._is_teacher_model and self.config.enable_sleep_mode and current_platform.is_cuda():
+            await engine_client.collective_rpc(method="enable_static_teacher_weight_cache")
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()

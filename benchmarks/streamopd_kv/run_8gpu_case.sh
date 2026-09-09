@@ -29,7 +29,6 @@ export CHECKPOINT_HOST_DIR="$RESULT_DIR/checkpoint_host"
 export KV_HANDOFF_DIR="$RESULT_DIR/kv_handoff"
 export RAY_TMPDIR="/tmp/opd8-ray-$$"
 export TRAIN_MAX_TOKENS_PER_GPU=${TRAIN_MAX_TOKENS_PER_GPU:-0}
-export ASYNC_TRAIN_MAX_TOKENS_PER_GPU=${ASYNC_TRAIN_MAX_TOKENS_PER_GPU:-8192}
 export ENABLE_GRADIENT_CHECKPOINTING=True USE_LIGER=True
 mkdir -p "$RESULT_DIR"
 python3 -c 'import json, os; from pathlib import Path; (Path(os.environ["RESULT_DIR"]) / "runtime.json").write_text(json.dumps({"ray_tmpdir": os.environ["RAY_TMPDIR"]}) + "\n")'
@@ -43,6 +42,16 @@ else
 fi
 ((BATCH_SIZE % STUDENT_GPUS == 0 && TEACHER_GPUS % TEACHER_TP_SIZE == 0))
 
+# Native baselines receive workload controls, not CF/KV runtime tuning.
+case "$METHOD" in
+  verl-async-opd) export NATIVE_MODE=separate_async ;;
+  verl-sync-opd-separate) export NATIVE_MODE=separate_sync ;;
+  verl-sync-opd-union) export NATIVE_MODE=union_sync ;;
+esac
+if [[ $METHOD == verl-* ]]; then
+  exec bash benchmarks/streamopd_cf/run_native_opd.sh "$@"
+fi
+
 common=(
   data.seed=1 data.shuffle=True trainer.resume_mode=disable
   trainer.default_local_dir="$RESULT_DIR/checkpoints"
@@ -53,20 +62,28 @@ common=(
   distillation.teacher_models.teacher_model.inference.max_num_seqs="$TEACHER_MAX_NUM_SEQS"
   distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="$TEACHER_MAX_BATCHED_TOKENS"
 )
-if [[ $METHOD == verl-sync-opd-* || $METHOD == verl-async-opd ]]; then
-  common+=(actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True)
+if [[ $METHOD == streamopd-cf ]]; then
+  common+=(
+    distillation.batching.memory_fraction=0.95
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.8
+  )
 fi
 case "$METHOD" in
   streamopd-kv-union|streamopd-kv-dedicated)
     export MODE=$METHOD
+    # Keep the KV inference budget fixed while retaining automatic reverse sizing.
+    export STREAMOPD_RUNTIME_PROFILE=manual
+    export ROLLOUT_GPU_MEMORY_UTILIZATION=0.85 TEACHER_GPU_MEMORY_UTILIZATION=0.85
+    export TOKEN_CHUNK_SIZE=$(( (( (MAX_RESPONSE_LENGTH + 3) / 4 + 63) / 64) * 64 ))
+    export TOKEN_CHUNK_SIZE=$(( TOKEN_CHUNK_SIZE < 256 ? 256 : TOKEN_CHUNK_SIZE ))
+    export TOKEN_CHUNK_SIZE=$(( TOKEN_CHUNK_SIZE > 1024 ? 1024 : TOKEN_CHUNK_SIZE ))
+    export ROLLOUT_KV_EXPORT_CHUNK_SIZE=2048
+    export REVERSE_BATCH_SIZE=0 REVERSE_BATCH_MAX_TOKENS=0 REVERSE_CHUNK_SIZE=0
+    export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=0 TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS=0
+    export KV_HANDOFF_DIR="/dev/shm/opd8-kv-$$"
     shared_args=()
     if [[ $METHOD == streamopd-kv-union ]]; then
-      export STREAMOPD_RUNTIME_PROFILE=manual
-      export ROLLOUT_GPU_MEMORY_UTILIZATION=0.85 TEACHER_GPU_MEMORY_UTILIZATION=0.85
-      export TOKEN_CHUNK_SIZE=1024 ROLLOUT_KV_EXPORT_CHUNK_SIZE=2048
-      export REVERSE_BATCH_SIZE=0 REVERSE_BATCH_MAX_TOKENS=0 REVERSE_CHUNK_SIZE=0
-      export TEACHER_PREFILL_MAX_ACTIVE_TRAJECTORIES=0 TEACHER_PREFILL_MAX_ACTIVE_KV_TOKENS=0
-      export KV_HANDOFF_DIR="/dev/shm/opd8-kv-$$"
+      export TOKEN_CHUNK_SIZE=1024
       shared_args=(
         actor_rollout_ref.actor.fsdp_config.param_offload=True
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
@@ -74,18 +91,10 @@ case "$METHOD" in
     fi
     bash benchmarks/streamopd_kv/run_colocate_case.sh "${shared_args[@]}" "${common[@]}" "$@"
     ;;
-  streamopd-cf|verl-sync-opd-separate|verl-async-opd)
+  streamopd-cf)
     export CASE=$METHOD
     bash benchmarks/streamopd_cf/run_case.sh \
       distillation.streamopd_cf.timeline_dir="$OPD_BENCH_TIMELINE_DIR" \
-      "${common[@]}" "$@"
-    ;;
-  verl-sync-opd-union)
-    export CASE=verl-sync-opd-separate
-    bash benchmarks/streamopd_cf/run_case.sh \
-      trainer.v1.trainer_mode=union_sync \
-      actor_rollout_ref.actor.fsdp_config.param_offload=True \
-      actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
       "${common[@]}" "$@"
     ;;
   *) echo "Unknown METHOD=$METHOD" >&2; exit 2 ;;

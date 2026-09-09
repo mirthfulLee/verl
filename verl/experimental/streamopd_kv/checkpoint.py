@@ -19,11 +19,12 @@ from verl.utils.ray_utils import auto_await
 async def update_streamopd_weights(
     manager: CheckpointEngineManager, global_steps: int, *, shares_rollout: bool
 ) -> dict:
-    """Use the ordinary transport unless GPU ownership requires a serial handoff.
+    """Overlap shared-pool publication and reception with inference KV asleep.
 
-    Host publication is durable: publish with Rollout asleep, release Trainer
-    memory, then wake Rollout to load weights. Generation stays paused until the
-    StreamOPD scheduler admits the next policy version.
+    The shared Trainer has already offloaded optimizer state and released its
+    reverse slots and gradients. Wake only Rollout weights while exporting the
+    new parameters, then release Trainer export allocations before restoring
+    inference KV. Generation waits for the scheduler's next policy version.
     """
     if not shares_rollout:
         # Actor-only rollout replicas use COLOCATED mode even on dedicated
@@ -41,14 +42,15 @@ async def update_streamopd_weights(
     with simple_timer("rollout_sleep", timings):
         await manager.sleep_replicas(level=2)
     manager.build_process_group(rollout)
-    with simple_timer("publish", timings):
-        results = ray.get(actor.update_weights(global_steps=global_steps, mode=manager.backend))
-    with simple_timer("trainer_release", timings):
-        actor.release_streamopd_allocator_cache()
     with simple_timer("weights_wake", timings):
         await manager.release_kv_cache_replicas()
-    with simple_timer("receive", timings):
-        ray.get(rollout.update_weights(global_steps=global_steps))
+    with simple_timer("publish_receive", timings):
+        results = ray.get(
+            actor.update_weights(global_steps=global_steps, mode=manager.backend)
+            + rollout.update_weights(global_steps=global_steps)
+        )
+    with simple_timer("trainer_release", timings):
+        actor.release_streamopd_allocator_cache()
     manager.finalize_workers(rollout)
     with simple_timer("kv_wake", timings):
         await manager.resume_kv_cache_replicas()

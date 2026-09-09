@@ -48,7 +48,7 @@ phase-exclusive vLLM worker sizes KV from the actual free bytes after CUDA/NCCL 
 and deterministic workspace reservations. KV allocation is capped at the page-aligned worst case for the entire
 global policy batch on each replica, without assuming even routing or reducing feasible session concurrency.
 This avoids allocating unusable cache capacity for small jobs. It reserves no simultaneously active Trainer workspace because vLLM enters
-level-2 sleep before Trainer state and reverse slots are loaded. A worst-case Host KV backing check also runs before
+sleep before Trainer state and reverse slots are loaded (Teacher level 1, Rollout level 2). A worst-case Host KV backing check also runs before
 Rollout starts; auto mode uses
 `/dev/shm`, while an explicitly selected path fails closed if it lacks capacity. Teacher session admission is refined
 after vLLM reports its actual paged-KV capacity, so group/session widths are not fixed to the reference hardware.
@@ -115,7 +115,7 @@ entry replaces the `teacher_model` template, and auto mode preserves overrides u
 | `qwen3.py`, `reverse_attention.py`, `fsdp_worker.py`, `ray_worker.py` | Reverse chain rule, fixed GPU slots, and actor worker |
 | `teacher_client.py`, `vllm_teacher.py` | Sticky Teacher leases and resumable vLLM input/output sessions |
 | `replica_group.py` | Shared Teacher/Rollout telemetry, capacity accounting, and KV export barriers |
-| `checkpoint.py` | Serialized weight handoff for shared Trainer/Rollout pools |
+| `checkpoint.py` | Overlapping weight publication and reception with shared-pool KV asleep |
 | `vllm_patch.py` | Opt-in, version-specific vLLM integration |
 | `verl/trainer/ppo/v1/trainer_streamopd_kv.py` | V1 trainer registration and orchestration through base trainer hooks |
 
@@ -146,9 +146,14 @@ ragged response controls extend that adapter in `benchmarks/streamopd_kv`.
    may start a unit as soon as every trajectory in that unit has complete Rollout KV and Teacher scores. A Trainer that shares
    Teacher GPUs waits for complete Teacher drain; one that shares Rollout GPUs waits for all Rollout EOS. A union
    Trainer waits for both conditions. There is no Teacher/Trainer alternation inside a policy.
-4. A shared pool changes active owner once per policy. The outgoing vLLM process enters level-2 sleep to discard its
-   sleep-managed weight/KV mappings, then the Trainer loads parameters and optimizer state once for its full training
-   phase. CUDA contexts, graph pools, and allocations outside vLLM's sleep allocator may remain; the first post-sleep
+4. A shared pool changes active owner once per policy. Teacher enters level-1 sleep, keeping one CPU backup of its
+   transformed, immutable weights; subsequent sleeps release GPU mappings without repeating the offload, and native
+   wake-up restores that backup. Rollout enters level-2 sleep and receives new Student weights after training.
+   Both inference pools must be asleep before allocator cleanup and reverse planning, then Trainer loads its parameters.
+   Shared Trainer
+   optimizer state stays on CPU during reverse backward and is restored once after the final gradient synchronization,
+   immediately before the optimizer update. CUDA contexts, graph pools, and allocations outside vLLM's sleep allocator
+   may remain; the first post-sleep
    reverse preflight measures that real headroom. Trainer FSDP state is offloaded before the vLLM process wakes again.
 5. `StreamOPDKVConnector` claims a finished request's vLLM pages through the HMA async-save contract and exports its
    complete trajectory after EOS. The default path copies arithmetic runs of physical cross-layer pages directly to
@@ -182,9 +187,9 @@ ragged response controls extend that adapter in `benchmarks/streamopd_kv`.
    before inference wakes; intermediate units retain gradients. Parameters stay at `theta_k` until all rollout,
    teacher coverage, and reverse backward work completes. Normalization, clipping, one optimizer step, and publication
    of `theta_(k+1)` occur only at the strict policy-version barrier.
-9. When Trainer shares the Rollout pool, Host checkpoint publication is phase-exclusive: Rollout enters level-2 sleep,
-   Trainer publishes and offloads the durable checkpoint, Rollout wakes only its weights to receive it, and KV wakes
-   last. Active Trainer state is gone before Rollout mappings are restored; sleep-retained process allocations remain
+9. When Trainer shares the Rollout pool, its optimizer state, reverse slots, and gradients are released from GPU before
+   weight publication. Rollout wakes only its weights and receives Host checkpoint buckets while Trainer publishes
+   them. Trainer export allocations are released before inference KV wakes; sleep-retained process allocations remain
    part of the measured shared-pool budget.
 
 Rollout throughput is configured independently through vLLM continuous-batching limits such as `max_num_seqs`.
@@ -198,10 +203,13 @@ Each layer owns stable `[B_slot, T_slot, H_kv, D]` K, V, dK, and dV tensors.
 `reverse_slot_max_tokens=0` resolves `T_slot` from the configured
 prompt/response upper bounds and page-aligns it. Preflight evaluates the fixed backing, active reverse workspace,
 LM-head workspace, model/optimizer reserve, and H2D reserve before selecting `B_slot` and a chunk size that divides
-`T_slot`. The optimizer reserve is derived per rank from gradients and optimizer tensors that have not yet been
-materialized; it is not a hardware-specific fixed allowance. The resulting addresses and kernel shapes are frozen
+`T_slot`. The state reserve is derived per rank from gradients and optimizer tensors that have not yet been
+materialized; it is not a hardware-specific fixed allowance. Shared pools check two separate peaks: reverse slots,
+unsharded gradients and activation workspace during backward; then reverse slots, sharded gradients, optimizer state
+and optimizer workspace during the update. Adam state does not reduce the backward workspace budget because it is
+restored only after gradient synchronization. The resulting addresses and kernel shapes are frozen
 before the first training phase. Dedicated pools plan at startup; shared pools
-plan once after their inference process first enters level-2 sleep so retained
+plan once after their inference process first enters sleep so retained
 CUDA state is included in the measured headroom.
 
 Host slots expose token-major contiguous `[T, H_kv, D]` K/V views directly from the mmap; there is no read-time

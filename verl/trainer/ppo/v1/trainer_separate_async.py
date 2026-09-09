@@ -15,7 +15,6 @@ import logging
 import os
 import time
 from collections import deque
-from copy import deepcopy
 from enum import Enum
 
 import ray
@@ -130,13 +129,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # initialize standalone rollout
         # TODO: make initialization parallel with super().init()
         hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
-        standalone_config = self.config
-        standalone_memory = self.config.actor_rollout_ref.rollout.get("standalone_gpu_memory_utilization")
-        if standalone_memory is not None:
-            standalone_config = deepcopy(self.config)
-            standalone_config.actor_rollout_ref.rollout.gpu_memory_utilization = standalone_memory
         self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
-            config=standalone_config, start_rank=hybrid_num_replicas
+            config=self.config, start_rank=hybrid_num_replicas
         )
         rollout_config = self.config.actor_rollout_ref.rollout
         if rollout_config.prometheus.enable:

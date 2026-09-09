@@ -133,6 +133,7 @@ METRICS = (
     "streamopd/rollout_wake_seconds",
     "checkpoint/phase_exclusive_rollout_sleep_seconds",
     "checkpoint/phase_exclusive_publish_seconds",
+    "checkpoint/phase_exclusive_publish_receive_seconds",
     "checkpoint/phase_exclusive_trainer_release_seconds",
     "checkpoint/phase_exclusive_weights_wake_seconds",
     "checkpoint/phase_exclusive_receive_seconds",

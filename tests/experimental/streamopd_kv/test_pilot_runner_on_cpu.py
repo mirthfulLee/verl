@@ -9,14 +9,43 @@
 """Failed or timed-out GPU jobs must never become performance measurements."""
 
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from benchmarks.streamopd_kv import pilot_8gpu
 from benchmarks.streamopd_kv.summarize_pilot_comparison import build_report
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_kv_launcher_preserves_baseline_inference_budget_and_auto_reverse(tmp_path, shared):
+    shim = tmp_path / "bash"
+    shim.write_text(f"#!{sys.executable}\nimport json, os\nprint(json.dumps(dict(os.environ)))\n")
+    shim.chmod(0o755)
+    repo = Path(__file__).resolve().parents[3]
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "RESULT_DIR": str(tmp_path / "result"),
+        "METHOD": "streamopd-kv-union" if shared else "streamopd-kv-dedicated",
+        "STUDENT_MODEL": "student",
+        "TEACHER_MODEL": "teacher",
+        "DATASET": "dataset.parquet",
+        "STUDENT_GPUS": "8" if shared else "4",
+        "ROLLOUT_GPUS": "4" if shared else "2",
+        "TEACHER_GPUS": "4" if shared else "2",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    }
+    launched = json.loads(
+        subprocess.check_output(["/bin/bash", "benchmarks/streamopd_kv/run_8gpu_case.sh"], cwd=repo, env=env, text=True)
+    )
+    assert launched["STREAMOPD_RUNTIME_PROFILE"] == "manual"
+    assert launched["ROLLOUT_GPU_MEMORY_UTILIZATION"] == launched["TEACHER_GPU_MEMORY_UTILIZATION"] == "0.85"
+    assert launched["REVERSE_BATCH_SIZE"] == launched["REVERSE_CHUNK_SIZE"] == "0"
 
 
 def test_all_methods_record_the_same_checkpoint_bucket(tmp_path):
@@ -54,6 +83,38 @@ def test_comparison_and_reports_follow_the_reduced_token_scope(tmp_path):
     assert len(list(pilot_8gpu.comparison_settings(tmp_path))) == 12
     pilot_8gpu.write_json(tmp_path / "comparison_scope.json", {"max_tokens": [4096]})
     assert list(pilot_8gpu.comparison_settings(tmp_path)) == settings
+
+
+def test_three_measured_steps_exclude_warmup_and_reject_partial_runs(tmp_path):
+    args = SimpleNamespace(
+        models=tmp_path, dataset=tmp_path / "train.parquet", batch=128, warmup=1, measure=3, devices="0,1,2,3"
+    )
+    case = dict(
+        method="verl-sync-opd-union",
+        student="Qwen3-8B",
+        teacher_model="Qwen3-32B",
+        trainer=4,
+        rollout=2,
+        teacher=2,
+        tp=2,
+        tokens=8192,
+    )
+    assert pilot_8gpu.environment(args, case, tmp_path)["TOTAL_TRAINING_STEPS"] == "4"
+    lines = [
+        f"step:{step} - timing_s/step:{seconds} - response_length/mean:100 "
+        "- training/off_policy/trajectory_staleness/max:0"
+        for step, seconds in enumerate((100, 10, 12, 14), start=1)
+    ]
+    log = tmp_path / "method.log"
+    log.write_text("\n".join([*lines, "Final validation metrics: None"]))
+    record = dict(returncode=0)
+    pilot_8gpu.validate_completed_record(args, case, tmp_path, record)
+    assert record["step_seconds"] == 12
+    assert record["summary"]["measured_steps"] == 3
+    assert record["summary"]["step_time_stddev"] == 2
+    log.write_text("\n".join([*lines[:-1], "Final validation metrics: None"]))
+    with pytest.raises(ValueError, match="expected steps 1..4"):
+        pilot_8gpu.validate_completed_record(args, case, tmp_path, dict(returncode=0))
 
 
 def test_cf_summary_exposes_all_completion_counts_to_the_pilot(tmp_path):
@@ -253,3 +314,105 @@ def test_failed_job_is_stopped_without_performance_metrics(tmp_path, monkeypatch
     assert result["stop_reason"].startswith(reason)
     assert "step_seconds" not in result
     assert "response_tokens_per_second" not in result
+
+
+@pytest.mark.parametrize("entry", ["benchmarks/streamopd_kv/run_8gpu_case.sh", "benchmarks/streamopd_cf/run_case.sh"])
+@pytest.mark.parametrize("mode", ["separate_async", "separate_sync", "union_sync"])
+def test_native_launch_inherits_runtime_defaults(tmp_path, entry, mode):
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    if entry.endswith("run_case.sh") and mode == "union_sync":
+        pytest.skip("Shared placement is selected through the GPU-count runner")
+    methods = {
+        "separate_async": "verl-async-opd",
+        "separate_sync": "verl-sync-opd-separate",
+        "union_sync": "verl-sync-opd-union",
+    }
+    repo = Path(__file__).resolve().parents[3]
+    captured = tmp_path / "arguments.json"
+    shim = tmp_path / "python3"
+    shim.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        "if sys.argv[1:3] == ['-m', 'verl.trainer.main_ppo']:\n"
+        "    open(os.environ['CAPTURE_ARGS'], 'w').write(json.dumps(sys.argv[3:]))\n"
+        "else:\n"
+        f"    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    shim.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "CAPTURE_ARGS": str(captured),
+        "RESULT_DIR": str(tmp_path / "results"),
+        "METHOD": methods[mode],
+        "CASE": methods[mode],
+        "STUDENT_MODEL": "/models/Qwen3-8B",
+        "TEACHER_MODEL": "/models/Qwen3-32B",
+        "DATASET": "/data/train.parquet",
+        "STUDENT_GPUS": "8" if mode == "union_sync" else "4",
+        "ROLLOUT_GPUS": "4" if mode == "union_sync" else "2",
+        "TEACHER_GPUS": "4" if mode == "union_sync" else "2",
+        "TEACHER_TP_SIZE": "2",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "BATCH_SIZE": "256",
+        "MAX_RESPONSE_LENGTH": "7168",
+        "TOTAL_TRAJECTORY_LENGTH": "8192",
+        "TOTAL_TRAINING_STEPS": "4",
+        # Old benchmark tuning must not leak through either entry point.
+        "ASYNC_TRAIN_MAX_TOKENS_PER_GPU": "8192",
+        "FIXED_MICRO_BATCH_SIZE": "2",
+        "TEACHER_GPU_MEMORY_UTILIZATION": "0.8",
+        "ROLLOUT_MAX_NUM_SEQS": "16",
+    }
+    subprocess.run(["/bin/bash", entry], cwd=repo, env=env, check=True, capture_output=True, text=True)
+    overrides = json.loads(captured.read_text())
+    with initialize_config_dir(config_dir=str(repo / "verl/trainer/config"), version_base=None):
+        native = compose(config_name="ppo_trainer")
+        actual = compose(config_name="ppo_trainer", overrides=overrides)
+    if mode == "union_sync":
+        native.actor_rollout_ref.actor.fsdp_config.param_offload = True
+        native.actor_rollout_ref.actor.fsdp_config.optimizer_offload = True
+    for key in (
+        "trainer.v1.separate_async.hybrid_rollout",
+        "trainer.v1.separate_async.num_warmup_batches",
+        "trainer.v1.sampler",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu",
+        "actor_rollout_ref.actor.use_torch_compile",
+        "actor_rollout_ref.actor.fsdp_config",
+        "actor_rollout_ref.model.use_liger",
+        "actor_rollout_ref.rollout.gpu_memory_utilization",
+        "actor_rollout_ref.rollout.max_num_seqs",
+        "actor_rollout_ref.rollout.max_num_batched_tokens",
+        "actor_rollout_ref.rollout.agent.num_workers",
+        "distillation.teacher_models.teacher_model.inference.gpu_memory_utilization",
+        "distillation.teacher_models.teacher_model.inference.enforce_eager",
+        "distillation.teacher_models.teacher_model.inference.max_num_seqs",
+        "distillation.batching",
+        "distillation.streamopd_kv",
+        "distillation.streamopd_cf",
+    ):
+        assert OmegaConf.select(actual, key) == OmegaConf.select(native, key), key
+    assert actual.trainer.v1.trainer_mode == mode
+    assert actual.data.train_batch_size == actual.actor_rollout_ref.actor.ppo_mini_batch_size == 256
+    if mode == "separate_async":
+        assert actual.trainer.v1.separate_async.parameter_sync_step == 1
+    assert actual.actor_rollout_ref.actor.use_dynamic_bsz
+    assert actual.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+    assert actual.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu == 16384
+    assert actual.actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes == 128
+    assert actual.actor_rollout_ref.model.path == env["STUDENT_MODEL"]
+    assert actual.distillation.teacher_models.teacher_model.model_path == env["TEACHER_MODEL"]
+    assert actual.trainer.n_gpus_per_node == int(env["STUDENT_GPUS"])
+    assert (
+        actual.actor_rollout_ref.rollout.n_gpus_per_node
+        == actual.distillation.n_gpus_per_node
+        == int(env["TEACHER_GPUS"])
+    )
+    assert actual.data.max_response_length + actual.data.max_prompt_length == 8192
+    assert actual.actor_rollout_ref.rollout.max_model_len == 8193
+    assert actual.distillation.teacher_models.teacher_model.inference.max_model_len == 8193
+    assert actual.distillation.distillation_loss.loss_mode == "forward_kl_topk"
+    assert actual.distillation.distillation_loss.topk == 32
+    assert not actual.distillation.distillation_loss.use_task_rewards
+    assert not actual.distillation.distillation_loss.use_policy_gradient

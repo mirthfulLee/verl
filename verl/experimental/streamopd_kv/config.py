@@ -513,16 +513,17 @@ def prepare_streamopd_kv_config(config: DictConfig) -> None:
     with open_dict(stream_config):
         if int(stream_config.get("rollout_kv_export_chunk_size", 0)) == 0:
             stream_config.rollout_kv_export_chunk_size = min(aligned_slot_tokens, 2048)
-        # Zero-valued reverse knobs mean "derive the largest stable preflight
-        # plan". Non-zero values remain optional user caps for experiments.
+        # Zero-valued reverse knobs select a bounded preflight plan.
+        # Non-zero values remain optional user caps for experiments.
         if int(stream_config.get("reverse_batch_size", 0)) == 0:
             stream_config.reverse_batch_size = train_batch_size
         if int(stream_config.get("reverse_batch_max_tokens", 0)) == 0:
             stream_config.reverse_batch_max_tokens = train_batch_size * aligned_slot_tokens
         if int(stream_config.get("reverse_chunk_size", 0)) == 0:
-            # The joint GPU preflight selects the largest useful token tile
-            # that fits the actual Trainer pool.
-            stream_config.reverse_chunk_size = aligned_slot_tokens
+            # Full-trajectory chunks can exceed the estimated backward peak.
+            # Bound the default workspace while preflight still chooses the
+            # batch width and may shrink the chunk further to fit the pool.
+            stream_config.reverse_chunk_size = min(aligned_slot_tokens, max(page_size, 2048 // page_size * page_size))
         if int(stream_config.get("reverse_chunk_min_size", 0)) == 0:
             stream_config.reverse_chunk_min_size = page_size
     with open_dict(config.trainer.v1.sampler):

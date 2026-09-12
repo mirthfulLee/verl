@@ -86,8 +86,21 @@ def test_prepare_config_installs_connector_only_for_streamopd() -> None:
     assert config.distillation.streamopd_kv.reverse_slot_max_tokens == 4096
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
     assert config.distillation.streamopd_kv.reverse_batch_max_tokens == 128 * 4096
-    assert config.distillation.streamopd_kv.reverse_chunk_size == 4096
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 2048
     assert config.distillation.streamopd_kv.reverse_chunk_min_size == 64
+
+    long_config = copy.deepcopy(config)
+    long_config.data.max_prompt_length = 1024
+    long_config.data.max_response_length = 7168
+    long_config.distillation.streamopd_kv.reverse_slot_max_tokens = 8192
+    long_config.distillation.streamopd_kv.reverse_chunk_size = 0
+    prepare_streamopd_kv_config(long_config)
+    assert long_config.distillation.streamopd_kv.reverse_slot_max_tokens == 8192
+    assert long_config.distillation.streamopd_kv.reverse_chunk_size == 2048
+
+    long_config.distillation.streamopd_kv.reverse_chunk_size = 1024
+    prepare_streamopd_kv_config(long_config)
+    assert long_config.distillation.streamopd_kv.reverse_chunk_size == 1024
 
     stale_config = copy.deepcopy(config)
     stale_config.trainer.v1.trainer_mode = "sync"
@@ -417,7 +430,7 @@ def test_prepare_config_applies_auto_runtime_profile_before_validation() -> None
     assert config.actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation is True
     assert config.actor_rollout_ref.actor.fsdp_config.reshard_after_forward is False
     assert config.distillation.teacher_models.teacher_model.inference.max_num_batched_tokens == 4096
-    assert config.distillation.streamopd_kv.reverse_chunk_size == 4096
+    assert config.distillation.streamopd_kv.reverse_chunk_size == 2048
     assert config.distillation.streamopd_kv.reverse_batch_size == 128
 
 

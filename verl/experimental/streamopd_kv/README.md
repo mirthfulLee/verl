@@ -238,8 +238,10 @@ so lazily created Adam buffers are included. These are storage snapshots, includ
 CUDA allocator peaks or total process memory. Reverse preflight likewise uses local shard sizes for deferred
 training state and counts shared offloaded parameter storage once.
 
-Preflight enumerates power-of-two reverse widths and chunks up to the trajectory length under the fixed-slot,
-activation, LM-head, optimizer, and transfer reserve. It first maximizes the useful `batch * chunk` token tile. Equal
+Preflight enumerates power-of-two reverse widths and chunks under the fixed-slot,
+activation, LM-head, optimizer, and transfer reserve. Automatic chunks are capped at 2048 tokens (or the shorter
+trajectory length) to leave headroom for backward peaks; an explicit `reverse_chunk_size` overrides this cap.
+It first maximizes the useful `batch * chunk` token tile. Equal
 tiles prefer at least two trajectories when feasible, then the longer chunk to reduce wavefront depth. The memory
 test includes six KV tensors for a one-chunk prefetch plan and four for a page-reuse plan. Non-zero token/batch/chunk
 caps remain available for controlled ablations.
